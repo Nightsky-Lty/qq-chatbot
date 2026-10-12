@@ -1,0 +1,7 @@
+# 使用白名单，仅将镜像构建需要的文件发送给 Docker。
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!app/
+!app/*.py

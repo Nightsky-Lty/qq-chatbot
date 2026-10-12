@@ -1,0 +1,70 @@
+name: qq-chatbot
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?请先在 .env 中填写 DeepSeek API Key}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      ONEBOT_ACCESS_TOKEN: ${ONEBOT_ACCESS_TOKEN:?请先在 .env 中填写 OneBot Token}
+      ADMIN_QQ_IDS: ${ADMIN_QQ_IDS:-}
+      # 固定写入挂载目录，避免 .env 中的相对路径将数据库写进临时文件系统。
+      DATABASE_PATH: /app/data/bot.db
+      BOT_NAME: ${BOT_NAME:-小群友}
+      CHAT_PREFIX: ${CHAT_PREFIX:-/问}
+      EVALUATE_PREFIX: ${EVALUATE_PREFIX:-/锐评}
+      MIMIC_PREFIX: ${MIMIC_PREFIX:-/模仿}
+      AI_COOLDOWN_SECONDS: ${AI_COOLDOWN_SECONDS:-8}
+      CONTEXT_MESSAGE_LIMIT: ${CONTEXT_MESSAGE_LIMIT:-20}
+      STYLE_SAMPLE_LIMIT: ${STYLE_SAMPLE_LIMIT:-60}
+      MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS:-30}
+    ports:
+      # 健康检查仅供服务器本机访问，NapCat 使用容器内网连接。
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - bot-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  napcat:
+    image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}
+    restart: unless-stopped
+    depends_on:
+      bot:
+        condition: service_healthy
+    environment:
+      WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:?请先在 .env 中设置 NapCat 管理页面密码}
+      MODE: reverse_ws
+      # Token 推荐使用随机十六进制字符，避免 URL 特殊字符需要转义。
+      ONEBOT_URL: ws://bot:8080/onebot/v11/ws?access_token=${ONEBOT_ACCESS_TOKEN:?请先设置 OneBot Token}
+    ports:
+      # 在电脑上通过 SSH 转发访问管理页，无需开放 6099 公网端口。
+      - "127.0.0.1:6099:6099"
+    volumes:
+      - qq-data:/app/.config/QQ
+      - napcat-config:/app/napcat/config
+      - napcat-plugins:/app/napcat/plugins
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# 普通容器重建保留这些数据。不要使用 docker compose down -v 删除数据卷。
+volumes:
+  bot-data:
+  qq-data:
+  napcat-config:
+  napcat-plugins:

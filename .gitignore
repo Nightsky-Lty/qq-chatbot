@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+data/
+*.db
+*.db-*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+qq-chatbot-deploy.tar.gz
+.DS_Store
