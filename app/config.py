@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # 表情包仅从本地目录读取；每次回复最多一张，发送限制按群或私聊会话计算。
     sticker_enabled: bool = True
     sticker_vision_enabled: bool = True
+    # 入库识别在独立后台任务中执行；关闭视觉时同时停用自动识别。
+    sticker_auto_index_enabled: bool = True
+    sticker_index_poll_seconds: int = Field(default=60, ge=10, le=3600)
+    sticker_index_batch_size: int = Field(default=5, ge=1, le=20)
+    sticker_index_retry_seconds: int = Field(default=3600, ge=60, le=86400)
     # 最多3张，按单图最高10MiB计算，内联Base64仍在DeepSeek 48MiB请求体限制以内。
     sticker_preview_limit: int = Field(default=3, ge=1, le=3)
     sticker_directory: Path = Path("app/sticker_images")

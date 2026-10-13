@@ -1,5 +1,6 @@
 """SQLite 持久化层：保存群配置及聊天，私聊记录独立按用户隔离。"""
 
+import json
 import sqlite3
 import threading
 import time
@@ -82,6 +83,14 @@ CREATE TABLE IF NOT EXISTS reminders (
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status,due_at,next_attempt_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reminders_pending_unique
     ON reminders(user_id,content,due_at) WHERE status='pending';
+CREATE TABLE IF NOT EXISTS sticker_annotations (
+    content_hash TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN ('ready','quarantined','error')),
+    metadata TEXT NOT NULL DEFAULT '{}',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -132,6 +141,34 @@ class Database:
         """关闭数据库连接。"""
         with self._lock:
             self.connection.close()
+
+    def get_sticker_annotation(self, content_hash: str) -> dict | None:
+        """按内容哈希复用识别结果；不保存图片字节或私聊数据。"""
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM sticker_annotations WHERE content_hash=?", (content_hash,)
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["metadata"] = json.loads(result["metadata"])
+        return result
+
+    def save_sticker_annotation(
+        self, content_hash: str, status: str, metadata: dict, *, attempts: int = 0,
+        next_attempt_at: int = 0,
+    ) -> None:
+        """缓存安全判断或带退避时间的失败，重启后不会重复识别成功图片。"""
+        with self._lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO sticker_annotations
+                   (content_hash,status,metadata,attempts,next_attempt_at,updated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(content_hash) DO UPDATE SET
+                   status=excluded.status,metadata=excluded.metadata,attempts=excluded.attempts,
+                   next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at""",
+                (content_hash, status, json.dumps(metadata, ensure_ascii=False), attempts,
+                 next_attempt_at, int(time.time())),
+            )
 
     def create_list(self, group_id: int, name: str) -> bool:
         """创建独立的命名名单，返回是否新建；不同群可使用相同名单名。"""

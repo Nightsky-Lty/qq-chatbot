@@ -13,6 +13,7 @@ from app.llm import DeepSeekClient, LLMUnavailable, SYSTEM_PROMPT
 from app.models import MessageView, at_segment, parse_message, text_segment
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
 from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, StickerSession
+from app.sticker_index import StickerIndexer
 
 logger = logging.getLogger(__name__)
 # 发送回调由连接层提供：业务层传入群号或 QQ 号和消息段，不直接操作 WebSocket。
@@ -79,6 +80,7 @@ class BotService:
         self.llm = llm
         self.reminders = reminders
         self.stickers = StickerService(settings)
+        self.sticker_indexer = StickerIndexer(settings, database, llm, self.stickers)
         # 冷却记录只存在于内存中，重启服务后会重置。
         self._last_ai_call: dict[AIKey, float] = {}
         self._trigger_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -107,6 +109,7 @@ class BotService:
         """阻止接受新请求并取消所有后台任务，在关闭模型客户端前调用。"""
         self._closed = True
         await self.cancel_pending()
+        await self.sticker_indexer.close()
 
     def _finish_ai_task(self, task: asyncio.Task[None]) -> None:
         """任务结束后回收名额；尚未开始就被取消的任务也必须回收。"""
@@ -527,6 +530,8 @@ class BotService:
                 tool_defs.extend(tool for tool in STICKER_TOOLS if self.settings.sticker_vision_enabled
                                  or tool["function"]["name"] != "get_sticker_image")
                 effective_system += STICKER_INSTRUCTIONS
+                if not self.stickers.auto_index_enabled:
+                    effective_system += "\n本次自动入库已关闭，目录只依据文件名和人工描述；不要声称图片已被后台识别或安全筛选。"
             if private and self.reminders is not None:
                 # 当前时间由程序提供，身份由实际私聊发信人绑定，不让模型指定QQ。
                 effective_system += reminder_instructions()
@@ -535,7 +540,7 @@ class BotService:
             if tool_defs:
                 kwargs["tools"] = tool_defs
                 async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-                    if name in {"list_stickers", "get_sticker_image", "send_sticker"} and sticker_session is not None:
+                    if name in {"search_stickers", "list_stickers", "get_sticker_image", "send_sticker"} and sticker_session is not None:
                         return await self.stickers.execute_tool(sticker_session, name, arguments)
                     if private and self.reminders is not None:
                         return await self.reminders.execute_tool(user_id, name, arguments)
@@ -565,7 +570,7 @@ class BotService:
                 if submitted and private:
                     self.db.log_private_message(user_id, "assistant", f"[表情包：{sticker_session.selected_id}]")
                 elif not submitted and not answer.strip() and not automatic:
-                    await self._send_text(send_message, target, "表情包刚发过啦，等一会儿再发。")
+                    await self._send_text(send_message, target, "这张表情包暂时不能发，换文字聊吧。")
         except Exception:
             # 连接可能在生成期间断开，发送失败只影响这条任务。
             logger.exception("Background AI reply failed: scope=%s context=%s user=%s", scope, context_id, user_id)

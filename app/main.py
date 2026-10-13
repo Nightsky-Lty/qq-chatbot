@@ -104,6 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.llm = llm
         app.state.reminders = reminders
         reminders.start()
+        app.state.bot.sticker_indexer.start()
         # yield 前是启动逻辑，yield 后是应用关闭时执行的清理逻辑。
         try:
             yield
