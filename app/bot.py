@@ -524,7 +524,8 @@ class BotService:
             if self.settings.sticker_enabled and (system is None or private or automatic):
                 conversation = ("private", user_id) if private else ("group", context_id)
                 sticker_session = StickerSession(conversation)
-                tool_defs.extend(STICKER_TOOLS)
+                tool_defs.extend(tool for tool in STICKER_TOOLS if self.settings.sticker_vision_enabled
+                                 or tool["function"]["name"] != "get_sticker_image")
                 effective_system += STICKER_INSTRUCTIONS
             if private and self.reminders is not None:
                 # 当前时间由程序提供，身份由实际私聊发信人绑定，不让模型指定QQ。
@@ -534,7 +535,7 @@ class BotService:
             if tool_defs:
                 kwargs["tools"] = tool_defs
                 async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-                    if name in {"list_stickers", "send_sticker"} and sticker_session is not None:
+                    if name in {"list_stickers", "get_sticker_image", "send_sticker"} and sticker_session is not None:
                         return await self.stickers.execute_tool(sticker_session, name, arguments)
                     if private and self.reminders is not None:
                         return await self.reminders.execute_tool(user_id, name, arguments)

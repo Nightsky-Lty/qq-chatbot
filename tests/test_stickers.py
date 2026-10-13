@@ -206,7 +206,7 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[0][0], 123)
         self.assertEqual([segment["type"] for segment in self.sent[0][1]], ["image"])
         names = {tool["function"]["name"] for tool in self.requests[0]["tools"]}
-        self.assertEqual(names, {"list_stickers", "send_sticker"})
+        self.assertEqual(names, {"list_stickers", "get_sticker_image", "send_sticker"})
 
     async def test_text_and_image_are_separate_messages(self):
         self.responses = self.sticker_responses(final="嘿嘿")
@@ -276,6 +276,137 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._run_ai_reply(123, 456, "发表情包", self.sender)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0][1][0]["type"], "image")
+
+    async def test_full_vision_chain_uses_user_image_blocks_and_keeps_tool_json_small(self):
+        self.responses = [call_message(tool_call("list_stickers", {}, "list")),
+                          call_message(tool_call("get_sticker_image", {"sticker_id": "开心.png"}, "view")),
+                          call_message(tool_call("send_sticker", {"sticker_id": "开心.png"}, "send")),
+                          {"role": "assistant", "content": ""}]
+        await self.bot._run_ai_reply(123, 456, "选个合适的表情", self.sender)
+        self.assertEqual(len(self.requests), 4)
+        self.assertEqual(self.requests[0]["tool_choice"], "auto")
+        preview_request = self.requests[2]
+        image_message = preview_request["messages"][-1]
+        self.assertEqual(image_message["role"], "user")
+        block = image_message["content"][1]
+        self.assertEqual(block["type"], "image_url")
+        self.assertTrue(block["image_url"]["url"].startswith("data:image/png;base64,"))
+        self.assertEqual(base64.b64decode(block["image_url"]["url"].split(",", 1)[1]), PNG)
+        for message in preview_request["messages"]:
+            if message["role"] == "tool":
+                self.assertNotIn("_image_content", message["content"])
+                self.assertNotIn("base64", message["content"])
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][1][0]["type"], "image")
+
+    async def test_multiple_preview_results_are_completed_before_user_message_and_deduplicated(self):
+        self.responses = [call_message(tool_call("list_stickers", {}, "list")), call_message(
+            tool_call("get_sticker_image", {"sticker_id": "开心.png"}, "view-1"),
+            tool_call("get_sticker_image", {"sticker_id": "晚安.gif"}, "view-2"),
+            tool_call("get_sticker_image", {"sticker_id": "开心.png"}, "view-3"),
+        ), {"role": "assistant", "content": "今天用文字啦"}]
+        await self.bot._run_ai_reply(123, 456, "看下表情", self.sender)
+        messages = self.requests[-1]["messages"]
+        self.assertEqual([m["role"] for m in messages[-4:]], ["tool", "tool", "tool", "user"])
+        blocks = messages[-1]["content"]
+        self.assertEqual(len([block for block in blocks if block["type"] == "image_url"]), 2)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][1][-1]["type"], "text")
+
+    async def test_preview_is_optional_and_never_sends_by_itself_or_saves_base64(self):
+        self.responses = [call_message(tool_call("list_stickers", {}, "list")),
+                          call_message(tool_call("get_sticker_image", {"sticker_id": "开心.png"}, "view")),
+                          {"role": "assistant", "content": "这张图是开心的表情"}]
+        await self.bot._run_ai_reply(456, 456, "看看表情", self.sender, private=True)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][1][0]["type"], "text")
+        history = self.db.recent_private_messages(456, 10)
+        self.assertEqual([item["content"] for item in history], ["这张图是开心的表情"])
+        self.assertEqual(self.bot.stickers._last_sent, {})
+
+    async def test_preview_limit_duplicate_cache_and_send_original_viewed_bytes(self):
+        self.settings.sticker_preview_limit = 1
+        session = StickerSession(("group", 123))
+        await self.service.execute_tool(session, "list_stickers", {})
+        first = await self.service.execute_tool(session, "get_sticker_image", {"sticker_id": "开心.png"})
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["remaining_previews"], 0)
+        (self.images / "开心.png").write_bytes(b"not the original")
+        again = await self.service.execute_tool(session, "get_sticker_image", {"sticker_id": "开心.png"})
+        self.assertEqual(first, again)
+        other = await self.service.execute_tool(session, "get_sticker_image", {"sticker_id": "晚安.gif"})
+        self.assertFalse(other["ok"])
+        selected = await self.service.execute_tool(session, "send_sticker", {"sticker_id": "开心.png"})
+        self.assertTrue(selected["ok"])
+        self.assertTrue(await self.service.send_selected(session, 123, self.sender))
+        self.assertEqual(base64.b64decode(self.sent[0][1][0]["data"]["file"][9:]), PNG)
+
+    async def test_preview_shares_path_size_and_file_type_guards(self):
+        outside = self.root / "outside.png"
+        outside.write_bytes(PNG)
+        (self.images / "link.png").symlink_to(outside)
+        (self.images / "bad.png").write_bytes(b"not a picture")
+        (self.images / "large.png").write_bytes(b"x" * (self.settings.sticker_max_bytes + 1))
+        session = StickerSession(("group", 1))
+        await self.service.execute_tool(session, "list_stickers", {})
+        for sticker_id in ("../outside.png", "https://example.com/img.png", "link.png", "large.png", "bad.png"):
+            result = await self.service.execute_tool(session, "get_sticker_image", {"sticker_id": sticker_id})
+            self.assertFalse(result["ok"])
+            self.assertNotIn("_image_content", result)
+        self.assertEqual(session.viewed_images, {})
+
+    async def test_preview_mime_uses_file_content_and_duplicate_call_id_adds_one_image(self):
+        samples = [("png.jpg", PNG, "image/png"), ("jpeg.png", b"\xff\xd8\xff\xe0", "image/jpeg"),
+                   ("gif.webp", b"GIF89a" + b"\x00" * 10, "image/gif"),
+                   ("webp.gif", b"RIFF" + b"\x00" * 4 + b"WEBP", "image/webp")]
+        for filename, data, mime in samples:
+            (self.images / filename).write_bytes(data)
+        self.settings.sticker_preview_limit = 3
+        for filename, data, mime in samples:
+            session = StickerSession(("group", 123))
+            await self.service.execute_tool(session, "list_stickers", {})
+            result = await self.service.execute_tool(session, "get_sticker_image", {"sticker_id": filename})
+            self.assertTrue(result["ok"])
+            url = result["_image_content"][1]["image_url"]["url"]
+            self.assertTrue(url.startswith(f"data:{mime};base64,"))
+            self.assertEqual(base64.b64decode(url.split(",", 1)[1]), data)
+        repeated = tool_call("get_sticker_image", {"sticker_id": "开心.png"}, "view")
+        self.responses = [call_message(tool_call("list_stickers", {}, "list")),
+                          call_message(repeated, repeated), {"role": "assistant", "content": "看懂啦"}]
+        await self.bot._run_ai_reply(123, 456, "看看图片", self.sender)
+        blocks = self.requests[-1]["messages"][-1]["content"]
+        self.assertEqual(len([block for block in blocks if block["type"] == "image_url"]), 1)
+
+    async def test_vision_chain_automatic_silence_sends_nothing(self):
+        self.responses = [call_message(tool_call("list_stickers", {}, "list")),
+                          call_message(tool_call("get_sticker_image", {"sticker_id": "开心.png"}, "view")),
+                          call_message(tool_call("send_sticker", {"sticker_id": "开心.png"}, "send")),
+                          {"role": "assistant", "content": "[不插话]"}]
+        await self.bot._run_ai_reply(123, 0, "自动接话", self.sender, system=AUTO_CHAT_SYSTEM_PROMPT, automatic=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.bot.stickers._last_sent, {})
+
+    async def test_vision_disable_keeps_listing_and_sending_tools(self):
+        self.settings.sticker_vision_enabled = False
+        self.responses = self.sticker_responses()
+        await self.bot._run_ai_reply(123, 456, "发表情", self.sender)
+        names = {item["function"]["name"] for item in self.requests[0]["tools"]}
+        self.assertEqual(names, {"list_stickers", "send_sticker"})
+        self.assertEqual(self.sent[0][1][0]["type"], "image")
+        session = StickerSession(("group", 456))
+        await self.service.execute_tool(session, "list_stickers", {})
+        self.assertFalse((await self.service.execute_tool(session, "get_sticker_image", {"sticker_id": "开心.png"}))["ok"])
+
+    async def test_vision_error_after_reminder_preserves_real_receipt(self):
+        due = (datetime.now(timezone(timedelta(hours=8))) + timedelta(minutes=5)).isoformat()
+        self.responses = [call_message(
+            tool_call("list_stickers", {}, "list"),
+            tool_call("create_reminder", {"content": "喝水", "due_at": due}, "reminder"),
+        ), call_message(tool_call("get_sticker_image", {"sticker_id": "开心.png"}, "view")), 400]
+        await self.bot._run_ai_reply(456, 456, "提醒并看图", self.sender, private=True)
+        self.assertEqual(len(self.db.list_reminders(456)), 1)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("已保存提醒 #", self.sent[0][1][0]["data"]["text"])
 
     async def test_blank_response_without_selected_image_is_an_error(self):
         self.responses = [{"role": "assistant", "content": ""}]

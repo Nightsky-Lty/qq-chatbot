@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     reminder_max_pending: int = Field(default=50, ge=1, le=100)
     # 表情包仅从本地目录读取；每次回复最多一张，发送限制按群或私聊会话计算。
     sticker_enabled: bool = True
+    sticker_vision_enabled: bool = True
+    # 最多3张，按单图最高10MiB计算，内联Base64仍在DeepSeek 48MiB请求体限制以内。
+    sticker_preview_limit: int = Field(default=3, ge=1, le=3)
     sticker_directory: Path = Path("app/sticker_images")
     sticker_cooldown_seconds: int = Field(default=30, ge=0)
     sticker_repeat_seconds: int = Field(default=7200, ge=0)
