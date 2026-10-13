@@ -1,4 +1,4 @@
-"""解析 OneBot 消息，并构造发送群消息时使用的文本和 @ 消息段。"""
+"""解析 OneBot 消息，并构造群聊和私聊使用的文本以及群聊 @ 消息段。"""
 
 from dataclasses import dataclass, field
 from typing import Any

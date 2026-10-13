@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class OneBotConnection:
-    """封装单个 OneBot 连接上的群消息发送操作。"""
+    """封装同一 OneBot 连接上的群聊和私聊发送，共用锁及请求序号。"""
 
     def __init__(self, websocket: WebSocket):
         """保存连接，并建立发送锁和请求序号。"""
@@ -27,13 +27,21 @@ class OneBotConnection:
 
     async def send_group(self, group_id: int, message: list[dict[str, Any]]) -> None:
         """向 NapCat 发送群消息调用；这里只提交请求，不等待发送结果确认。"""
+        await self._send_action("send_group_msg", {"group_id": group_id, "message": message})
+
+    async def send_private(self, user_id: int, message: list[dict[str, Any]]) -> None:
+        """向指定 QQ 发送私聊消息；使用私聊动作，不向群发送或附加 @。"""
+        await self._send_action("send_private_msg", {"user_id": user_id, "message": message})
+
+    async def _send_action(self, action: str, params: dict[str, Any]) -> None:
+        """串行提交 OneBot 动作，群聊和私聊共用序号，防止并发写入。"""
         # 同一连接上的发送操作串行执行，避免并发写入。
         async with self.lock:
             self.sequence += 1
             await self.websocket.send_json(
                 {
-                    "action": "send_group_msg",
-                    "params": {"group_id": group_id, "message": message},
+                    "action": action,
+                    "params": params,
                     # echo 用于标识请求，NapCat 的调用响应会携带该字段。
                     "echo": f"send-{self.sequence}",
                 }
@@ -93,7 +101,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
                 try:
                     # 接收和配置操作保持有序；模型请求由业务层后台执行，不阻塞收消息。
-                    await app.state.bot.handle_event(event, connection.send_group)
+                    await app.state.bot.handle_event(event, connection.send_group, connection.send_private)
                 except Exception:
                     # 单条业务事件异常只记录日志，继续处理连接上的后续事件。
                     logger.exception("Failed to handle OneBot event")
@@ -102,6 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             # 不让旧连接的任务在重连后继续向已关闭的 WebSocket 发送回复。
             await app.state.bot.cancel_pending(connection.send_group)
+            await app.state.bot.cancel_pending(connection.send_private)
 
     return app
 

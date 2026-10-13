@@ -1,4 +1,4 @@
-"""群机器人业务逻辑：命令处理、关键词召集、聊天、锐评和授权风格模仿。"""
+"""机器人业务逻辑：群命令与召集、隔离的私聊、后台聊天和授权风格模仿。"""
 
 import asyncio
 import logging
@@ -9,12 +9,16 @@ from typing import Any, Awaitable, Callable
 
 from app.config import Settings
 from app.database import Database
-from app.llm import DeepSeekClient, LLMUnavailable
+from app.llm import DeepSeekClient, LLMUnavailable, SYSTEM_PROMPT
 from app.models import MessageView, at_segment, parse_message, text_segment
 
 logger = logging.getLogger(__name__)
-# 发送回调由连接层提供：业务层只传入群号和消息段，不直接操作 WebSocket。
-SendGroup = Callable[[int, list[dict[str, Any]]], Awaitable[None]]
+# 发送回调由连接层提供：业务层传入群号或 QQ 号和消息段，不直接操作 WebSocket。
+SendMessage = Callable[[int, list[dict[str, Any]]], Awaitable[None]]
+SendGroup = SendMessage
+SendPrivate = SendMessage
+# 会话类型也参与冷却和未完成请求的键，群号与 QQ 号相同也不会串话。
+AIKey = tuple[str, int, int]
 
 
 HELP_TEXT = """可用命令：
@@ -29,11 +33,22 @@ HELP_TEXT = """可用命令：
 /允许模仿｜/禁止模仿（只能为自己授权）
 /删除我的数据
 /模仿 @某人 主题
-/帮助"""
+/帮助
+也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
+
+PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
+/问 内容
+/锐评 内容
+/删除我的数据（只删除你与机器人的私聊记录）
+/帮助
+名单、关键词召集和模仿功能请在群里使用。
+私聊文本和机器人回复会保存在服务器，相关上下文会发送给 DeepSeek。"""
+
+PRIVATE_SYSTEM_PROMPT = SYSTEM_PROMPT + "\n\n当前是一对一私聊，不是群聊。只参考当前用户的私聊上下文，不声称读取了群聊或其他用户的私聊。"
 
 
 class BotService:
-    """协调配置、数据库和模型客户端，处理每个群的机器人功能。"""
+    """协调配置、数据库和模型客户端，隔离处理群聊及每位用户的私聊。"""
 
     def __init__(
         self,
@@ -46,18 +61,18 @@ class BotService:
         self.db = database
         self.llm = llm
         # 冷却记录只存在于内存中，重启服务后会重置。
-        self._last_ai_call: dict[tuple[int, int], float] = defaultdict(float)
+        self._last_ai_call: dict[AIKey, float] = defaultdict(float)
         self._trigger_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         # 保存强引用和来源连接，断线或关闭时可以取消对应任务。
-        self._ai_tasks: dict[asyncio.Task[None], tuple[SendGroup, tuple[int, int]]] = {}
-        self._pending_ai_users: set[tuple[int, int]] = set()
+        self._ai_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
+        self._pending_ai_users: set[AIKey] = set()
         self._closed = False
 
-    async def cancel_pending(self, send_group: SendGroup | None = None) -> None:
-        """取消指定连接的后台任务；不指定连接时取消全部，等待资源释放。"""
+    async def cancel_pending(self, send_message: SendMessage | None = None, *, key: AIKey | None = None) -> None:
+        """按发送连接或会话键取消后台任务；无过滤时取消全部，等待释放。"""
         tasks = [
-            task for task, (sender, _) in self._ai_tasks.items()
-            if send_group is None or sender == send_group
+            task for task, (sender, task_key) in self._ai_tasks.items()
+            if (send_message is None or sender == send_message) and (key is None or task_key == key)
         ]
         for task in tasks:
             task.cancel()
@@ -79,19 +94,25 @@ class BotService:
             if error is not None:
                 logger.error("Unexpected background AI error", exc_info=(type(error), error, error.__traceback__))
 
-    async def handle_event(self, event: dict[str, Any], send_group: SendGroup) -> None:
-        """过滤事件、保存消息，再依次处理命令、关键词和 @ 机器人聊天。"""
-        if event.get("post_type") != "message" or event.get("message_type") != "group":
+    async def handle_event(
+        self, event: dict[str, Any], send_group: SendGroup, send_private: SendPrivate | None = None
+    ) -> None:
+        """过滤事件，先分流私聊；群聊继续处理命令、关键词和 @ 聊天。"""
+        if event.get("post_type") != "message" or event.get("message_type") not in {"group", "private"}:
             return
         if event.get("sub_type") == "notice":
             return
-        group_id = int(event["group_id"])
         user_id = int(event["user_id"])
         self_id = int(event.get("self_id", 0))
         # 忽略机器人自己的发言，避免回复触发自身业务逻辑。
         if user_id == self_id:
             return
         view = parse_message(event.get("message"))
+        if event["message_type"] == "private":
+            if send_private is not None:
+                await self._handle_private(user_id, view, send_private)
+            return
+        group_id = int(event["group_id"])
         nickname = str((event.get("sender") or {}).get("card") or (event.get("sender") or {}).get("nickname") or user_id)
         # 优先使用群名片，缺失时使用昵称或 QQ 号；命令文本也会被记录。
         self.db.log_message(group_id, user_id, nickname, view.text)
@@ -107,6 +128,49 @@ class BotService:
             prompt = view.text.replace(f"@{self_id}", "").strip()
             if prompt:
                 await self._chat(group_id, user_id, prompt, send_group)
+
+    async def _handle_private(self, user_id: int, view: MessageView, send_private: SendPrivate) -> None:
+        """私聊普通文本直接聊天，支持帮助和锐评；从不执行群管理或模仿。"""
+        text = view.text.strip()
+        if not text:
+            await self._send_text(send_private, user_id, "目前只支持文字聊天，请发一段文字给我。")
+            return
+        if text == "/帮助":
+            await self._send_text(send_private, user_id, PRIVATE_HELP_TEXT)
+            return
+        if text == "/删除我的数据":
+            # 先取消该用户的私聊生成，避免删除后旧回复重新写入历史。
+            await self.cancel_pending(key=("private", user_id, user_id))
+            deleted = self.db.delete_private_messages(user_id)
+            await self._send_text(send_private, user_id, f"已删除你与机器人的 {deleted} 条私聊记录，群聊数据不受影响。")
+            return
+        group_only = ("/名单", "/关键词", "/允许模仿", "/禁止模仿", self.settings.mimic_prefix)
+        if text.startswith(group_only):
+            await self._send_text(send_private, user_id, "这个功能只支持群聊，请在群里使用。私聊发 /帮助 可以查看可用命令。")
+            return
+        prompt = text
+        if text.startswith(self.settings.chat_prefix):
+            prompt = text.removeprefix(self.settings.chat_prefix).strip()
+            if not prompt:
+                await self._send_text(send_private, user_id, f"直接发文字即可聊天，也可以用：{self.settings.chat_prefix} 你想说的话")
+                return
+        elif text.startswith(self.settings.evaluate_prefix):
+            content = text.removeprefix(self.settings.evaluate_prefix).strip()
+            if not content:
+                await self._send_text(send_private, user_id, f"用法：{self.settings.evaluate_prefix} 要评价的内容")
+                return
+            prompt = f"请对下面这段内容做简短、有梗但不伤人的评价：\n{content}"
+        elif text.startswith("/"):
+            await self._send_text(send_private, user_id, "未知私聊命令，请发送 /帮助；普通文字可以直接聊天。")
+            return
+        # 先读历史再写当前文本，不把当前问题重复加入上下文；按用户独立查询。
+        rows = self.db.recent_private_messages(user_id, self.settings.context_message_limit)
+        history = [{"role": row["role"], "content": row["content"]} for row in rows]
+        self.db.log_private_message(user_id, "user", prompt)
+        await self._ai_reply(
+            user_id, user_id, prompt, send_private,
+            history=history, system=PRIVATE_SYSTEM_PROMPT, private=True,
+        )
 
     async def _handle_command(
         self,
@@ -332,52 +396,54 @@ class BotService:
 
     async def _ai_reply(
         self,
-        group_id: int,
+        context_id: int,
         user_id: int,
         prompt: str,
-        send_group: SendGroup,
+        send_message: SendMessage,
         *,
         history: list[dict[str, str]] | None = None,
         system: str | None = None,
+        private: bool = False,
     ) -> None:
         """检查冷却及并发名额，然后调度后台 AI 请求，不等待模型生成。"""
         if self._closed:
             return
-        key = (group_id, user_id)
+        key = ("private" if private else "group", context_id, user_id)
         if key in self._pending_ai_users:
-            await self._send_text(send_group, group_id, "你的上一条 AI 请求还没完成，请稍等一下。")
+            await self._send_text(send_message, context_id, "你的上一条 AI 请求还没完成，请稍等一下。")
             return
         # 单调时钟适合计算时间间隔，不受系统日期调整影响。
         now = time.monotonic()
         wait = self.settings.ai_cooldown_seconds - (now - self._last_ai_call[key])
         if wait > 0:
-            await self._send_text(send_group, group_id, f"慢一点，{wait:.0f} 秒后再问我。")
+            await self._send_text(send_message, context_id, f"慢一点，{wait:.0f} 秒后再问我。")
             return
         if len(self._ai_tasks) >= self.settings.ai_max_concurrency:
-            await self._send_text(send_group, group_id, "现在 AI 请求较多，请稍后再试；名单和关键词功能仍可正常使用。")
+            await self._send_text(send_message, context_id, "现在 AI 请求较多，请稍后再试。")
             return
         # 在请求前记录时间，失败的请求同样计入冷却，避免连续重试。
         self._last_ai_call[key] = now
         self._pending_ai_users.add(key)
         # 注册前不 await，名额检查和占用在同一事件循环中不会被其他事件打断。
         task = asyncio.create_task(
-            self._run_ai_reply(group_id, user_id, prompt, send_group, history=history, system=system),
-            name=f"ai-reply-{group_id}-{user_id}",
+            self._run_ai_reply(context_id, user_id, prompt, send_message, history=history, system=system, private=private),
+            name=f"ai-reply-{key[0]}-{context_id}-{user_id}",
         )
-        self._ai_tasks[task] = (send_group, key)
+        self._ai_tasks[task] = (send_message, key)
         task.add_done_callback(self._finish_ai_task)
 
     async def _run_ai_reply(
         self,
-        group_id: int,
+        context_id: int,
         user_id: int,
         prompt: str,
-        send_group: SendGroup,
+        send_message: SendMessage,
         *,
         history: list[dict[str, str]] | None = None,
         system: str | None = None,
+        private: bool = False,
     ) -> None:
-        """后台生成并发送完整回复；隔离错误，不记录聊天文本、样本或凭证。"""
+        """后台生成并发送回复；私聊回复入库，运行日志不记录文本、样本或凭证。"""
         started = time.monotonic()
         try:
             kwargs: dict[str, Any] = {"history": history}
@@ -387,15 +453,19 @@ class BotService:
                 answer = await self.llm.complete(prompt, **kwargs)
             except LLMUnavailable as exc:
                 logger.warning("LLM unavailable: %s", exc)
-                await self._send_text(send_group, group_id, f"AI 暂时不可用：{exc}")
+                await self._send_text(send_message, context_id, f"AI 暂时不可用：{exc}")
                 return
-            logger.info("AI generated: group=%s user=%s elapsed=%.2fs", group_id, user_id, time.monotonic() - started)
-            await send_group(group_id, [at_segment(user_id), text_segment(f" {answer}")])
+            logger.info("AI generated: scope=%s context=%s user=%s elapsed=%.2fs", "private" if private else "group", context_id, user_id, time.monotonic() - started)
+            if private:
+                await send_message(user_id, [text_segment(answer)])
+                self.db.log_private_message(user_id, "assistant", answer)
+            else:
+                await send_message(context_id, [at_segment(user_id), text_segment(f" {answer}")])
         except Exception:
             # 连接可能在生成期间断开，发送失败只影响这条任务。
-            logger.exception("Background AI reply failed: group=%s user=%s", group_id, user_id)
+            logger.exception("Background AI reply failed: scope=%s context=%s user=%s", "private" if private else "group", context_id, user_id)
 
     @staticmethod
-    async def _send_text(send_group: SendGroup, group_id: int, text: str) -> None:
-        """通过发送回调向群内发送一条纯文本消息。"""
-        await send_group(group_id, [text_segment(text)])
+    async def _send_text(send_message: SendMessage, target_id: int, text: str) -> None:
+        """通过对应发送回调向群或私聊发送纯文本。"""
+        await send_message(target_id, [text_segment(text)])

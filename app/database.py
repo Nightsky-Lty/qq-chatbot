@@ -1,4 +1,4 @@
-"""SQLite 持久化层：按群保存召集配置、聊天文本和用户模仿授权。"""
+"""SQLite 持久化层：保存群配置、聊天和授权，私聊记录独立按用户隔离。"""
 
 import sqlite3
 import threading
@@ -9,6 +9,7 @@ from pathlib import Path
 # 数据表用途：member_lists 存名单，list_members 存成员，trigger_keywords 存关键词，
 # keyword_list_bindings 保存关键词到名单的唯一绑定；外键防止悬空引用。
 # messages 存群聊文本和样本资格，mimic_consent 存各用户在各群的授权。
+# private_messages 只存每位用户与机器人的私聊，不作为群聊上下文或模仿样本。
 # WAL 日志模式允许读写操作更好地共存；群号参与键值，隔离不同群的数据。
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -65,6 +66,15 @@ CREATE TABLE IF NOT EXISTS mimic_consent (
     consented_at INTEGER NOT NULL,
     PRIMARY KEY (group_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS private_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_private_messages_user_id
+    ON private_messages(user_id, id DESC);
 """
 
 
@@ -304,6 +314,35 @@ class Database:
                 (group_id, user_id),
             ).fetchone() is not None
 
+    def log_private_message(self, user_id: int, role: str, content: str) -> None:
+        """保存私聊用户文本或已提交发送的机器人回复，每条最多 4000 字。"""
+        if not content:
+            return
+        with self._lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO private_messages(user_id,role,content,created_at) VALUES(?,?,?,?)",
+                (user_id, role, content[:4000], int(time.time())),
+            )
+
+    def recent_private_messages(self, user_id: int, limit: int) -> list[sqlite3.Row]:
+        """只读取该用户与机器人的私聊，按时间顺序返回角色和文本。"""
+        with self._lock:
+            rows = list(self.connection.execute(
+                """SELECT role,content FROM private_messages
+                   WHERE user_id=? ORDER BY id DESC LIMIT ?""",
+                (user_id, limit),
+            ))
+        rows.reverse()
+        return rows
+
+    def delete_private_messages(self, user_id: int) -> int:
+        """删除该用户的全部私聊记录，不影响群聊、名单或模仿授权。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM private_messages WHERE user_id=?", (user_id,)
+            )
+            return cursor.rowcount
+
     def style_samples(self, group_id: int, user_id: int, limit: int) -> list[str]:
         """取目标用户授权期间保存的最新文本，按从旧到新返回。
 
@@ -334,7 +373,7 @@ class Database:
             return cursor.rowcount
 
     def purge_old_messages(self, retention_days: int) -> int:
-        """删除超过保留天数的消息；非正数表示不清理，返回删除条数。"""
+        """清理过期的群聊和私聊消息；非正数表示不清理，返回总删除条数。"""
         if retention_days <= 0:
             return 0
         cutoff = int(time.time()) - retention_days * 86400
@@ -342,4 +381,7 @@ class Database:
             cursor = self.connection.execute(
                 "DELETE FROM messages WHERE created_at < ?", (cutoff,)
             )
-            return cursor.rowcount
+            private_cursor = self.connection.execute(
+                "DELETE FROM private_messages WHERE created_at < ?", (cutoff,)
+            )
+            return cursor.rowcount + private_cursor.rowcount
