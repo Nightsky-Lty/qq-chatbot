@@ -165,6 +165,8 @@ Python 日志出现 `OneBot reverse WebSocket connected` 表示 NapCat 已连接
 
 ## 日常管理
 
+新版关闭深度思考，AI 在后台执行，不阻塞关键词和管理命令。已有 `.env` 中的配置不会随代码更新：如果希望使用更长上下文，请手动改为 `CONTEXT_MESSAGE_LIMIT=40`；可添加 `AI_MAX_CONCURRENCY=3` 控制所有群的请求并发。满额时机器人会提示稍后重试，不建立长队列。更多上下文可能增加 API 费用和耗时。
+
 ```bash
 # 修改 .env 后重新创建容器，使新配置生效
 sudo docker compose up -d --force-recreate
@@ -179,6 +181,8 @@ sudo docker stats --no-stream
 # 停止服务，保留数据卷；恢复使用 docker compose up -d
 sudo docker compose down
 ```
+
+日志中的 `AI generated: ... elapsed=...s` 是拿到模型完整回复的耗时，不包括 QQ 送达时间。重建机器人时，未完成的后台请求会被取消；正常数据库和 QQ 登录数据不会因此清空。
 
 Docker 开机自启和 `restart: unless-stopped` 会在服务器重启后重新启动容器；如果主动停止了服务，需要手动恢复。QQ 登录异常时仍需按页面提示重新验证。
 

@@ -56,9 +56,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.db = db
         app.state.llm = llm
         # yield 前是启动逻辑，yield 后是应用关闭时执行的清理逻辑。
-        yield
-        await llm.close()
-        db.close()
+        try:
+            yield
+        finally:
+            # 先结束后台请求，再关闭它们使用的客户端和数据库。
+            await app.state.bot.close()
+            await llm.close()
+            db.close()
 
     app = FastAPI(title="QQ DeepSeek Bot", version="0.1.0", lifespan=lifespan)
 
@@ -88,13 +92,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     # API 调用响应没有 post_type，当前不处理这些响应。
                     continue
                 try:
-                    # 当前连接逐条处理事件；模型请求完成前不会读取下一条事件。
+                    # 接收和配置操作保持有序；模型请求由业务层后台执行，不阻塞收消息。
                     await app.state.bot.handle_event(event, connection.send_group)
                 except Exception:
                     # 单条业务事件异常只记录日志，继续处理连接上的后续事件。
                     logger.exception("Failed to handle OneBot event")
         except WebSocketDisconnect:
             logger.info("OneBot reverse WebSocket disconnected")
+        finally:
+            # 不让旧连接的任务在重连后继续向已关闭的 WebSocket 发送回复。
+            await app.state.bot.cancel_pending(connection.send_group)
 
     return app
 

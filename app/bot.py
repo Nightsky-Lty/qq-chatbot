@@ -48,6 +48,36 @@ class BotService:
         # 冷却记录只存在于内存中，重启服务后会重置。
         self._last_ai_call: dict[tuple[int, int], float] = defaultdict(float)
         self._trigger_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # 保存强引用和来源连接，断线或关闭时可以取消对应任务。
+        self._ai_tasks: dict[asyncio.Task[None], tuple[SendGroup, tuple[int, int]]] = {}
+        self._pending_ai_users: set[tuple[int, int]] = set()
+        self._closed = False
+
+    async def cancel_pending(self, send_group: SendGroup | None = None) -> None:
+        """取消指定连接的后台任务；不指定连接时取消全部，等待资源释放。"""
+        tasks = [
+            task for task, (sender, _) in self._ai_tasks.items()
+            if send_group is None or sender == send_group
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close(self) -> None:
+        """阻止接受新请求并取消所有后台任务，在关闭模型客户端前调用。"""
+        self._closed = True
+        await self.cancel_pending()
+
+    def _finish_ai_task(self, task: asyncio.Task[None]) -> None:
+        """任务结束后回收名额；尚未开始就被取消的任务也必须回收。"""
+        entry = self._ai_tasks.pop(task, None)
+        if entry is not None:
+            self._pending_ai_users.discard(entry[1])
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.error("Unexpected background AI error", exc_info=(type(error), error, error.__traceback__))
 
     async def handle_event(self, event: dict[str, Any], send_group: SendGroup) -> None:
         """过滤事件、保存消息，再依次处理命令、关键词和 @ 机器人聊天。"""
@@ -262,8 +292,8 @@ class BotService:
                 await send_group(group_id, message)
 
     async def _chat(self, group_id: int, user_id: int, prompt: str, send_group: SendGroup) -> None:
-        """读取最近群消息，附上发送者昵称作为上下文，再请求模型回复。"""
-        rows = self.db.recent_messages(group_id, self.settings.context_message_limit)
+        """在消息接收时快照最近群消息，再调度后台请求，避免混入之后的消息。"""
+        rows = self.db.recent_messages(group_id, self.settings.context_message_limit + 1)
         # 当前消息已在入口保存，因此跳过最后一条，避免和 prompt 重复。
         history = [
             {"role": "user", "content": f'{row["nickname"]}: {row["content"]}'}
@@ -310,26 +340,60 @@ class BotService:
         history: list[dict[str, str]] | None = None,
         system: str | None = None,
     ) -> None:
-        """统一执行 AI 调用：检查冷却、生成回复、处理异常并 @ 提问者。"""
+        """检查冷却及并发名额，然后调度后台 AI 请求，不等待模型生成。"""
+        if self._closed:
+            return
         key = (group_id, user_id)
+        if key in self._pending_ai_users:
+            await self._send_text(send_group, group_id, "你的上一条 AI 请求还没完成，请稍等一下。")
+            return
         # 单调时钟适合计算时间间隔，不受系统日期调整影响。
         now = time.monotonic()
         wait = self.settings.ai_cooldown_seconds - (now - self._last_ai_call[key])
         if wait > 0:
             await self._send_text(send_group, group_id, f"慢一点，{wait:.0f} 秒后再问我。")
             return
+        if len(self._ai_tasks) >= self.settings.ai_max_concurrency:
+            await self._send_text(send_group, group_id, "现在 AI 请求较多，请稍后再试；名单和关键词功能仍可正常使用。")
+            return
         # 在请求前记录时间，失败的请求同样计入冷却，避免连续重试。
         self._last_ai_call[key] = now
+        self._pending_ai_users.add(key)
+        # 注册前不 await，名额检查和占用在同一事件循环中不会被其他事件打断。
+        task = asyncio.create_task(
+            self._run_ai_reply(group_id, user_id, prompt, send_group, history=history, system=system),
+            name=f"ai-reply-{group_id}-{user_id}",
+        )
+        self._ai_tasks[task] = (send_group, key)
+        task.add_done_callback(self._finish_ai_task)
+
+    async def _run_ai_reply(
+        self,
+        group_id: int,
+        user_id: int,
+        prompt: str,
+        send_group: SendGroup,
+        *,
+        history: list[dict[str, str]] | None = None,
+        system: str | None = None,
+    ) -> None:
+        """后台生成并发送完整回复；隔离错误，不记录聊天文本、样本或凭证。"""
+        started = time.monotonic()
         try:
             kwargs: dict[str, Any] = {"history": history}
             if system is not None:
                 kwargs["system"] = system
-            answer = await self.llm.complete(prompt, **kwargs)
-        except LLMUnavailable as exc:
-            logger.warning("LLM unavailable: %s", exc)
-            await self._send_text(send_group, group_id, f"AI 暂时不可用：{exc}")
-            return
-        await send_group(group_id, [at_segment(user_id), text_segment(f" {answer}")])
+            try:
+                answer = await self.llm.complete(prompt, **kwargs)
+            except LLMUnavailable as exc:
+                logger.warning("LLM unavailable: %s", exc)
+                await self._send_text(send_group, group_id, f"AI 暂时不可用：{exc}")
+                return
+            logger.info("AI generated: group=%s user=%s elapsed=%.2fs", group_id, user_id, time.monotonic() - started)
+            await send_group(group_id, [at_segment(user_id), text_segment(f" {answer}")])
+        except Exception:
+            # 连接可能在生成期间断开，发送失败只影响这条任务。
+            logger.exception("Background AI reply failed: group=%s user=%s", group_id, user_id)
 
     @staticmethod
     async def _send_text(send_group: SendGroup, group_id: int, text: str) -> None:

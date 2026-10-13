@@ -88,6 +88,8 @@ class DeepSeekClient:
                     "model": self.settings.deepseek_model,
                     "messages": messages,
                     "temperature": temperature,
+                    # 通过 API 参数真正关闭深度思考，聊天、锐评和模仿均生效。
+                    "thinking": {"type": "disabled"},
                     # 限制生成长度；stream=False 表示等待完整回复后再返回。
                     "max_tokens": 500,
                     "stream": False,

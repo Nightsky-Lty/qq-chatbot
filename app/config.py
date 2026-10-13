@@ -31,7 +31,9 @@ class Settings(BaseSettings):
     mimic_prefix: str = "/模仿"
     # 冷却单位为秒；上下文和模仿样本限制按消息条数计算。
     ai_cooldown_seconds: int = 8
-    context_message_limit: int = 20
+    # 限制后台请求总数，不建立无上限队列；满额时请用户稍后重试。
+    ai_max_concurrency: int = Field(default=3, ge=1, le=16)
+    context_message_limit: int = Field(default=40, ge=1)
     style_sample_limit: int = 60
     # 保留期单位为天，过期消息在服务启动时清理；非正数表示不自动清理。
     message_retention_days: int = 30
