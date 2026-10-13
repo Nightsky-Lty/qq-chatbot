@@ -12,6 +12,7 @@ from app.database import Database
 from app.llm import DeepSeekClient, LLMUnavailable, SYSTEM_PROMPT
 from app.models import MessageView, at_segment, parse_message, text_segment
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
+from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, StickerSession
 
 logger = logging.getLogger(__name__)
 # 发送回调由连接层提供：业务层传入群号或 QQ 号和消息段，不直接操作 WebSocket。
@@ -34,6 +35,7 @@ HELP_TEXT = """可用命令：
 /删除我的数据
 /模仿 @某人 主题（无需授权，至少需要 5 条本群普通文字发言）
 /帮助
+可在聊天中要求发表情包，图片需先由部署者放入本地图库。
 也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
 
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
@@ -43,6 +45,7 @@ PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 /帮助
 可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
 提醒使用北京时间，目前只支持一次性提醒。
+也可以说“发个开心的表情包”，需要本地图库中有对应图片。
 名单、关键词召集和模仿功能请在群里使用。
 私聊文本和机器人回复会保存在服务器，相关上下文会发送给 DeepSeek。"""
 
@@ -75,6 +78,7 @@ class BotService:
         self.db = database
         self.llm = llm
         self.reminders = reminders
+        self.stickers = StickerService(settings)
         # 冷却记录只存在于内存中，重启服务后会重置。
         self._last_ai_call: dict[AIKey, float] = {}
         self._trigger_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -513,14 +517,28 @@ class BotService:
         scope = "auto" if automatic else ("private" if private else "group")
         try:
             kwargs: dict[str, Any] = {"history": history}
-            if system is not None:
-                kwargs["system"] = system
+            effective_system = system or (PRIVATE_SYSTEM_PROMPT if private else SYSTEM_PROMPT)
+            tool_defs: list[dict[str, Any]] = []
+            sticker_session = None
+            # 自定义模仿提示词不开放表情工具，自动和手动群聊使用同一个群限流键。
+            if self.settings.sticker_enabled and (system is None or private or automatic):
+                conversation = ("private", user_id) if private else ("group", context_id)
+                sticker_session = StickerSession(conversation)
+                tool_defs.extend(STICKER_TOOLS)
+                effective_system += STICKER_INSTRUCTIONS
             if private and self.reminders is not None:
                 # 当前时间由程序提供，身份由实际私聊发信人绑定，不让模型指定QQ。
-                kwargs["system"] = (system or PRIVATE_SYSTEM_PROMPT) + reminder_instructions()
-                kwargs["tools"] = REMINDER_TOOLS
+                effective_system += reminder_instructions()
+                tool_defs.extend(REMINDER_TOOLS)
+            kwargs["system"] = effective_system
+            if tool_defs:
+                kwargs["tools"] = tool_defs
                 async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-                    return await self.reminders.execute_tool(user_id, name, arguments)
+                    if name in {"list_stickers", "send_sticker"} and sticker_session is not None:
+                        return await self.stickers.execute_tool(sticker_session, name, arguments)
+                    if private and self.reminders is not None:
+                        return await self.reminders.execute_tool(user_id, name, arguments)
+                    return {"ok": False, "message": "当前会话不支持这个工具。"}
                 kwargs["execute_tool"] = execute_tool
             try:
                 answer = await self.llm.complete(prompt, **kwargs)
@@ -530,14 +548,23 @@ class BotService:
                     await self._send_text(send_message, context_id, f"AI 暂时不可用：{exc}")
                 return
             logger.info("AI generated: scope=%s context=%s user=%s elapsed=%.2fs", scope, context_id, user_id, time.monotonic() - started)
-            if automatic:
-                if answer.strip() and answer.strip() not in {"[不插话]", "不插话"}:
+            if automatic and answer.strip() in {"[不插话]", "不插话"}:
+                return  # 工具只选择，直到这里都没发图；不插话时一起丢弃。
+            if answer.strip():
+                if automatic:
                     await send_message(context_id, [text_segment(answer)])
-            elif private:
-                await send_message(user_id, [text_segment(answer)])
-                self.db.log_private_message(user_id, "assistant", answer)
-            else:
-                await send_message(context_id, [at_segment(user_id), text_segment(f" {answer}")])
+                elif private:
+                    await send_message(user_id, [text_segment(answer)])
+                    self.db.log_private_message(user_id, "assistant", answer)
+                else:
+                    await send_message(context_id, [at_segment(user_id), text_segment(f" {answer}")])
+            if sticker_session is not None and sticker_session.selected_id is not None:
+                target = user_id if private else context_id
+                submitted = await self.stickers.send_selected(sticker_session, target, send_message)
+                if submitted and private:
+                    self.db.log_private_message(user_id, "assistant", f"[表情包：{sticker_session.selected_id}]")
+                elif not submitted and not answer.strip() and not automatic:
+                    await self._send_text(send_message, target, "表情包刚发过啦，等一会儿再发。")
         except Exception:
             # 连接可能在生成期间断开，发送失败只影响这条任务。
             logger.exception("Background AI reply failed: scope=%s context=%s user=%s", scope, context_id, user_id)

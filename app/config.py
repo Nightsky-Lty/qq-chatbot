@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # 提醒由本地后台调度，到期通知不依赖模型再次生成。
     reminder_poll_seconds: int = Field(default=5, ge=1, le=60)
     reminder_max_pending: int = Field(default=50, ge=1, le=100)
+    # 表情包仅从本地目录读取；每次回复最多一张，发送限制按群或私聊会话计算。
+    sticker_enabled: bool = True
+    sticker_directory: Path = Path("app/sticker_images")
+    sticker_cooldown_seconds: int = Field(default=30, ge=0)
+    sticker_repeat_seconds: int = Field(default=7200, ge=0)
+    sticker_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1, le=10 * 1024 * 1024)
     style_sample_limit: int = 60
     # 保留期单位为天，过期消息在服务启动时清理；非正数表示不自动清理。
     message_retention_days: int = 30

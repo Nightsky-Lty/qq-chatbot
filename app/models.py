@@ -43,6 +43,11 @@ def text_segment(text: str) -> dict[str, Any]:
     return {"type": "text", "data": {"text": text}}
 
 
+def image_segment(file: str) -> dict[str, Any]:
+    """构造图片段；本地表情包使用Base64跨容器发送。"""
+    return {"type": "image", "data": {"file": file}}
+
+
 def at_segment(user_id: int) -> dict[str, Any]:
     """构造 @ 指定用户的消息段，协议中的 QQ 号使用字符串。"""
     return {"type": "at", "data": {"qq": str(user_id)}}

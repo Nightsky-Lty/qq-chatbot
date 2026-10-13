@@ -13,3 +13,8 @@ id_rsa*
 id_ed25519*
 qq-chatbot-deploy.tar.gz
 .DS_Store
+
+# 服务器本地表情素材与描述，避免更新代码时覆盖自建图库。
+/app/sticker_images/*
+!/app/sticker_images/README.md
+!/app/sticker_images/manifest.example.json

@@ -14,11 +14,13 @@ services:
       ADMIN_QQ_IDS: ${ADMIN_QQ_IDS:-}
       # 固定写入挂载目录，避免 .env 中的相对路径将数据库写进临时文件系统。
       DATABASE_PATH: /app/data/bot.db
+      STICKER_DIRECTORY: /app/app/sticker_images
     ports:
       # 健康检查仅供服务器本机访问，NapCat 使用容器内网连接。
       - "127.0.0.1:8080:8080"
     volumes:
       - bot-data:/app/data
+      - ./app/sticker_images:/app/app/sticker_images:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: 30s

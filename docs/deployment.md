@@ -175,6 +175,8 @@ Python 日志出现 `OneBot reverse WebSocket connected` 表示 NapCat 已连接
 
 ## 日常管理
 
+表情包图片直接放在服务器项目的 `app/sticker_images/` 中，支持PNG、JPG/JPEG、GIF和WebP，默认每张最多5MiB；图片文件和自定义 `manifest.json` 不提交Git。默认没有素材，需要自行添加。更新到支持表情包的版本后重新构建机器人，Compose会自动只读挂载图库，无需改NapCat配置或把图片放入NapCat容器。机器人以UID 10001运行，图片须可读、目录须可访问。可用 `/问 发个开心的表情包` 或私聊测试；文件名、描述和标签配置见 [本地表情包](../README.md#本地表情包)。首次更新需要重建容器接入挂载，之后添加图片无需重建。
+
 新版关闭深度思考，AI 在后台执行，不阻塞关键词和管理命令。`CONTEXT_MESSAGE_LIMIT=40`、`AI_MAX_CONCURRENCY=3` 等普通参数位于 `config.env`，会随代码更新；拉取后重新创建机器人容器即可生效。满额时机器人会提示稍后重试，不建立长队列。更多上下文可能增加 API 费用和耗时。
 
 ```bash
