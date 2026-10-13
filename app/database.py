@@ -1,4 +1,4 @@
-"""SQLite 持久化层：保存群配置、聊天和授权，私聊记录独立按用户隔离。"""
+"""SQLite 持久化层：保存群配置及聊天，私聊记录独立按用户隔离。"""
 
 import sqlite3
 import threading
@@ -8,7 +8,7 @@ from pathlib import Path
 
 # 数据表用途：member_lists 存名单，list_members 存成员，trigger_keywords 存关键词，
 # keyword_list_bindings 保存关键词到名单的唯一绑定；外键防止悬空引用。
-# messages 存群聊文本和样本资格，mimic_consent 存各用户在各群的授权。
+# messages 存群聊文本，普通文字发言可用作当前群的模仿样本。
 # private_messages 只存每位用户与机器人的私聊，不作为群聊上下文或模仿样本。
 # WAL 日志模式允许读写操作更好地共存；群号参与键值，隔离不同群的数据。
 SCHEMA = """
@@ -53,19 +53,12 @@ CREATE TABLE IF NOT EXISTS messages (
     user_id INTEGER NOT NULL,
     nickname TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
-    mimic_eligible INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_group_time
     ON messages(group_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_user_time
     ON messages(group_id, user_id, created_at DESC);
-CREATE TABLE IF NOT EXISTS mimic_consent (
-    group_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    consented_at INTEGER NOT NULL,
-    PRIMARY KEY (group_id, user_id)
-);
 CREATE TABLE IF NOT EXISTS private_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -82,24 +75,16 @@ class Database:
     """封装同步数据库操作，通过锁保护共享连接，并用事务提交写入。"""
 
     def __init__(self, path: Path):
-        """创建数据库目录、连接、表结构，并兼容早期数据库缺失的字段。"""
+        """创建数据库目录、连接和表结构，并迁移早期的单名单配置。"""
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
-        # log_message 持锁时会调用同样需要锁的授权查询，因此使用可重入锁。
+        # 绑定关键词时会嵌套调用持锁的名单查询，因此使用可重入锁。
         self._lock = threading.RLock()
         with self._lock:
             self.connection.executescript(SCHEMA)
         with self._lock, self.connection:
-            # 老版本消息表可能没有样本资格字段，补充时默认不授权历史消息。
-            columns = {
-                row["name"]
-                for row in self.connection.execute("PRAGMA table_info(messages)")
-            }
-            if "mimic_eligible" not in columns:
-                self.connection.execute(
-                    "ALTER TABLE messages ADD COLUMN mimic_eligible INTEGER NOT NULL DEFAULT 0"
-                )
+            # 旧库的授权表和样本资格字段不再读写，原样保留，避免为升级重建消息表。
             self._migrate_legacy_lists()
 
     def _migrate_legacy_lists(self) -> None:
@@ -266,16 +251,14 @@ class Database:
     def log_message(
         self, group_id: int, user_id: int, nickname: str, content: str
     ) -> None:
-        """保存非空文本，最多 4000 字；按保存时的授权状态标记样本资格。"""
+        """保存非空群聊文本，最多 4000 字，不再检查或记录模仿授权。"""
         if not content:
             return
         with self._lock, self.connection:
-            # 将当时的授权状态存入消息，之后授权不会让之前的发言自动成为样本。
-            mimic_eligible = int(self.has_mimic_consent(group_id, user_id))
             self.connection.execute(
-                """INSERT INTO messages(group_id,user_id,nickname,content,mimic_eligible,created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (group_id, user_id, nickname, content[:4000], mimic_eligible, int(time.time())),
+                """INSERT INTO messages(group_id,user_id,nickname,content,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (group_id, user_id, nickname, content[:4000], int(time.time())),
             )
 
     def recent_messages(self, group_id: int, limit: int) -> list[sqlite3.Row]:
@@ -291,28 +274,6 @@ class Database:
         # 倒序查询便于限制最新条数，反转后符合聊天上下文的时间顺序。
         rows.reverse()
         return rows
-
-    def set_mimic_consent(self, group_id: int, user_id: int, enabled: bool) -> None:
-        """设置用户在当前群的授权；撤销只删除授权记录，不删除历史消息。"""
-        with self._lock, self.connection:
-            if enabled:
-                self.connection.execute(
-                    "INSERT OR REPLACE INTO mimic_consent(group_id,user_id,consented_at) VALUES(?,?,?)",
-                    (group_id, user_id, int(time.time())),
-                )
-            else:
-                self.connection.execute(
-                    "DELETE FROM mimic_consent WHERE group_id=? AND user_id=?",
-                    (group_id, user_id),
-                )
-
-    def has_mimic_consent(self, group_id: int, user_id: int) -> bool:
-        """查询用户是否仍允许在当前群被模仿。"""
-        with self._lock:
-            return self.connection.execute(
-                "SELECT 1 FROM mimic_consent WHERE group_id=? AND user_id=?",
-                (group_id, user_id),
-            ).fetchone() is not None
 
     def log_private_message(self, user_id: int, role: str, content: str) -> None:
         """保存私聊用户文本或已提交发送的机器人回复，每条最多 4000 字。"""
@@ -336,7 +297,7 @@ class Database:
         return rows
 
     def delete_private_messages(self, user_id: int) -> int:
-        """删除该用户的全部私聊记录，不影响群聊、名单或模仿授权。"""
+        """删除该用户的全部私聊记录，不影响群聊或名单。"""
         with self._lock, self.connection:
             cursor = self.connection.execute(
                 "DELETE FROM private_messages WHERE user_id=?", (user_id,)
@@ -344,15 +305,13 @@ class Database:
             return cursor.rowcount
 
     def style_samples(self, group_id: int, user_id: int, limit: int) -> list[str]:
-        """取目标用户授权期间保存的最新文本，按从旧到新返回。
-
-        此方法只检查消息的样本资格，调用方还需要确认用户当前仍然授权。
-        """
+        """取目标用户在当前群的最新普通文字，排除空文本及 / 指令，不读私聊。"""
         with self._lock:
             rows = list(
                 self.connection.execute(
                     """SELECT content FROM messages
-                       WHERE group_id=? AND user_id=? AND mimic_eligible=1
+                       WHERE group_id=? AND user_id=?
+                           AND trim(content)<>'' AND ltrim(content) NOT LIKE '/%'
                        ORDER BY id DESC LIMIT ?""",
                     (group_id, user_id, limit),
                 )
@@ -360,14 +319,10 @@ class Database:
         return [row["content"] for row in reversed(rows)]
 
     def delete_user_messages(self, group_id: int, user_id: int) -> int:
-        """删除用户在指定群的全部消息并撤销模仿授权，返回删除的消息条数。"""
+        """删除用户在指定群的全部消息及模仿样本，不影响名单或私聊。"""
         with self._lock, self.connection:
             cursor = self.connection.execute(
                 "DELETE FROM messages WHERE group_id=? AND user_id=?",
-                (group_id, user_id),
-            )
-            self.connection.execute(
-                "DELETE FROM mimic_consent WHERE group_id=? AND user_id=?",
                 (group_id, user_id),
             )
             return cursor.rowcount

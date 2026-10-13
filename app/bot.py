@@ -1,4 +1,4 @@
-"""机器人业务逻辑：群命令与召集、隔离的私聊、后台聊天和授权风格模仿。"""
+"""机器人业务逻辑：群命令与召集、隔离的私聊、后台聊天和发言风格模仿。"""
 
 import asyncio
 import logging
@@ -30,9 +30,8 @@ HELP_TEXT = """可用命令：
 只有完整发送已绑定的关键词，才会 @ 对应名单；改绑需先解绑。
 /问 内容（或直接 @机器人）
 /锐评 内容
-/允许模仿｜/禁止模仿（只能为自己授权）
 /删除我的数据
-/模仿 @某人 主题
+/模仿 @某人 主题（无需授权，至少需要 5 条本群普通文字发言）
 /帮助
 也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
 
@@ -121,7 +120,7 @@ class BotService:
         is_admin = user_id in self.settings.admin_qq_ids or role in {"owner", "admin"}
 
         # 已识别的命令不再参与关键词召集或普通聊天，避免一次触发多个功能。
-        if await self._handle_command(group_id, user_id, nickname, view, is_admin, send_group):
+        if await self._handle_command(group_id, user_id, view, is_admin, send_group):
             return
         await self._handle_keyword(group_id, view.text, send_group)
         if self_id and self_id in view.mentions:
@@ -144,7 +143,7 @@ class BotService:
             deleted = self.db.delete_private_messages(user_id)
             await self._send_text(send_private, user_id, f"已删除你与机器人的 {deleted} 条私聊记录，群聊数据不受影响。")
             return
-        group_only = ("/名单", "/关键词", "/允许模仿", "/禁止模仿", self.settings.mimic_prefix)
+        group_only = ("/名单", "/关键词", self.settings.mimic_prefix)
         if text.startswith(group_only):
             await self._send_text(send_private, user_id, "这个功能只支持群聊，请在群里使用。私聊发 /帮助 可以查看可用命令。")
             return
@@ -176,7 +175,6 @@ class BotService:
         self,
         group_id: int,
         user_id: int,
-        nickname: str,
         view: MessageView,
         is_admin: bool,
         send_group: SendGroup,
@@ -198,18 +196,13 @@ class BotService:
                 return True
             await self._manage_keywords(group_id, text, send_group)
             return True
-        if text == "/允许模仿":
-            # 使用发送者自己的 QQ 号授权，无法通过 @ 替他人授权。
-            self.db.set_mimic_consent(group_id, user_id, True)
-            await self._send_text(send_group, group_id, f"已记录 {nickname} 的授权。之后的新发言可作为风格样本。")
-            return True
-        if text == "/禁止模仿":
-            self.db.set_mimic_consent(group_id, user_id, False)
-            await self._send_text(send_group, group_id, f"已关闭 {nickname} 的模仿授权。")
+        if text in {"/允许模仿", "/禁止模仿"}:
+            # 旧指令只做停用提示，不能让用户误以为仍然控制样本使用权限。
+            await self._send_text(send_group, group_id, f"模仿授权功能已移除，这个旧指令不再生效。群内可以直接使用 {self.settings.mimic_prefix} @某人 [主题]。")
             return True
         if text == "/删除我的数据":
             deleted = self.db.delete_user_messages(group_id, user_id)
-            await self._send_text(send_group, group_id, f"已删除你在本群保存的 {deleted} 条消息，并关闭模仿授权。")
+            await self._send_text(send_group, group_id, f"已删除你在本群保存的 {deleted} 条消息及模仿样本，之后的新发言仍会保存。")
             return True
         if text.startswith(self.settings.mimic_prefix):
             await self._mimic(group_id, user_id, text, view.mentions, send_group)
@@ -368,23 +361,20 @@ class BotService:
     async def _mimic(
         self, group_id: int, user_id: int, text: str, mentions: list[int], send_group: SendGroup
     ) -> None:
-        """确认目标用户授权和样本数量后，用其发言样本生成指定主题的新话。"""
+        """样本数量足够时直接模仿目标用户在本群的说话风格，无需授权。"""
         if not mentions:
             await self._send_text(send_group, group_id, f"用法：{self.settings.mimic_prefix} @某人 [主题]")
             return
-        # 一次只模仿首个被 @ 的用户，至少需要 5 条授权期间保存的消息。
+        # 一次只模仿首个被 @ 的用户，至少需要 5 条本群普通文字发言。
         target = mentions[0]
-        if not self.db.has_mimic_consent(group_id, target):
-            await self._send_text(send_group, group_id, "对方尚未发送 /允许模仿，不能模仿。")
-            return
         samples = self.db.style_samples(group_id, target, self.settings.style_sample_limit)
         if len(samples) < 5:
-            await self._send_text(send_group, group_id, "可用样本不足，至少需要 5 条发言。")
+            await self._send_text(send_group, group_id, "可用样本不足，至少需要 5 条本群普通文字发言（不含指令）。")
             return
         topic = text.replace(self.settings.mimic_prefix, "", 1).replace(f"@{target}", "").strip() or "随便聊两句"
         # 每条样本截取前 300 字，减少提示词长度和模型调用成本。
         sample_text = "\n".join(f"- {sample[:300]}" for sample in samples)
-        system = """根据用户主动授权的聊天样本，提炼语言风格并生成一句新话。
+        system = """根据提供的群聊文字样本，提炼语言风格并生成一句新话。
 不要声称自己就是该用户，不复述隐私信息，不模仿敏感身份特征，不输出分析过程。只输出生成的话，最多 100 字。"""
         await self._ai_reply(
             group_id,
