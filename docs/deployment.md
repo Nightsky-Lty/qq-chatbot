@@ -131,14 +131,28 @@ Compose 的管理端口绑定在服务器的 `127.0.0.1`，所以不需要在云
 
 ```text
 /帮助
-/名单 添加 @某人
+/名单 创建 开黑队
+/名单 添加 开黑队 @某人
 /关键词 添加 开黑
+/关键词 绑定 开黑 开黑队
 /问 你好
 ```
 
 `/帮助` 验证 QQ 收发链路，`/问` 验证 DeepSeek 请求。机器人账号无需成为群管理员；维护名单的发令用户必须是群主、群管理员，或配置在 `ADMIN_QQ_IDS` 中。
 
-添加关键词“开黑”后，单独发送“开黑”会召集名单成员；“今晚开黑吗”不会触发。关键词匹配忽略首尾空白，但要求文本整体相同。
+创建名单、添加成员并绑定关键词“开黑”后，单独发送“开黑”只会召集“开黑队”成员；“今晚开黑吗”不会触发。关键词匹配忽略首尾空白，但要求文本整体相同。未绑定的关键词不触发，一个关键词只能绑定一个名单，多个关键词可共用名单。命令详情见 [README](../README.md#群内命令)。
+
+旧版本升级会自动将原名单迁为“默认”，将旧关键词绑定到它。迁移不删除成员，但不支持直接回退旧版代码；升级前请备份数据库。例如在服务器项目目录执行以下命令，短暂停止机器人并将整个数据卷复制到本机备份目录：
+
+```bash
+sudo docker compose stop bot
+mkdir -p backups
+backup_dir="$(mktemp -d "$PWD/backups/bot-data.XXXXXX")"
+sudo docker cp "$(sudo docker compose ps -a -q bot):/app/data/." "$backup_dir/"
+sudo docker compose start bot
+```
+
+复制命令成功才代表备份完成；备份同时包含 SQLite 数据库及可能存在的 WAL 文件。请保留该目录；QQ 登录状态和 NapCat 配置不包含在这份备份中。
 
 查看日志：
 
@@ -156,7 +170,7 @@ Python 日志出现 `OneBot reverse WebSocket connected` 表示 NapCat 已连接
 sudo docker compose up -d --force-recreate
 
 # 修改代码后重新构建机器人镜像
-git pull --ff-only
+git pull --ff-only && \
 sudo docker compose up -d --build bot
 
 # 查看资源占用

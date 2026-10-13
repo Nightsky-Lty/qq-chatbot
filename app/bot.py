@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import time
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
@@ -17,8 +18,12 @@ SendGroup = Callable[[int, list[dict[str, Any]]], Awaitable[None]]
 
 
 HELP_TEXT = """可用命令：
-/名单 添加 @某人｜删除 @某人｜查看
+/名单 创建 名单名｜删除名单 名单名
+/名单 添加 名单名 @某人｜删除 名单名 @某人
+/名单 查看 [名单名]
 /关键词 添加 词｜删除 词｜查看
+/关键词 绑定 词 名单名｜解绑 词
+只有完整发送已绑定的关键词，才会 @ 对应名单；改绑需先解绑。
 /问 内容（或直接 @机器人）
 /锐评 内容
 /允许模仿｜/禁止模仿（只能为自己授权）
@@ -137,65 +142,121 @@ class BotService:
         return False
 
     async def _manage_users(self, group_id: int, text: str, mentions: list[int], send_group: SendGroup) -> None:
-        """维护当前群的召集名单，添加和删除的对象来自消息中的 @ 用户。"""
-        if "查看" in text:
-            users = self.db.list_managed_users(group_id)
-            if not users:
-                await self._send_text(send_group, group_id, "当前名单为空。")
-                return
-            message: list[dict[str, Any]] = [text_segment("当前名单：")]
-            for row in users:
-                message.extend([text_segment(" "), at_segment(row["user_id"])])
-            await send_group(group_id, message)
+        """独立管理命名名单；旧的无名单名成员命令继续操作迁移后的“默认”名单。"""
+        usage = "用法：/名单 创建|删除名单 名单名；/名单 添加|删除 名单名 @某人；/名单 查看 [名单名]。名单名为 1～32 字且不能含空白或 @。"
+        parts = text.split(maxsplit=2)
+        if len(parts) < 2 or parts[0] != "/名单":
+            await self._send_text(send_group, group_id, usage)
             return
-        if not mentions:
-            await self._send_text(send_group, group_id, "请 @ 要操作的用户，例如：/名单 添加 @某人")
+        action = parts[1]
+        argument = parts[2].strip() if len(parts) == 3 else ""
+        if action == "查看" and not argument:
+            lists = self.db.list_lists(group_id)
+            content = "\n".join(f'{row["name"]}（{row["member_count"]} 人）' for row in lists)
+            await self._send_text(send_group, group_id, "当前群的名单：\n" + (content or "暂无，请先用 /名单 创建 名单名"))
             return
-        if "添加" in text:
+        if action not in {"创建", "删除名单", "查看", "添加", "删除"}:
+            await self._send_text(send_group, group_id, usage)
+            return
+        if action in {"添加", "删除"}:
+            # @ 消息段已被解析为 @QQ号；仅移除实际提及，不能把普通数字当作目标。
             for target in mentions:
-                self.db.add_managed_user(group_id, target)
-            await self._send_text(send_group, group_id, f"已添加 {len(mentions)} 人。")
-        elif "删除" in text:
-            removed = sum(self.db.remove_managed_user(group_id, target) for target in mentions)
-            await self._send_text(send_group, group_id, f"已删除 {removed} 人。")
+                argument = re.sub(rf"@{target}(?!\d)", " ", argument)
+            name = argument.strip() or "默认"
         else:
-            await self._send_text(send_group, group_id, "用法：/名单 添加|删除 @某人，或 /名单 查看")
+            name = argument
+        if not name or len(name) > 32 or any(char.isspace() for char in name) or "@" in name:
+            await self._send_text(send_group, group_id, usage)
+            return
+        if action == "创建":
+            created = self.db.create_list(group_id, name)
+            await self._send_text(send_group, group_id, f"已创建名单：{name}" if created else f"名单“{name}”已存在。")
+            return
+        if not self.db.has_list(group_id, name):
+            await self._send_text(send_group, group_id, f"名单“{name}”不存在，请先发送 /名单 创建 {name}")
+            return
+        if action == "删除名单":
+            self.db.delete_list(group_id, name)
+            await self._send_text(send_group, group_id, f"已删除名单“{name}”及其成员，相关关键词已解绑但未删除。")
+        elif action == "查看":
+            users = self.db.list_managed_users(group_id, name)
+            content = "、".join(str(row["user_id"]) for row in users) or "暂无成员"
+            # 管理时只列出 QQ 号，不额外 @；真正召集由关键词触发。
+            await self._send_text(send_group, group_id, f"名单“{name}”：{content}")
+        elif not mentions:
+            await self._send_text(send_group, group_id, f"请 @ 要操作的用户，例如：/名单 {action} {name} @某人")
+        elif action == "添加":
+            targets = list(dict.fromkeys(mentions))
+            for target in targets:
+                self.db.add_managed_user(group_id, name, target)
+            await self._send_text(send_group, group_id, f"已将 {len(targets)} 人加入名单“{name}”（已有成员不会重复添加）。")
+        elif action == "删除":
+            removed = sum(self.db.remove_managed_user(group_id, name, target) for target in set(mentions))
+            await self._send_text(send_group, group_id, f"已从名单“{name}”删除 {removed} 人。")
 
     async def _manage_keywords(self, group_id: int, text: str, send_group: SendGroup) -> None:
-        """维护当前群的关键词，按命令、操作、关键词三部分解析输入。"""
-        if "查看" in text:
+        """独立维护关键词及绑定，允许多关键词共用名单，但禁止直接覆盖绑定。"""
+        usage = "用法：/关键词 添加|删除|解绑 关键词；/关键词 绑定 关键词 名单名；/关键词 查看"
+        parts = text.split(maxsplit=2)
+        if len(parts) < 2 or parts[0] != "/关键词":
+            await self._send_text(send_group, group_id, usage)
+            return
+        action = parts[1]
+        if action == "查看" and len(parts) == 2:
             keywords = self.db.list_keywords(group_id)
-            await self._send_text(send_group, group_id, "关键词：" + ("、".join(keywords) if keywords else "暂无"))
+            content = "\n".join(f'{row["keyword"]} → {row["list_name"] or "未绑定"}' for row in keywords)
+            await self._send_text(send_group, group_id, "关键词与名单：\n" + (content or "暂无"))
             return
         # 最多拆分两次，保留关键词内部的空格。
-        parts = text.split(maxsplit=2)
         if len(parts) < 3 or not parts[2].strip():
-            await self._send_text(send_group, group_id, "用法：/关键词 添加|删除 关键词")
+            await self._send_text(send_group, group_id, usage)
             return
         action, keyword = parts[1], parts[2].strip()
         if action == "添加":
-            self.db.add_keyword(group_id, keyword)
-            await self._send_text(send_group, group_id, f"已添加关键词：{keyword}")
+            created = self.db.add_keyword(group_id, keyword)
+            await self._send_text(send_group, group_id, f"已添加关键词：{keyword}。请绑定名单后使用。" if created else f"关键词“{keyword}”已存在，原绑定保持不变。")
         elif action == "删除":
             removed = self.db.remove_keyword(group_id, keyword)
             await self._send_text(send_group, group_id, "已删除。" if removed else "没有找到这个关键词。")
+        elif action == "绑定":
+            # 最后一个空白分隔的参数是名单名，关键词内部的空格仍然保留。
+            binding = keyword.rsplit(maxsplit=1)
+            if len(binding) != 2:
+                await self._send_text(send_group, group_id, usage)
+                return
+            keyword, name = binding
+            result = self.db.bind_keyword(group_id, keyword, name)
+            replies = {
+                "bound": f"已绑定：{keyword} → {name}",
+                "already_bound": f"关键词“{keyword}”已经绑定名单“{name}”。",
+                "missing_keyword": f"关键词不存在，请先发送 /关键词 添加 {keyword}",
+                "missing_list": f"名单不存在，请先发送 /名单 创建 {name}",
+                "conflict": f"关键词“{keyword}”已绑定其他名单，不能绑定多个名单。请先发送 /关键词 解绑 {keyword} 再重新绑定。",
+            }
+            await self._send_text(send_group, group_id, replies[result])
+        elif action == "解绑":
+            removed = self.db.unbind_keyword(group_id, keyword)
+            await self._send_text(send_group, group_id, "已解绑，关键词和名单均保留。" if removed else "这个关键词不存在或尚未绑定名单。")
         else:
-            await self._send_text(send_group, group_id, "用法：/关键词 添加|删除 关键词")
+            await self._send_text(send_group, group_id, usage)
 
     async def _handle_keyword(self, group_id: int, text: str, send_group: SendGroup) -> None:
-        """消息文本与某个关键词完全相同时，分批 @ 当前群名单中的所有用户。"""
+        """消息文本与已绑定关键词完全相同时，只召集对应名单的成员。"""
         # 忽略首尾空白，保留消息内部内容；关键词作为其他句子的子串时不触发。
         text = text.strip()
-        if not text or text not in self.db.list_keywords(group_id):
+        if not text:
             return
         # 按群串行发送，避免同一群的两次召集消息相互穿插；此处没有触发冷却。
         async with self._trigger_locks[group_id]:
-            users = self.db.list_managed_users(group_id)
+            name = self.db.keyword_list(group_id, text)
+            if name is None:
+                return
+            users = self.db.list_managed_users(group_id, name)
             if not users:
                 return
             # 每条消息最多包含 20 个 @ 用户，控制单次消息大小。
             for start in range(0, len(users), 20):
-                message: list[dict[str, Any]] = [text_segment("集合啦：")]
+                message: list[dict[str, Any]] = [text_segment(f"{name}，集合啦：")]
                 for row in users[start : start + 20]:
                     message.extend([text_segment(" "), at_segment(row["user_id"])])
                 await send_group(group_id, message)
