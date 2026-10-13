@@ -5,29 +5,15 @@ services:
     build: .
     restart: unless-stopped
     init: true
+    # 普通配置随 Git 更新；密钥和部署身份只从本地 .env 注入。
+    env_file:
+      - config.env
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?请先在 .env 中填写 DeepSeek API Key}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
-      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
       ONEBOT_ACCESS_TOKEN: ${ONEBOT_ACCESS_TOKEN:?请先在 .env 中填写 OneBot Token}
       ADMIN_QQ_IDS: ${ADMIN_QQ_IDS:-}
       # 固定写入挂载目录，避免 .env 中的相对路径将数据库写进临时文件系统。
       DATABASE_PATH: /app/data/bot.db
-      BOT_NAME: ${BOT_NAME:-小群友}
-      CHAT_PREFIX: ${CHAT_PREFIX:-/问}
-      EVALUATE_PREFIX: ${EVALUATE_PREFIX:-/锐评}
-      MIMIC_PREFIX: ${MIMIC_PREFIX:-/模仿}
-      AI_COOLDOWN_SECONDS: ${AI_COOLDOWN_SECONDS:-8}
-      AI_MAX_CONCURRENCY: ${AI_MAX_CONCURRENCY:-3}
-      CONTEXT_MESSAGE_LIMIT: ${CONTEXT_MESSAGE_LIMIT:-40}
-      AUTO_CHAT_ENABLED: ${AUTO_CHAT_ENABLED:-true}
-      AUTO_CHAT_MIN_USERS: ${AUTO_CHAT_MIN_USERS:-3}
-      AUTO_CHAT_WINDOW_SECONDS: ${AUTO_CHAT_WINDOW_SECONDS:-180}
-      AUTO_CHAT_COOLDOWN_SECONDS: ${AUTO_CHAT_COOLDOWN_SECONDS:-30}
-      REMINDER_POLL_SECONDS: ${REMINDER_POLL_SECONDS:-5}
-      REMINDER_MAX_PENDING: ${REMINDER_MAX_PENDING:-50}
-      STYLE_SAMPLE_LIMIT: ${STYLE_SAMPLE_LIMIT:-60}
-      MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS:-30}
     ports:
       # 健康检查仅供服务器本机访问，NapCat 使用容器内网连接。
       - "127.0.0.1:8080:8080"
@@ -46,7 +32,7 @@ services:
         max-file: "3"
 
   napcat:
-    image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}
+    image: mlikiowa/napcat-docker:latest
     restart: unless-stopped
     depends_on:
       bot:

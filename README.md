@@ -50,7 +50,7 @@
 - 所有群同时最多一个自动 AI 请求，共用 `AI_MAX_CONCURRENCY` 总上限；优先避开本群已有的手动请求，并尽量保留一个名额给手动提问。总上限为 1 时无法保留额外名额。忙碌时静默跳过，不排队或刷提示。
 - 人数、窗口和冷却状态只存内存，重启后重新统计。群内 `/删除我的数据` 也会移除本人的自动接话缓存，并取消当前群未完成的自动请求。
 
-可在 `.env` 中调整或关闭：
+可在版本库中的 `config.env` 调整或关闭：
 
 ```dotenv
 AUTO_CHAT_ENABLED=true
@@ -222,7 +222,7 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 
 ## 配置说明
 
-配置模板为 [.env.example](.env.example)。本地运行从 `.env` 和环境变量读取配置；Compose 显式将对应配置传入容器。
+配置分为两层：版本库中的 [config.env](config.env) 保存可公开的普通运行参数，服务器本地的 `.env` 只保存 API Key、Token 和管理员 QQ。Compose 将前者注入机器人容器，再用 `.env` 中的私密值补齐敏感字段。本地直接运行 Python 时，按 `config.env` → `.env` → 进程环境变量的顺序覆盖；若希望普通参数随代码更新，旧 `.env` 中应移除同名普通字段。
 
 | 配置项 | 默认值 | 用途 |
 | --- | --- | --- |
@@ -231,7 +231,7 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 请求使用的模型名，以账号可用模型为准 |
 | `ONEBOT_ACCESS_TOKEN` | 空 | NapCat 与机器人连接认证；部署时设置随机值 |
 | `NAPCAT_WEBUI_TOKEN` | 无 | 云端 NapCat 管理页面密码，与 OneBot Token 分开设置 |
-| `NAPCAT_IMAGE` | `mlikiowa/napcat-docker:latest` | Compose 使用的 NapCat 镜像，可指定版本标签 |
+| NapCat 镜像 | `mlikiowa/napcat-docker:latest` | 在 `compose.yaml` 中维护，随代码更新 |
 | `ADMIN_QQ_IDS` | 空集合 | 额外管理员 QQ 号，例如 `123456789,987654321` |
 | `DATABASE_PATH` | `data/bot.db` | 本地数据库路径；Compose 固定为 `/app/data/bot.db` |
 | `CHAT_PREFIX` | `/问` | 聊天命令前缀 |
@@ -271,9 +271,9 @@ sudo docker compose down
 sudo docker compose up -d
 ```
 
-修改 `.env` 后，执行 `sudo docker compose up -d --force-recreate` 更新容器环境。NapCat 的 Token 和网络设置只在首次创建配置时自动初始化；已有部署需要同步在 NapCat WebUI 修改。
+修改 `.env` 中的私密值后，执行 `sudo docker compose up -d --force-recreate` 更新容器环境。NapCat 的 Token 和网络设置只在首次创建配置时自动初始化；已有部署需要同步在 NapCat WebUI 修改。
 
-已有 `.env` 不会被 `git pull` 修改。如果其中仍然是 `CONTEXT_MESSAGE_LIMIT=20`（或之前设为 8），需要手动改为 `CONTEXT_MESSAGE_LIMIT=40`，否则会覆盖新版默认值。`AI_MAX_CONCURRENCY=3` 可选填写；未填写时使用默认值。只修改机器人环境时，使用 `sudo docker compose up -d --no-deps --force-recreate bot`，无需重建 NapCat。
+普通参数统一在 `config.env` 中维护并随 `git pull` 更新，拉取后重新创建 `bot` 容器即可生效。旧版 `.env` 中即使还保留 `CONTEXT_MESSAGE_LIMIT` 等普通字段，Compose 也不会再把它们注入容器；可以在确认密钥和管理员 QQ 已保留后删掉这些旧字段。只修改普通配置时，使用 `sudo docker compose up -d --no-deps --force-recreate bot`，无需重建 NapCat。
 
 不要执行 `docker compose down -v`，它会删除本项目的数据库、QQ 登录状态和 NapCat 配置数据卷。数据卷可以防止普通重建丢失数据，但不替代备份。
 
@@ -286,7 +286,7 @@ git clone https://github.com/Nightsky-Lty/qq-chatbot.git
 cd qq-chatbot
 uv sync --frozen
 cp .env.example .env
-# 编辑 .env，至少配置 API Key、OneBot Token 和管理员 QQ 号
+# 编辑 .env，只配置 API Key、两个 Token 和管理员 QQ 号
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8080
 ```
 
@@ -310,10 +310,11 @@ app/
 ├── models.py     # OneBot 消息解析、文本和 @ 消息段构造
 ├── config.py     # 配置读取、校验和默认值
 └── __init__.py   # Python 应用包标记
+config.env         # 可提交的普通配置，随 git pull 更新
 docs/deployment.md # Ubuntu 安装、部署和管理说明
 Dockerfile         # Python 机器人镜像
 compose.yaml       # 机器人与 NapCat 的容器编排
-.env.example       # 环境配置模板，不包含真实密钥
+.env.example       # 本地私密配置模板，不包含真实密钥
 pyproject.toml     # Python 依赖声明
 uv.lock            # Python 依赖版本锁定
 ```

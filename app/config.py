@@ -1,4 +1,4 @@
-"""统一读取和管理机器人配置，配置来源包括环境变量和项目根目录的 .env。"""
+"""统一读取配置：普通值来自 config.env，私密值来自 .env 或进程环境。"""
 
 import json
 from functools import lru_cache
@@ -12,8 +12,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 class Settings(BaseSettings):
     """机器人配置及默认值，环境变量名称与字段名称对应，不区分大小写。"""
 
-    # 允许 .env 中存在额外字段，便于在共享配置文件中保留其他服务的配置。
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # 本地运行时以 .env 覆盖仓库默认值；Compose 只从 .env 显式注入敏感字段，
+    # 因而服务器旧 .env 中残留的普通参数不会阻止 config.env 随 git pull 更新。
+    model_config = SettingsConfigDict(env_file=("config.env", ".env"), extra="ignore")
 
     # DeepSeek 请求的认证信息、接口地址和模型名称。
     deepseek_api_key: str = ""
@@ -59,5 +60,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """缓存配置对象，避免重复读取 .env；配置修改后需要重启服务。"""
+    """缓存配置对象，避免重复读取配置文件；配置修改后需要重启服务。"""
     return Settings()

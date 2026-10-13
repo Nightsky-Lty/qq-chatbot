@@ -84,7 +84,7 @@ NAPCAT_WEBUI_TOKEN=第二次生成的随机字符串
 ADMIN_QQ_IDS=你的管理员QQ号
 ```
 
-管理员是你日常操作机器人的 QQ 号，不一定是机器人登录的 QQ 号；可以逗号分隔多个人。`nano` 保存按 Ctrl+O、回车，退出按 Ctrl+X。Key 和 Token 只填写在服务器的 `.env` 中。
+管理员是你日常操作机器人的 QQ 号，不一定是机器人登录的 QQ 号；可以逗号分隔多个人。`nano` 保存按 Ctrl+O、回车，退出按 Ctrl+X。`.env` 只保存每个部署独有或敏感的值，不提交到 Git；模型、并发、冷却和提醒间隔等普通参数保存在版本库中的 `config.env`。
 
 Compose 会自动读取这些配置，并为 NapCat 设置反向 WebSocket URL。数据库路径在容器中固定为 `/app/data/bot.db`，由数据卷保存。
 
@@ -99,7 +99,7 @@ curl http://127.0.0.1:8080/health
 
 第一次构建需要下载 Python、uv、NapCat 镜像和 Python 依赖。机器人容器健康检查通过后，NapCat 才会启动。健康检查返回 `{"status":"ok"}` 仅代表 Python 服务已启动，不代表 QQ 已登录。
 
-镜像拉取失败时，先查看错误涉及 Docker Hub、GHCR 还是 PyPI，再处理对应网络问题；Docker 镜像下载由 Docker daemon 负责，不会自动使用终端的代理设置。NapCat 官方镜像也可以用 `NAPCAT_IMAGE` 选择明确的版本标签。
+镜像拉取失败时，先查看错误涉及 Docker Hub、GHCR 还是 PyPI，再处理对应网络问题；Docker 镜像下载由 Docker daemon 负责，不会自动使用终端的代理设置。NapCat 镜像版本在 `compose.yaml` 中维护。
 
 ## 5. 在电脑上打开 NapCat，扫码登录
 
@@ -150,7 +150,7 @@ Compose 的管理端口绑定在服务器的 `127.0.0.1`，所以不需要在云
 
 新版默认支持自动加入话题：同一群最近 180 秒内至少 3 位不同群友发普通文字，可触发简短接话，无需命令或 @；每次自动尝试结束后冷却 30 秒。指令、关键词召集、@ 机器人、私聊和无文字消息不计人数，重启后重新统计；忙碌或不适合插话时静默跳过。开启时普通群聊天也可能自动作为上下文发给 DeepSeek，请向群成员说明，并关注 API 用量。
 
-可在 `.env` 配置 `AUTO_CHAT_ENABLED=true`、`AUTO_CHAT_MIN_USERS=3`、`AUTO_CHAT_WINDOW_SECONDS=180`、`AUTO_CHAT_COOLDOWN_SECONDS=30`；未填则使用默认值。如果已有 `.env` 填了旧值 120，需要手动改为 30，否则会覆盖新版默认值。将 `AUTO_CHAT_ENABLED=false` 可以关闭，不影响手动或私聊。修改后运行 `sudo docker compose up -d --no-deps --force-recreate bot` 生效；更新代码还需要加 `--build`。不需要清空数据库。
+自动接话参数保存在 `config.env`：`AUTO_CHAT_ENABLED=true`、`AUTO_CHAT_MIN_USERS=3`、`AUTO_CHAT_WINDOW_SECONDS=180`、`AUTO_CHAT_COOLDOWN_SECONDS=30`。将 `AUTO_CHAT_ENABLED=false` 可以关闭，不影响手动或私聊。修改后运行 `sudo docker compose up -d --no-deps --force-recreate bot` 生效；更新代码还需要加 `--build`。不需要清空数据库。
 
 旧版本升级会自动将原名单迁为“默认”，将旧关键词绑定到它。迁移不删除成员，但不支持直接回退旧版代码；升级前请备份数据库。例如在服务器项目目录执行以下命令，短暂停止机器人并将整个数据卷复制到本机备份目录：
 
@@ -175,10 +175,10 @@ Python 日志出现 `OneBot reverse WebSocket connected` 表示 NapCat 已连接
 
 ## 日常管理
 
-新版关闭深度思考，AI 在后台执行，不阻塞关键词和管理命令。已有 `.env` 中的配置不会随代码更新：如果希望使用更长上下文，请手动改为 `CONTEXT_MESSAGE_LIMIT=40`；可添加 `AI_MAX_CONCURRENCY=3` 控制群聊和私聊共用的请求并发。满额时机器人会提示稍后重试，不建立长队列。更多上下文可能增加 API 费用和耗时。
+新版关闭深度思考，AI 在后台执行，不阻塞关键词和管理命令。`CONTEXT_MESSAGE_LIMIT=40`、`AI_MAX_CONCURRENCY=3` 等普通参数位于 `config.env`，会随代码更新；拉取后重新创建机器人容器即可生效。满额时机器人会提示稍后重试，不建立长队列。更多上下文可能增加 API 费用和耗时。
 
 ```bash
-# 修改 .env 后重新创建容器，使新配置生效
+# 修改 .env 密钥或 config.env 普通参数后，重新创建容器使配置生效
 sudo docker compose up -d --force-recreate
 
 # 修改代码后重新构建机器人镜像
