@@ -183,8 +183,10 @@ class BotService:
             await self._send_text(send_group, group_id, "用法：/关键词 添加|删除 关键词")
 
     async def _handle_keyword(self, group_id: int, text: str, send_group: SendGroup) -> None:
-        """文本包含任一关键词时，分批 @ 当前群名单中的所有用户。"""
-        if not text or not any(keyword in text for keyword in self.db.list_keywords(group_id)):
+        """消息文本与某个关键词完全相同时，分批 @ 当前群名单中的所有用户。"""
+        # 忽略首尾空白，保留消息内部内容；关键词作为其他句子的子串时不触发。
+        text = text.strip()
+        if not text or text not in self.db.list_keywords(group_id):
             return
         # 按群串行发送，避免同一群的两次召集消息相互穿插；此处没有触发冷却。
         async with self._trigger_locks[group_id]:
