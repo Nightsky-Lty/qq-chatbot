@@ -363,7 +363,6 @@ compose.yaml       # 机器人与 NapCat 的容器编排
 .env.example       # 本地私密配置模板，不包含真实密钥
 pyproject.toml     # Python 依赖声明
 uv.lock            # Python 依赖版本锁定
-tests/test_stickers.py # 表情包及工具消息链路的离线回归测试
 ```
 
 ## 常见问题
