@@ -68,6 +68,20 @@ CREATE TABLE IF NOT EXISTS private_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_private_messages_user_id
     ON private_messages(user_id, id DESC);
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    due_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status,due_at,next_attempt_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reminders_pending_unique
+    ON reminders(user_id,content,due_at) WHERE status='pending';
 """
 
 
@@ -304,6 +318,83 @@ class Database:
             )
             return cursor.rowcount
 
+    def delete_private_data(self, user_id: int) -> tuple[int, int]:
+        """原子删除本人的私聊及全部提醒记录，返回两类记录的数量。"""
+        with self._lock, self.connection:
+            messages = self.connection.execute("DELETE FROM private_messages WHERE user_id=?", (user_id,))
+            reminders = self.connection.execute("DELETE FROM reminders WHERE user_id=?", (user_id,))
+            return messages.rowcount, reminders.rowcount
+
+    def create_reminder(self, user_id: int, content: str, due_at: int, max_pending: int) -> tuple[sqlite3.Row, bool]:
+        """创建持久提醒；同人同内容同时间的未完成提醒复用，防止工具重复调用。"""
+        with self._lock, self.connection:
+            existing = self.connection.execute(
+                "SELECT * FROM reminders WHERE user_id=? AND content=? AND due_at=? AND status='pending'",
+                (user_id, content, due_at),
+            ).fetchone()
+            if existing is not None:
+                return existing, False
+            count = self.connection.execute(
+                "SELECT COUNT(*) FROM reminders WHERE user_id=? AND status='pending'", (user_id,)
+            ).fetchone()[0]
+            if count >= max_pending:
+                raise ValueError(f"未完成提醒已达到 {max_pending} 条，请先取消不需要的提醒。")
+            now = int(time.time())
+            cursor = self.connection.execute(
+                "INSERT INTO reminders(user_id,content,due_at,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (user_id, content, due_at, now, now),
+            )
+            row = self.connection.execute("SELECT * FROM reminders WHERE id=?", (cursor.lastrowid,)).fetchone()
+            return row, True
+
+    def list_reminders(self, user_id: int) -> list[sqlite3.Row]:
+        """只查看当前用户的未完成提醒，包括等待连接恢复的过期提醒。"""
+        with self._lock:
+            return list(self.connection.execute(
+                "SELECT * FROM reminders WHERE user_id=? AND status='pending' ORDER BY due_at,id", (user_id,)
+            ))
+
+    def get_reminder(self, user_id: int, reminder_id: int) -> sqlite3.Row | None:
+        """按所有者与编号查询，防止工具访问其他用户的提醒。"""
+        with self._lock:
+            return self.connection.execute(
+                "SELECT * FROM reminders WHERE user_id=? AND id=?", (user_id, reminder_id)
+            ).fetchone()
+
+    def cancel_reminder(self, user_id: int, reminder_id: int) -> bool:
+        """仅取消属于当前用户且尚未完成的提醒。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE reminders SET status='cancelled',updated_at=? WHERE user_id=? AND id=? AND status='pending'",
+                (int(time.time()), user_id, reminder_id),
+            )
+            return cursor.rowcount > 0
+
+    def due_reminders(self, now: int, limit: int = 20) -> list[sqlite3.Row]:
+        """供单实例后台调度查询到期且满足重试时间的提醒。"""
+        with self._lock:
+            return list(self.connection.execute(
+                """SELECT * FROM reminders WHERE status='pending' AND due_at<=? AND next_attempt_at<=?
+                   ORDER BY due_at,id LIMIT ?""", (now, now, limit)
+            ))
+
+    def mark_reminder_sent(self, reminder_id: int, now: int) -> bool:
+        """收到 OneBot 成功响应后标记完成，不覆盖并发取消或删除的状态。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE reminders SET status='sent',updated_at=? WHERE id=? AND status='pending'",
+                (now, reminder_id),
+            )
+            return cursor.rowcount > 0
+
+    def retry_reminder(self, reminder_id: int, next_attempt_at: int, now: int) -> None:
+        """发送失败仍保留待办，并更新重试次数及时间，不恢复已取消的提醒。"""
+        with self._lock, self.connection:
+            self.connection.execute(
+                """UPDATE reminders SET attempts=attempts+1,next_attempt_at=?,updated_at=?
+                   WHERE id=? AND status='pending'""", (next_attempt_at, now, reminder_id)
+            )
+
     def style_samples(self, group_id: int, user_id: int, limit: int) -> list[str]:
         """取目标用户在当前群的最新普通文字，排除空文本及 / 指令，不读私聊。"""
         with self._lock:
@@ -328,7 +419,7 @@ class Database:
             return cursor.rowcount
 
     def purge_old_messages(self, retention_days: int) -> int:
-        """清理过期的群聊和私聊消息；非正数表示不清理，返回总删除条数。"""
+        """清理过期消息及已完成/取消的提醒；待办不清理，返回总删除条数。"""
         if retention_days <= 0:
             return 0
         cutoff = int(time.time()) - retention_days * 86400
@@ -339,4 +430,7 @@ class Database:
             private_cursor = self.connection.execute(
                 "DELETE FROM private_messages WHERE created_at < ?", (cutoff,)
             )
-            return cursor.rowcount + private_cursor.rowcount
+            reminders = self.connection.execute(
+                "DELETE FROM reminders WHERE status<>'pending' AND updated_at<?", (cutoff,)
+            )
+            return cursor.rowcount + private_cursor.rowcount + reminders.rowcount

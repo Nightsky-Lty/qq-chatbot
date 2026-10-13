@@ -11,6 +11,7 @@ from app.config import Settings
 from app.database import Database
 from app.llm import DeepSeekClient, LLMUnavailable, SYSTEM_PROMPT
 from app.models import MessageView, at_segment, parse_message, text_segment
+from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
 
 logger = logging.getLogger(__name__)
 # 发送回调由连接层提供：业务层传入群号或 QQ 号和消息段，不直接操作 WebSocket。
@@ -38,8 +39,10 @@ HELP_TEXT = """可用命令：
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 /问 内容
 /锐评 内容
-/删除我的数据（只删除你与机器人的私聊记录）
+/删除我的数据（删除你的私聊记录和提醒，不影响群聊）
 /帮助
+可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
+提醒使用北京时间，目前只支持一次性提醒。
 名单、关键词召集和模仿功能请在群里使用。
 私聊文本和机器人回复会保存在服务器，相关上下文会发送给 DeepSeek。"""
 
@@ -59,11 +62,13 @@ class BotService:
         settings: Settings,
         database: Database,
         llm: DeepSeekClient,
+        reminders: ReminderService | None = None,
     ):
         """保存依赖，并初始化按用户计时的冷却记录和按群分配的发送锁。"""
         self.settings = settings
         self.db = database
         self.llm = llm
+        self.reminders = reminders
         # 冷却记录只存在于内存中，重启服务后会重置。
         self._last_ai_call: dict[AIKey, float] = {}
         self._trigger_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -180,8 +185,8 @@ class BotService:
         if text == "/删除我的数据":
             # 先取消该用户的私聊生成，避免删除后旧回复重新写入历史。
             await self.cancel_pending(key=("private", user_id, user_id))
-            deleted = self.db.delete_private_messages(user_id)
-            await self._send_text(send_private, user_id, f"已删除你与机器人的 {deleted} 条私聊记录，群聊数据不受影响。")
+            deleted, reminders_deleted = self.db.delete_private_data(user_id)
+            await self._send_text(send_private, user_id, f"已删除你的 {deleted} 条私聊记录和 {reminders_deleted} 条提醒记录，群聊数据不受影响。")
             return
         group_only = ("/名单", "/关键词", self.settings.mimic_prefix)
         if text.startswith(group_only):
@@ -504,6 +509,13 @@ class BotService:
             kwargs: dict[str, Any] = {"history": history}
             if system is not None:
                 kwargs["system"] = system
+            if private and self.reminders is not None:
+                # 当前时间由程序提供，身份由实际私聊发信人绑定，不让模型指定QQ。
+                kwargs["system"] = (system or PRIVATE_SYSTEM_PROMPT) + reminder_instructions()
+                kwargs["tools"] = REMINDER_TOOLS
+                async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    return await self.reminders.execute_tool(user_id, name, arguments)
+                kwargs["execute_tool"] = execute_tool
             try:
                 answer = await self.llm.complete(prompt, **kwargs)
             except LLMUnavailable as exc:

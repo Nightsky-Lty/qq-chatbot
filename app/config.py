@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     auto_chat_min_users: int = Field(default=3, ge=3)
     auto_chat_window_seconds: int = Field(default=180, ge=1)
     auto_chat_cooldown_seconds: int = Field(default=30, ge=1)
+    # 提醒由本地后台调度，到期通知不依赖模型再次生成。
+    reminder_poll_seconds: int = Field(default=5, ge=1, le=60)
+    reminder_max_pending: int = Field(default=50, ge=1, le=100)
     style_sample_limit: int = 60
     # 保留期单位为天，过期消息在服务启动时清理；非正数表示不自动清理。
     message_retention_days: int = 30

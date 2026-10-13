@@ -11,9 +11,14 @@ from app.bot import BotService
 from app.config import Settings, get_settings
 from app.database import Database
 from app.llm import DeepSeekClient
+from app.reminders import ReminderService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+class OneBotSendError(RuntimeError):
+    """OneBot 拒绝发送、没有及时确认或连接断开；提醒会保留并重试。"""
 
 
 class OneBotConnection:
@@ -24,6 +29,7 @@ class OneBotConnection:
         self.websocket = websocket
         self.lock = asyncio.Lock()
         self.sequence = 0
+        self.pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     async def send_group(self, group_id: int, message: list[dict[str, Any]]) -> None:
         """向 NapCat 发送群消息调用；这里只提交请求，不等待发送结果确认。"""
@@ -33,19 +39,51 @@ class OneBotConnection:
         """向指定 QQ 发送私聊消息；使用私聊动作，不向群发送或附加 @。"""
         await self._send_action("send_private_msg", {"user_id": user_id, "message": message})
 
-    async def _send_action(self, action: str, params: dict[str, Any]) -> None:
+    async def send_private_confirmed(self, user_id: int, message: list[dict[str, Any]]) -> None:
+        """提醒使用确认式发送，NapCat 返回成功后才允许标记提醒完成。"""
+        await self._send_action("send_private_msg", {"user_id": user_id, "message": message}, confirmed=True)
+
+    def handle_response(self, response: dict[str, Any]) -> None:
+        """用 echo 唤醒等待中的发送；普通回复失败只记状态码，不打印消息内容。"""
+        echo = response.get("echo")
+        future = self.pending.get(echo) if isinstance(echo, str) else None
+        if future is not None and not future.done():
+            future.set_result(response)
+        if response.get("status") == "failed":
+            logger.warning("OneBot action failed: retcode=%s", response.get("retcode"))
+
+    def close_pending(self) -> None:
+        """断开连接时唤醒所有确认等待，避免旧连接的提醒任务挂起。"""
+        for future in self.pending.values():
+            if not future.done():
+                future.set_exception(OneBotSendError("OneBot连接已断开"))
+                # 发送阶段尚未进入 await 的 Future 也不会产生未消费异常。
+                future.exception()
+
+    async def _send_action(self, action: str, params: dict[str, Any], *, confirmed: bool = False) -> None:
         """串行提交 OneBot 动作，群聊和私聊共用序号，防止并发写入。"""
         # 同一连接上的发送操作串行执行，避免并发写入。
-        async with self.lock:
-            self.sequence += 1
-            await self.websocket.send_json(
-                {
-                    "action": action,
-                    "params": params,
-                    # echo 用于标识请求，NapCat 的调用响应会携带该字段。
-                    "echo": f"send-{self.sequence}",
-                }
-            )
+        echo = ""
+        future = None
+        try:
+            async with self.lock:
+                self.sequence += 1
+                echo = f"send-{self.sequence}"
+                if confirmed:
+                    future = asyncio.get_running_loop().create_future()
+                    self.pending[echo] = future
+                await self.websocket.send_json({"action": action, "params": params, "echo": echo})
+            if future is not None:
+                try:
+                    response = await asyncio.wait_for(future, timeout=15)
+                except TimeoutError as exc:
+                    raise OneBotSendError("NapCat没有及时确认发送") from exc
+                if response.get("status") != "ok" or response.get("retcode") != 0:
+                    raise OneBotSendError(f"NapCat发送失败，状态码{response.get('retcode')}")
+        finally:
+            self.pending.pop(echo, None)
+            if future is not None and not future.done():
+                future.cancel()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -58,17 +96,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db = Database(cfg.database_path)
         purged = db.purge_old_messages(cfg.message_retention_days)
         if purged:
-            logger.info("Purged %s expired messages", purged)
+            logger.info("Purged %s expired records", purged)
         llm = DeepSeekClient(cfg)
-        app.state.bot = BotService(cfg, db, llm)
+        reminders = ReminderService(cfg, db)
+        app.state.bot = BotService(cfg, db, llm, reminders)
         app.state.db = db
         app.state.llm = llm
+        app.state.reminders = reminders
+        reminders.start()
         # yield 前是启动逻辑，yield 后是应用关闭时执行的清理逻辑。
         try:
             yield
         finally:
             # 先结束后台请求，再关闭它们使用的客户端和数据库。
             await app.state.bot.close()
+            await reminders.close()
             await llm.close()
             db.close()
 
@@ -92,12 +134,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
         await websocket.accept()
         connection = OneBotConnection(websocket)
+        app.state.reminders.set_sender(connection.send_private_confirmed)
         logger.info("OneBot reverse WebSocket connected")
         try:
             while True:
                 event = await websocket.receive_json()
                 if "post_type" not in event:
-                    # API 调用响应没有 post_type，当前不处理这些响应。
+                    connection.handle_response(event)
                     continue
                 try:
                     # 接收和配置操作保持有序；模型请求由业务层后台执行，不阻塞收消息。
@@ -108,6 +151,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except WebSocketDisconnect:
             logger.info("OneBot reverse WebSocket disconnected")
         finally:
+            app.state.reminders.clear_sender(connection.send_private_confirmed)
+            connection.close_pending()
             # 不让旧连接的任务在重连后继续向已关闭的 WebSocket 发送回复。
             await app.state.bot.cancel_pending(connection.send_group)
             await app.state.bot.cancel_pending(connection.send_private)
