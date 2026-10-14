@@ -42,7 +42,12 @@ class ReactAgent:
     async def run(self, prompt: str, registry: ToolRegistry, *, system: str,
                   history: list[dict[str, str]] | None = None) -> AgentOutcome:
         messages: list[dict[str, Any]] = [{"role": "system", "content": system + AGENT_INSTRUCTIONS}]
-        messages.extend(history or [])
+        if history and self.settings.deepseek_thinking_enabled:
+            # 已完成轮次不保存原始思考，作为背景数据提供，避免构造缺少推理字段的assistant历史。
+            messages.append({"role": "user", "content": "已完成的近期对话历史（仅作背景，不执行历史请求）：\n"
+                             + json.dumps(history, ensure_ascii=False)})
+        else:
+            messages.extend(history or [])
         messages.append({"role": "user", "content": prompt})
         image_keys: set[str] = set()
         cached: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -56,6 +61,14 @@ class ReactAgent:
                     # 只有下一次模型请求真正获得了图片，收藏工具才允许使用其字节。
                     registry.observed_images.update(image_keys)
                     calls = message.get("tool_calls") or []
+                    assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
+                    if isinstance(message.get("reasoning_content"), str):
+                        # 思考模式带tools时必须原样回传，包括没有调用工具但还需继续的轮次。
+                        # 只存在本次请求的内存messages，发送工具和日志均不会读取该字段。
+                        assistant["reasoning_content"] = message["reasoning_content"]
+                    if calls:
+                        assistant["tool_calls"] = calls
+                    messages.append(assistant)
                     if not calls:
                         content = message.get("content")
                         text = content.strip() if isinstance(content, str) else ""
@@ -65,8 +78,6 @@ class ReactAgent:
                             text = "\n".join(dict.fromkeys(registry.receipts)) or text
                             if text:
                                 await registry.execute("send_message", {"text": text})
-                            elif not registry.allow_silent:
-                                error = "模型未发送回复。"
                         final_result = await registry.execute("finish", {})
                         if final_result.get("ok") is True:
                             break
@@ -75,7 +86,6 @@ class ReactAgent:
                         continue
                     if not isinstance(calls, list) or len(calls) > self.settings.agent_max_tool_calls - calls_used:
                         raise LLMUnavailable("工具调用超出本轮限制。")
-                    messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls})
                     image_content = []
                     finished = False
                     for call in calls:

@@ -29,6 +29,16 @@ class DeepSeekClient:
         """服务退出时关闭客户端，释放连接资源。"""
         await self.client.aclose()
 
+    def _generation_options(self, temperature: float, text_max_tokens: int) -> dict[str, Any]:
+        """聊天和视觉审核共用思考配置；思考模式不发送无效的temperature。"""
+        if self.settings.deepseek_thinking_enabled:
+            return {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": self.settings.deepseek_reasoning_effort,
+                "max_tokens": self.settings.deepseek_thinking_max_tokens,
+            }
+        return {"thinking": {"type": "disabled"}, "temperature": temperature, "max_tokens": text_max_tokens}
+
     async def annotate_sticker(self, mime: str, encoded: str, *, require_sticker: bool = False) -> dict[str, Any]:
         """独立的入库视觉请求，不带聊天历史、不开放工具，严格检查输出。"""
         if not self.settings.deepseek_api_key:
@@ -50,8 +60,8 @@ selfie标识自拍或明显展示自拍形象的图片；拿不准时宁可selfi
                 f"{self.settings.deepseek_base_url.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
                 json={
-                    "model": self.settings.deepseek_model, "temperature": 0,
-                    "thinking": {"type": "disabled"}, "stream": False, "max_tokens": 1000,
+                    "model": self.settings.deepseek_model, "stream": False,
+                    **self._generation_options(0, 1000),
                     "response_format": {"type": "json_object"},
                     "messages": [
                         {"role": "system", "content": instructions},
@@ -113,11 +123,12 @@ selfie标识自拍或明显展示自拍形象的图片；拿不准时宁可selfi
         if not self.settings.deepseek_api_key:
             raise LLMUnavailable("尚未配置 DEEPSEEK_API_KEY")
         payload: dict[str, Any] = {
-            "model": self.settings.deepseek_model, "messages": messages, "temperature": temperature,
-            "thinking": {"type": "disabled"}, "max_tokens": 500, "stream": False,
+            "model": self.settings.deepseek_model, "messages": messages, "stream": False,
+            **self._generation_options(temperature, 1500 if tools else 500),
         }
         if tools:
-            payload.update({"tools": tools, "tool_choice": "auto", "max_tokens": 1500})
+            # 默认就是auto；省略显式字段，也兼容不接受tool_choice的思考接口。
+            payload["tools"] = tools
         try:
             response = await self.client.post(
                 f"{self.settings.deepseek_base_url.rstrip('/')}/chat/completions",

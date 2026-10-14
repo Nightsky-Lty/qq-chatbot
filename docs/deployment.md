@@ -179,7 +179,7 @@ Python 日志出现 `OneBot reverse WebSocket connected` 表示 NapCat 已连接
 
 更新代码后重建bot，SQLite自动新增缓存表，不删除聊天或提醒数据。Compose将图库只读挂载，缓存写在数据库中，无需改NapCat配置。机器人UID 10001需读取图片及访问目录。模型可自行按场景检索、必要时看图并决定发不发；群友来图仍未接入识图。可用 `/问 发个开心的表情包` 或私聊验证；详细配置见 [本地表情包](../README.md#本地表情包)。后续添加图片不必重建，但需等待入库；只更新bot可执行 `sudo docker compose up -d --build --no-deps bot`，无需重启NapCat。
 
-新版关闭深度思考，AI 在后台执行，不阻塞关键词和管理命令。`CONTEXT_MESSAGE_LIMIT=40`、`AI_MAX_CONCURRENCY=3` 等普通参数位于 `config.env`，会随代码更新；拉取后重新创建机器人容器即可生效。满额时机器人会提示稍后重试，不建立长队列。更多上下文可能增加 API 费用和耗时。
+新版默认开启 `low` 强度思考，推理只在当前Agent内存中用于工具续接，不发QQ、不写聊天数据库；思考及多步工具可能增加API费用和耗时。AI在后台执行，不阻塞关键词和管理命令。`DEEPSEEK_THINKING_ENABLED=true`、`DEEPSEEK_REASONING_EFFORT=low`、`DEEPSEEK_THINKING_MAX_TOKENS=4096`、`CONTEXT_MESSAGE_LIMIT=40`、`AI_MAX_CONCURRENCY=3` 等普通参数位于 `config.env`，会随代码更新；拉取后重新创建机器人容器即可生效。满额时提示稍后重试，不建立长队列；如需关闭思考可设 `DEEPSEEK_THINKING_ENABLED=false`。
 
 ```bash
 # 修改 .env 密钥或 config.env 普通参数后，重新创建容器使配置生效
