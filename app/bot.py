@@ -597,7 +597,7 @@ class BotService:
             sticker_session = None
             if image_session is not None and not automatic:
                 tool_defs.append(CHAT_IMAGE_TOOL)
-                effective_system += image_session.instructions
+                logger.info("Chat images attached: scope=%s context=%s user=%s count=%s", scope, context_id, user_id, len(image_session.images))
             # 自定义模仿提示词不开放表情工具，自动和手动群聊使用同一个群限流键。
             if self.settings.sticker_enabled and (system is None or private or automatic):
                 conversation = ("private", user_id) if private else ("group", context_id)
@@ -622,6 +622,11 @@ class BotService:
                     if preserve_layout else
                     "\n本轮是普通闲聊：一条消息内禁止换行，每条1～35字，只接当前一个话题。"
                 )
+            # 把本轮附件状态放在所有场景规则之后，避免被长角色卡和旧失败历史淹没。
+            request_prompt = prompt
+            if image_session is not None and not automatic:
+                effective_system += image_session.instructions
+                request_prompt += image_session.attachment_note
             kwargs["system"] = effective_system
             if tool_defs:
                 kwargs["tools"] = tool_defs
@@ -635,7 +640,7 @@ class BotService:
                     return {"ok": False, "message": "当前会话不支持这个工具。"}
                 kwargs["execute_tool"] = execute_tool
             try:
-                answer = await self.llm.complete(prompt, **kwargs)
+                answer = await self.llm.complete(request_prompt, **kwargs)
             except LLMUnavailable as exc:
                 logger.warning("LLM unavailable: %s", exc)
                 if not automatic:

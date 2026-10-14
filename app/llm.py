@@ -1,12 +1,15 @@
 """封装 DeepSeek 聊天请求，供聊天、锐评和风格模仿功能共用。"""
 
 import json
+import logging
 from typing import Any, Awaitable, Callable
 
 import httpx
 
 from app.config import Settings
 from app.persona import SYSTEM_PROMPT
+
+logger = logging.getLogger(__name__)
 
 
 # 完整角色卡在app/persona.py中维护，群聊、私聊及锐评复用；模仿提示词保持独立。
@@ -124,6 +127,7 @@ selfie标识自拍或明显展示自拍形象的图片；拿不准时宁可selfi
                 raise
             calls = message.get("tool_calls") or []
             if not calls:
+                logger.info("LLM reply ready: tool_calls=%s image_blocks=%s", calls_used, len(images_added))
                 content = message.get("content")
                 if not isinstance(content, str) or not content.strip():
                     if receipts:
@@ -168,6 +172,7 @@ selfie标识自拍或明显展示自拍形象的图片；拿不准时宁可selfi
                             if name in {"get_sticker_image", "get_message_image"} and image_key not in images_added and len(images_added) >= 3:
                                 result = {"ok": False, "error": "本轮来图与表情原图合计最多查看3张，请根据已看到的内容回答。"}
                             else:
+                                logger.info("LLM tool requested: name=%s", name)
                                 result = await execute_tool(name, arguments)
                         except Exception as exc:
                             if receipts or has_media_reply:
