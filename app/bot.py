@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from typing import Any, Awaitable, Callable
 
 from app.config import Settings
+from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
 from app.database import Database
 from app.llm import DeepSeekClient, LLMUnavailable, SYSTEM_PROMPT
 from app.models import MessageView, at_segment, parse_message, text_segment
@@ -38,6 +39,7 @@ HELP_TEXT = """可用命令：
 /模仿 @某人 主题（无需授权，至少需要 5 条本群普通文字发言）
 /帮助
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
+同一条消息中@机器人或使用/问、/锐评并附图，模型可按需看图。
 也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
 
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
@@ -48,8 +50,10 @@ PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
 提醒使用北京时间，目前只支持一次性提醒。
 也可以说“发个开心的表情包”，需要本地图库中有对应图片。
+可直接发图片或文字附图，模型自行决定是否看图；仅支持当前消息的前3张。
 名单、关键词召集和模仿功能请在群里使用。
-私聊文本和机器人回复会保存在服务器，相关上下文会发送给 DeepSeek。"""
+私聊文本和机器人回复会保存在服务器，相关上下文会发送给 DeepSeek。
+调用看图工具时，所选图片也会发送给DeepSeek；原图不保存到聊天数据库。"""
 
 PRIVATE_SYSTEM_PROMPT = SYSTEM_PROMPT + """\n\n当前是一对一私聊，用同样自然、友善的小鲸鱼语气回应当前用户。
 只参考当前用户的私聊上下文，不声称读取了群聊或其他用户的私聊。
@@ -108,6 +112,7 @@ class BotService:
         self.db = database
         self.llm = llm
         self.reminders = reminders
+        self.chat_images = ChatImageService(settings)
         self.stickers = StickerService(settings)
         self.sticker_indexer = StickerIndexer(settings, database, llm, self.stickers)
         # 冷却记录只存在于内存中，重启服务后会重置。
@@ -166,9 +171,10 @@ class BotService:
         if user_id == self_id:
             return
         view = parse_message(event.get("message"))
+        image_session = ChatImageSession(view.images) if view.images and self.settings.chat_image_enabled else None
         if event["message_type"] == "private":
             if send_private is not None:
-                await self._handle_private(user_id, view, send_private)
+                await self._handle_private(user_id, view, send_private, image_session=image_session)
             return
         group_id = int(event["group_id"])
         nickname = str((event.get("sender") or {}).get("card") or (event.get("sender") or {}).get("nickname") or user_id)
@@ -179,14 +185,14 @@ class BotService:
         is_admin = user_id in self.settings.admin_qq_ids or role in {"owner", "admin"}
 
         # 已识别的命令不再参与关键词召集或普通聊天，避免一次触发多个功能。
-        if await self._handle_command(group_id, user_id, view, is_admin, send_group):
+        if await self._handle_command(group_id, user_id, view, is_admin, send_group, image_session=image_session):
             return
         if await self._handle_keyword(group_id, view.text, send_group):
             return
         if self_id and self_id in view.mentions:
             prompt = view.text.replace(f"@{self_id}", "").strip()
-            if prompt:
-                await self._chat(group_id, user_id, prompt, send_group)
+            if prompt or image_session is not None:
+                await self._chat(group_id, user_id, prompt or "[用户发送了一条图片消息]", send_group, image_session=image_session)
             return
         await self._auto_join_topic(group_id, user_id, nickname, view.text, send_group)
 
@@ -227,11 +233,13 @@ class BotService:
             send_group, history=history, system=AUTO_CHAT_SYSTEM_PROMPT, automatic=True,
         )
 
-    async def _handle_private(self, user_id: int, view: MessageView, send_private: SendPrivate) -> None:
+    async def _handle_private(
+        self, user_id: int, view: MessageView, send_private: SendPrivate, *, image_session: ChatImageSession | None = None
+    ) -> None:
         """私聊普通文本直接聊天，支持帮助和锐评；从不执行群管理或模仿。"""
         text = view.text.strip()
-        if not text:
-            await self._send_text(send_private, user_id, "目前只支持文字聊天，请发一段文字给我。")
+        if not text and image_session is None:
+            await self._send_text(send_private, user_id, "请发文字给我；图片聊天需要部署者开启 CHAT_IMAGE_ENABLED，语音和视频暂不支持。")
             return
         if text == "/帮助":
             await self._send_text(send_private, user_id, PRIVATE_HELP_TEXT)
@@ -246,28 +254,30 @@ class BotService:
         if text.startswith(group_only):
             await self._send_text(send_private, user_id, "这个功能只支持群聊，请在群里使用。私聊发 /帮助 可以查看可用命令。")
             return
-        prompt = text
+        prompt = text or "[用户发送了一条图片消息]"
         if text.startswith(self.settings.chat_prefix):
             prompt = text.removeprefix(self.settings.chat_prefix).strip()
-            if not prompt:
+            if not prompt and image_session is None:
                 await self._send_text(send_private, user_id, f"直接发文字即可聊天，也可以用：{self.settings.chat_prefix} 你想说的话")
                 return
         elif text.startswith(self.settings.evaluate_prefix):
             content = text.removeprefix(self.settings.evaluate_prefix).strip()
-            if not content:
+            if not content and image_session is None:
                 await self._send_text(send_private, user_id, f"用法：{self.settings.evaluate_prefix} 要评价的内容")
                 return
-            prompt = f"请对下面这段内容做简短、有梗但不伤人的评价：\n{content}"
+            prompt = f"请对下面这段内容或本条附图做简短、有梗但不伤人的评价：\n{content}"
         elif text.startswith("/"):
             await self._send_text(send_private, user_id, "未知私聊命令，请发送 /帮助；普通文字可以直接聊天。")
             return
         # 先读历史再写当前文本，不把当前问题重复加入上下文；按用户独立查询。
         rows = self.db.recent_private_messages(user_id, self.settings.context_message_limit)
         history = [{"role": row["role"], "content": row["content"]} for row in rows]
-        self.db.log_private_message(user_id, "user", prompt)
+        prompt = prompt or "[用户发送了一条图片消息]"
+        stored_text = prompt + (f"\n[附带图片{len(view.images)}张，原图未保存]" if view.images else "")
+        self.db.log_private_message(user_id, "user", stored_text)
         await self._ai_reply(
             user_id, user_id, prompt, send_private,
-            history=history, system=PRIVATE_SYSTEM_PROMPT, private=True,
+            history=history, system=PRIVATE_SYSTEM_PROMPT, private=True, image_session=image_session,
         )
 
     async def _handle_command(
@@ -277,6 +287,8 @@ class BotService:
         view: MessageView,
         is_admin: bool,
         send_group: SendGroup,
+        *,
+        image_session: ChatImageSession | None = None,
     ) -> bool:
         """分发群内命令；识别并处理后返回 True，否则返回 False。"""
         text = view.text.strip()
@@ -315,22 +327,23 @@ class BotService:
             return True
         if text.startswith(self.settings.evaluate_prefix):
             content = text.removeprefix(self.settings.evaluate_prefix).strip()
-            if not content:
+            if not content and image_session is None:
                 await self._send_text(send_group, group_id, "用法：/锐评 要评价的内容")
             else:
                 await self._ai_reply(
                     group_id,
                     user_id,
-                    f"请对下面这段群聊内容做简短、有梗但不伤人的评价：\n{content}",
+                    f"请对下面这段群聊内容或本条附图做简短、有梗但不伤人的评价：\n{content}",
                     send_group,
+                    image_session=image_session,
                 )
             return True
         if text.startswith(self.settings.chat_prefix):
             prompt = text.removeprefix(self.settings.chat_prefix).strip()
-            if not prompt:
+            if not prompt and image_session is None:
                 await self._send_text(send_group, group_id, f"用法：{self.settings.chat_prefix} 你想说的话")
             else:
-                await self._chat(group_id, user_id, prompt, send_group)
+                await self._chat(group_id, user_id, prompt or "[用户发送了一条图片消息]", send_group, image_session=image_session)
             return True
         return False
 
@@ -455,7 +468,9 @@ class BotService:
                 await send_group(group_id, message)
             return True
 
-    async def _chat(self, group_id: int, user_id: int, prompt: str, send_group: SendGroup) -> None:
+    async def _chat(
+        self, group_id: int, user_id: int, prompt: str, send_group: SendGroup, *, image_session: ChatImageSession | None = None
+    ) -> None:
         """当前消息独立提供；只有追问或指代时才快照少量背景，避免历史串话。"""
         rows = self.db.recent_messages(group_id, self.settings.context_message_limit + 1)
         # 当前消息已在入口保存，因此跳过最后一条，避免和 prompt 重复。
@@ -477,7 +492,7 @@ class BotService:
             "当前发言人": {"QQ": user_id, "昵称": rows[-1]["nickname"] if rows else str(user_id)},
             "当前消息": prompt,
         }, ensure_ascii=False)
-        await self._ai_reply(group_id, user_id, prompt, send_group, history=history)
+        await self._ai_reply(group_id, user_id, prompt, send_group, history=history, image_session=image_session)
 
     async def _mimic(
         self, group_id: int, user_id: int, text: str, mentions: list[int], send_group: SendGroup
@@ -516,6 +531,7 @@ class BotService:
         system: str | None = None,
         private: bool = False,
         automatic: bool = False,
+        image_session: ChatImageSession | None = None,
     ) -> None:
         """检查冷却及并发名额，然后调度后台 AI 请求，不等待模型生成。"""
         if self._closed:
@@ -552,7 +568,7 @@ class BotService:
         self._pending_ai_users.add(key)
         # 注册前不 await，名额检查和占用在同一事件循环中不会被其他事件打断。
         task = asyncio.create_task(
-            self._run_ai_reply(context_id, user_id, prompt, send_message, history=history, system=system, private=private, automatic=automatic),
+            self._run_ai_reply(context_id, user_id, prompt, send_message, history=history, system=system, private=private, automatic=automatic, image_session=image_session),
             name=f"ai-reply-{key[0]}-{context_id}-{user_id}",
         )
         self._ai_tasks[task] = (send_message, key)
@@ -569,6 +585,7 @@ class BotService:
         system: str | None = None,
         private: bool = False,
         automatic: bool = False,
+        image_session: ChatImageSession | None = None,
     ) -> None:
         """后台生成并发送回复；私聊回复入库，运行日志不记录文本、样本或凭证。"""
         started = time.monotonic()
@@ -578,6 +595,9 @@ class BotService:
             effective_system = system or (PRIVATE_SYSTEM_PROMPT if private else SYSTEM_PROMPT)
             tool_defs: list[dict[str, Any]] = []
             sticker_session = None
+            if image_session is not None and not automatic:
+                tool_defs.append(CHAT_IMAGE_TOOL)
+                effective_system += image_session.instructions
             # 自定义模仿提示词不开放表情工具，自动和手动群聊使用同一个群限流键。
             if self.settings.sticker_enabled and (system is None or private or automatic):
                 conversation = ("private", user_id) if private else ("group", context_id)
@@ -606,6 +626,8 @@ class BotService:
             if tool_defs:
                 kwargs["tools"] = tool_defs
                 async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if name == "get_message_image" and image_session is not None:
+                        return await self.chat_images.execute_tool(image_session, arguments)
                     if name in {"search_stickers", "list_stickers", "get_sticker_image", "send_sticker"} and sticker_session is not None:
                         return await self.stickers.execute_tool(sticker_session, name, arguments)
                     if private and self.reminders is not None:

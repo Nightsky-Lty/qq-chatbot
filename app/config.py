@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # 提醒由本地后台调度，到期通知不依赖模型再次生成。
     reminder_poll_seconds: int = Field(default=5, ge=1, le=60)
     reminder_max_pending: int = Field(default=50, ge=1, le=100)
+    # 来图只有模型调用工具才下载；独立于本地表情包视觉开关。
+    chat_image_enabled: bool = True
+    chat_image_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1, le=5 * 1024 * 1024)
     # 表情包仅从本地目录读取；每次回复最多一张，发送限制按群或私聊会话计算。
     sticker_enabled: bool = True
     sticker_vision_enabled: bool = True

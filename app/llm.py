@@ -161,8 +161,14 @@ selfie标识自拍或明显展示自拍形象的图片；拿不准时宁可selfi
                     if not isinstance(name, str) or name not in allowed or not isinstance(arguments, dict):
                         result = {"ok": False, "message": "工具或参数无效，请重新确认。"}
                     else:
+                        image_id = arguments.get("image_id" if name == "get_message_image" else "sticker_id")
+                        image_key = f"{name}:{image_id}"
                         try:
-                            result = await execute_tool(name, arguments)
+                            # 两种看图工具共用预算，最高3张10MiB原图的Base64仍低于48MiB。
+                            if name in {"get_sticker_image", "get_message_image"} and image_key not in images_added and len(images_added) >= 3:
+                                result = {"ok": False, "error": "本轮来图与表情原图合计最多查看3张，请根据已看到的内容回答。"}
+                            else:
+                                result = await execute_tool(name, arguments)
                         except Exception as exc:
                             if receipts or has_media_reply:
                                 return "\n".join(dict.fromkeys(receipts)) + "\n后续工具操作未完成，请稍后重试。"
@@ -178,12 +184,14 @@ selfie标识自拍或明显展示自拍形象的图片；拿不准时宁可selfi
                 # 避免把Base64当作工具JSON文字计费，或在多工具调用的回执之间插入user消息。
                 tool_result = {key: value for key, value in result.items() if key != "_image_content"}
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(tool_result, ensure_ascii=False)})
-                sticker_id = result.get("sticker_id")
-                if (name == "get_sticker_image" and result.get("ok") is True
-                        and isinstance(sticker_id, str) and sticker_id not in images_added
+                image_id = result.get("image_id" if name == "get_message_image" else "sticker_id")
+                image_key = f"{name}:{image_id}"
+                if (name in {"get_sticker_image", "get_message_image"} and result.get("ok") is True
+                        and isinstance(image_id, str) and image_key not in images_added
+                        and len(images_added) < 3
                         and isinstance(result.get("_image_content"), list)):
                     image_content.extend(result["_image_content"])
-                    images_added.add(sticker_id)
+                    images_added.add(image_key)
             if image_content:
                 messages.append({"role": "user", "content": image_content})
         if receipts or has_media_reply:

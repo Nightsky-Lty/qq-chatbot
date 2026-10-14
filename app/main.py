@@ -14,6 +14,9 @@ from app.llm import DeepSeekClient
 from app.reminders import ReminderService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# HTTP 请求日志会包含 QQ 图片链接中的临时签名，不输出完整 URL。
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 

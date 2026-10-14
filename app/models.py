@@ -1,4 +1,4 @@
-"""解析 OneBot 消息，并构造群聊和私聊使用的文本以及群聊 @ 消息段。"""
+"""解析 OneBot 文本、@ 和当前图片引用，并构造发出的消息段。"""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -6,14 +6,16 @@ from typing import Any
 
 @dataclass(slots=True)
 class MessageView:
-    """消息的简化视图：合并后的文本，以及按出现顺序提取的被 @ 用户 QQ 号。"""
+    """消息简化视图：文本、被 @ 用户，以及按顺序截取的前三张图片引用。"""
 
     text: str = ""
     mentions: list[int] = field(default_factory=list)
+    # 只保留当前事件的图片引用，不下载、不保存图片内容。
+    images: list[dict[str, str]] = field(default_factory=list)
 
 
 def parse_message(message: object) -> MessageView:
-    """解析数组消息中的文本和 @ 消息段；纯字符串仅作为文本，不解析 CQ 码。"""
+    """解析数组消息中的文本、@ 和图片；纯字符串仅作文本，不解析 CQ 码。"""
     if isinstance(message, str):
         return MessageView(text=message.strip())
     if not isinstance(message, list):
@@ -21,11 +23,14 @@ def parse_message(message: object) -> MessageView:
 
     text_parts: list[str] = []
     mentions: list[int] = []
+    images: list[dict[str, str]] = []
     for segment in message:
         if not isinstance(segment, dict):
             continue
         kind = segment.get("type")
         data = segment.get("data") or {}
+        if not isinstance(data, dict):
+            continue
         if kind == "text":
             text_parts.append(str(data.get("text", "")))
         elif kind == "at":
@@ -34,8 +39,14 @@ def parse_message(message: object) -> MessageView:
             if qq.isdigit():
                 mentions.append(int(qq))
                 text_parts.append(f"@{qq}")
-        # 图片、语音等其他消息段暂不参与文本解析。
-    return MessageView(text="".join(text_parts).strip(), mentions=mentions)
+        elif kind == "image" and len(images) < 3:
+            # 不将带签名的下载地址、文件路径或不可信 summary 暴露给模型。
+            images.append({
+                "url": data.get("url", "")[:8193] if isinstance(data.get("url"), str) else "",
+                "file_size": str(data.get("file_size", ""))[:20],
+            })
+        # 语音、视频等其他消息段暂不参与解析。
+    return MessageView(text="".join(text_parts).strip(), mentions=mentions, images=images)
 
 
 def text_segment(text: str) -> dict[str, Any]:
