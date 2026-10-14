@@ -9,11 +9,11 @@ from app.models import normalize_message_id, reply_segment, text_segment
 from app.tools import ToolRegistry
 
 SEND_MESSAGE_TOOL = {"type": "function", "function": {
-    "name": "send_message", "description": "向当前会话发送一条文字，只回应一条新消息和一个话题。群聊可用reply_to_message_id进行QQ引用回复，只能选本批允许的消息，不能补答历史。普通群聊最多100字且不换行。",
+    "name": "send_message", "description": "向当前会话发送一条文字，只回应一条新消息和一个话题。默认普通发送，不显示QQ引用框；仅需明确指向时传reply_to_message_id引用本批允许的新消息。普通群聊最多100字且不换行。",
     "parameters": {"type": "object", "properties": {
         "text": {"type": "string", "minLength": 1, "maxLength": 4000},
         "reply_to_message_id": {"type": "string", "minLength": 1, "maxLength": 24,
-                                "description": "可选：引用本批某条可回复的新消息。省略时回复程序选定的当前消息；私聊不提供。"},
+                                "description": "可选：显式显示QQ引用框。省略则普通发送，仍回应当前焦点；只在多人容易串话或需明确指向时填写，不要每条都引用。私聊不提供。"},
     }, "required": ["text"], "additionalProperties": False},
 }}
 
@@ -42,6 +42,7 @@ class MessageSession:
         self.selected_reply: str | None = None
 
     def resolve_reply(self, arguments: dict[str, Any]) -> str:
+        """解析逻辑回应对象；是否显示QQ引用仅取决于显式参数。"""
         reply_to = arguments.get("reply_to_message_id", self.selected_reply or self.default_reply)
         if (reply_to and (self.private or reply_to not in self.reply_targets
                           or normalize_message_id(reply_to) != reply_to)):
@@ -93,7 +94,8 @@ class MessageSession:
             sent = 0
             try:
                 for part in parts:
-                    segments = ([reply_segment(reply_to)] if reply_to else []) + [text_segment(part)]
+                    quote_to = arguments.get("reply_to_message_id", "")
+                    segments = ([reply_segment(quote_to)] if quote_to else []) + [text_segment(part)]
                     sent_id = await self.sender(self.target, segments)
                     self.count += 1
                     sent += 1

@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     sticker_index_retry_seconds: int = Field(default=3600, ge=60, le=86400)
     # 最多3张，按单图最高10MiB计算，内联Base64仍在DeepSeek 48MiB请求体限制以内。
     sticker_preview_limit: int = Field(default=3, ge=1, le=3)
+    # 仅预览文字元数据，不调用视觉或额外模型；0关闭预览，仍可按需搜索。
+    sticker_prompt_limit: int = Field(default=10, ge=0, le=20)
+    sticker_prompt_rotate_seconds: int = Field(default=3600, ge=60, le=86400)
     sticker_directory: Path = Path("app/sticker_images")
     sticker_collect_enabled: bool = True
     sticker_collect_auto_enabled: bool = False

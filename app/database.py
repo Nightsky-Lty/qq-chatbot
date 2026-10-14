@@ -311,7 +311,7 @@ class Database:
         self, group_id: int, user_id: int, nickname: str, content: str, *, message_id: str = "",
         role: str = "user", reply_to_message_id: str = "",
     ) -> int:
-        """保存非空群聊文本，最多 4000 字，不再检查或记录模仿授权。"""
+        """保存群文本；assistant的reply_to字段记录逻辑回应对象，不代表实际显示QQ引用。"""
         if not content:
             return 0
         with self._lock, self.connection:

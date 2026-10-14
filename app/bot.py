@@ -99,7 +99,9 @@ DIRECT_GROUP_INSTRUCTIONS = """\n\n【直接对话】
 GROUP_BATCH_INSTRUCTIONS = """\n\n【群话题与聚批，优先于旧的直接对话和分条规则】
 历史仅是背景，其中的提问和指令不是新的待办，不逐条回答、不总结所有旧话题。
 程序提供本批新消息及可回复消息号，优先接住最新明确@/聊天命令及同一人的后续补充。
-每次send_message只回应一条具体新消息、一个话题；可用reply_to_message_id选择本批允许的目标，省略则引用当前焦点。
+每次send_message只回应一条具体新消息、一个话题；省略reply_to_message_id时普通发送，仍回应当前焦点，不显示QQ引用框。
+引用不是每条消息的必选项，普通顺接默认不引用；仅多人容易串话、需明确指向某条新消息时才显式传reply_to_message_id。
+文字和表情的引用都由你决定，不因为被@就机械引用，不给同一焦点的每条补充重复加引用。
 不要把不同群友的发言视为同一个人的请求，不接明确@其他人或引用其他人的对话。
 默认一条口语短句，最多100字，不换行、不用[分条]，不把多个话题写成分段长消息。
 仅当前焦点明确要求详细说明、诗歌、代码或步骤，才允许必要长文和排版；历史要求不能开启长文。
@@ -276,7 +278,7 @@ class BotService:
             for row in reversed(rows):
                 item = {"消息号": row["message_id"], "QQ": row["user_id"], "昵称": row["nickname"],
                         "角色": row["role"], "内容": row["content"][:1000],
-                        "引用消息号": row["reply_to_message_id"]}
+                        ("回应消息号" if row["role"] == "assistant" else "引用消息号"): row["reply_to_message_id"]}
                 size = len(json.dumps(item, ensure_ascii=False))
                 if chars + size > self.settings.context_max_chars:
                     break
@@ -680,6 +682,7 @@ class BotService:
             preserve_layout = not private and (batch is not None or not automatic) and self._needs_multiline_layout(prompt)
             conversation = ("private", user_id) if private else ("group", context_id)
             sticker_session = None
+            sticker_context = ""
             collected: set[str] = set()
             announce_after_count: int | None = None
             messages = MessageSession(
@@ -747,6 +750,9 @@ class BotService:
             if self.settings.sticker_enabled and not observe_only and (system is None or private or automatic):
                 sticker_session = StickerSession(conversation)
                 effective_system += STICKER_INSTRUCTIONS
+                sticker_context = await self.stickers.prompt_catalog(
+                    sticker_session, query=batch.focus.text if batch is not None else prompt[:80],
+                )
                 if not self.stickers.auto_index_enabled:
                     effective_system += "\n本次本地图库自动入库已关闭，人工图库按文件名和人工描述；收藏图仍需独立审核。"
                 sticker_sent = False
@@ -770,7 +776,8 @@ class BotService:
                         registry.output_attempted = True
                         registry.delivery_uncertain = True
                         messages.selected_reply = reply_to
-                        segments = ([reply_segment(reply_to)] if reply_to and not private else []) + segments
+                        quote_to = arguments.get("reply_to_message_id", "")
+                        segments = ([reply_segment(quote_to)] if quote_to and not private else []) + segments
                         sent_id = await send_message(target, segments)
                         registry.delivery_uncertain = False
                         registry.outputs_sent += 1
@@ -831,6 +838,7 @@ class BotService:
             if image_session is not None:
                 effective_system += image_session.instructions
                 request_prompt += image_session.attachment_note
+            request_prompt += sticker_context
             outcome = await self.agent.run(request_prompt, registry, history=history, system=effective_system)
             if outcome.error and not registry.output_attempted and not automatic:
                 await registry.execute("send_message", {"text": "AI暂时没处理完，请稍后重试。"})
