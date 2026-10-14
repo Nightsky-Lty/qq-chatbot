@@ -2,7 +2,9 @@
 FROM python:3.12-slim-bookworm AS builder
 COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /usr/local/bin/uv
 WORKDIR /app
-ENV UV_PYTHON_DOWNLOADS=never
+ARG UV_DEFAULT_INDEX=https://pypi.org/simple
+ENV UV_PYTHON_DOWNLOADS=never \
+    UV_DEFAULT_INDEX=${UV_DEFAULT_INDEX}
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project --no-cache
 
