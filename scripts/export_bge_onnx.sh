@@ -17,8 +17,7 @@ optimum-cli export onnx \
     --model BAAI/bge-small-zh-v1.5 \
     --task feature-extraction \
     --framework pt \
-    --optimize O2 \
-    --output_dir "$fp32_dir"
+    "$fp32_dir"
 
 optimum-cli onnxruntime quantize \
     --onnx_model "$fp32_dir" \
