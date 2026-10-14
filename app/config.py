@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     ai_cooldown_seconds: int = 8
     # 限制后台请求总数，不建立无上限队列；满额时请用户稍后重试。
     ai_max_concurrency: int = Field(default=3, ge=1, le=16)
+    agent_max_steps: int = Field(default=8, ge=2, le=16)
+    agent_max_tool_calls: int = Field(default=16, ge=4, le=32)
+    agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
     context_message_limit: int = Field(default=40, ge=1)
     # 自动接话按最近活跃群友判断，与手动提问的冷却独立。
     auto_chat_enabled: bool = True
@@ -57,6 +60,13 @@ class Settings(BaseSettings):
     # 最多3张，按单图最高10MiB计算，内联Base64仍在DeepSeek 48MiB请求体限制以内。
     sticker_preview_limit: int = Field(default=3, ge=1, le=3)
     sticker_directory: Path = Path("app/sticker_images")
+    sticker_collect_enabled: bool = True
+    sticker_collect_auto_enabled: bool = True
+    sticker_collected_directory: Path = Path("data/collected_stickers")
+    sticker_collect_observe_seconds: int = Field(default=300, ge=30, le=3600)
+    sticker_collect_cooldown_seconds: int = Field(default=60, ge=0)
+    sticker_collect_max_files: int = Field(default=200, ge=1, le=1000)
+    sticker_collect_max_disk_bytes: int = Field(default=200 * 1024 * 1024, ge=1024 * 1024, le=1024 * 1024 * 1024)
     sticker_cooldown_seconds: int = Field(default=30, ge=0)
     sticker_repeat_seconds: int = Field(default=7200, ge=0)
     sticker_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1, le=10 * 1024 * 1024)

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class OneBotSendError(RuntimeError):
-    """OneBot 拒绝发送、没有及时确认或连接断开；提醒会保留并重试。"""
+    """OneBot发送未确认；Agent不盲目重发，到期提醒按独立退避策略重试。"""
 
 
 class OneBotConnection:
@@ -43,8 +43,12 @@ class OneBotConnection:
         await self._send_action("send_private_msg", {"user_id": user_id, "message": message})
 
     async def send_private_confirmed(self, user_id: int, message: list[dict[str, Any]]) -> None:
-        """提醒使用确认式发送，NapCat 返回成功后才允许标记提醒完成。"""
+        """Agent和提醒使用确认式发送；NapCat成功不代表用户已读。"""
         await self._send_action("send_private_msg", {"user_id": user_id, "message": message}, confirmed=True)
+
+    async def send_group_confirmed(self, group_id: int, message: list[dict[str, Any]]) -> None:
+        """Agent发送工具等待NapCat确认；只能由后台任务调用，不能阻塞事件接收。"""
+        await self._send_action("send_group_msg", {"group_id": group_id, "message": message}, confirmed=True)
 
     def handle_response(self, response: dict[str, Any]) -> None:
         """用 echo 唤醒等待中的发送；普通回复失败只记状态码，不打印消息内容。"""
@@ -148,7 +152,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
                 try:
                     # 接收和配置操作保持有序；模型请求由业务层后台执行，不阻塞收消息。
-                    await app.state.bot.handle_event(event, connection.send_group, connection.send_private)
+                    await app.state.bot.handle_event(
+                        event, connection.send_group, connection.send_private,
+                        send_group_confirmed=connection.send_group_confirmed,
+                        send_private_confirmed=connection.send_private_confirmed,
+                    )
                 except Exception:
                     # 单条业务事件异常只记录日志，继续处理连接上的后续事件。
                     logger.exception("Failed to handle OneBot event")

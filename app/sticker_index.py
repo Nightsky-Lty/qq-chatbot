@@ -24,10 +24,12 @@ class StickerIndexer:
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
-        if self.settings.sticker_enabled and self.stickers.auto_index_enabled and self._task is None:
+        if (self.settings.sticker_enabled and self._task is None
+                and (self.stickers.auto_index_enabled or self.settings.sticker_collect_enabled
+                     or self.stickers.collected_directory.is_dir())):
             self._task = asyncio.create_task(self._run(), name="sticker-indexer")
-            logger.info("Sticker auto indexing enabled: poll=%ss batch=%s",
-                        self.settings.sticker_index_poll_seconds, self.settings.sticker_index_batch_size)
+            logger.info("Sticker index refresh enabled: automatic=%s poll=%ss batch=%s",
+                        self.stickers.auto_index_enabled, self.settings.sticker_index_poll_seconds, self.settings.sticker_index_batch_size)
 
     async def close(self) -> None:
         if self._task is not None:
@@ -37,7 +39,7 @@ class StickerIndexer:
 
     def _read_snapshot(self, filename: str, signature: tuple) -> tuple[str, str, str]:
         """上传与哈希来自同一份字节；读前后的签名必须与扫描一致。"""
-        path = self.stickers.directory / filename
+        path = self.stickers.path_for_id(filename)
         if file_signature(path.lstat()) != signature:
             raise ValueError("image changed")
         data = self.stickers._read_file(filename, self.settings.sticker_max_bytes)
@@ -48,11 +50,15 @@ class StickerIndexer:
     async def scan_once(self) -> None:
         """逐张处理，每轮限制API次数；未变化文件复用哈希，未就绪图片不进入聊天目录。"""
         items = await asyncio.to_thread(self.stickers._catalog, raw=True)
+        if not self.stickers.auto_index_enabled:
+            # 关闭自动识别时仍恢复已收藏、已审核的缓存，不上传新图。
+            items = [item for item in items if item["id"].startswith("collected:")]
         previous = self.stickers.annotations
         known: dict[str, dict[str, Any]] = {}
         # 先移除被删除、禁用或移出扫描范围的文件，缓存记录仍按内容保留。
         active = {item["id"] for item in items}
-        self.stickers.annotations = {name: value for name, value in previous.items() if name in active}
+        self.stickers.annotations = {name: value for name, value in previous.items()
+                                    if name in active or (name.startswith("collected:") and self.stickers.path_for_id(name).is_file())}
         calls_used = 0
         for item in items:
             filename, signature = item["id"], item["_signature"]
@@ -70,6 +76,8 @@ class StickerIndexer:
                 self.stickers.annotations = {**self.stickers.annotations, filename: state}
                 if record and (record["status"] != "error" or record["next_attempt_at"] > time.time()):
                     continue
+                if not self.stickers.auto_index_enabled:
+                    continue
                 if not self.settings.deepseek_api_key or calls_used >= self.settings.sticker_index_batch_size:
                     continue
                 if not encoded:
@@ -78,7 +86,7 @@ class StickerIndexer:
                         continue
                 calls_used += 1
                 try:
-                    metadata = await self.llm.annotate_sticker(mime, encoded)
+                    metadata = await self.llm.annotate_sticker(mime, encoded, require_sticker=filename.startswith("collected:"))
                 except Exception as exc:
                     attempts = (record["attempts"] if record else 0) + 1
                     delay = min(86400, self.settings.sticker_index_retry_seconds * 2 ** min(attempts - 1, 5))
@@ -88,6 +96,8 @@ class StickerIndexer:
                 else:
                     # 有风险提示、自画像/自拍或模型不确定时一律不自动使用。
                     safe = metadata["safe"] and not metadata["selfie"] and not metadata["warnings"]
+                    if filename.startswith("collected:"):
+                        safe = safe and metadata.get("is_sticker") is True
                     status = "ready" if safe else "quarantined"
                     self.db.save_sticker_annotation(content_hash, status, metadata)
                     logger.info("Sticker annotation stored: status=%s", status)
@@ -97,7 +107,10 @@ class StickerIndexer:
             except (OSError, ValueError) as exc:
                 # 文件上传尚未完成、权限不足或无效格式只影响这一张。
                 logger.warning("Sticker file skipped: error=%s", type(exc).__name__)
-        self.stickers.annotations = known
+        # 扫描期间收藏工具可能新增文件，不能用旧扫描快照抹掉它的已审核索引。
+        added = {name: value for name, value in self.stickers.annotations.items()
+                 if name not in active and name.startswith("collected:") and self.stickers.path_for_id(name).is_file()}
+        self.stickers.annotations = {**added, **known}
 
     async def _run(self) -> None:
         while True:
