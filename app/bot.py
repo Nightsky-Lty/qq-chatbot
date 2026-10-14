@@ -662,11 +662,8 @@ class BotService:
             else:
                 parts = self._split_group_reply(answer, preserve_layout=preserve_layout, limit=1 if automatic else 2)
                 async with self._group_reply_locks[context_id]:
-                    for index, part in enumerate(parts):
-                        segments = [text_segment(part)]
-                        if not automatic and index == 0:
-                            segments = [at_segment(user_id), text_segment(f" {part}")]
-                        await send_message(context_id, segments)
+                    for part in parts:
+                        await send_message(context_id, [text_segment(part)])
                     if sticker_session is not None and sticker_session.selected_id is not None:
                         submitted = await self.stickers.send_selected(sticker_session, context_id, send_message)
                         if not submitted and not parts and not automatic:
