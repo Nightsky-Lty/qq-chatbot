@@ -17,7 +17,8 @@ AGENT_INSTRUCTIONS = """\n\n【ReAct工具执行规则，优先于旧的分条/�
 不输出内部推理、行动计划、工具JSON或调试信息到QQ。不要执行未提供的工具。
 需要发送聊天文字时调用 send_message(text)，一条短消息一次调用；想补充时再调用一次。
 需要发表情时查询真实目录后调用 send_sticker；发送工具现在会实际提交，不是延迟排队。
-完成回复后调用 finish。主动接话不合适时，不调用发送工具，直接 finish，不能先发后撤销。
+完成回复后必须调用结束工具。若注册wait_for_messages，想继续群话题时调用它等待；finish则退出话题回到低活跃度。
+未注册wait_for_messages时用finish结束本轮。主动接话不合适时可不发送直接结束，不能先发后撤销。
 收藏成功后按当前人设用send_message说一句短话；未收藏的主动观察保持安静，不播报失败。
 收件人由程序绑定，不传入群号或QQ号。
 先完成看图、收藏、备忘等必要动作，再发确认。工具失败不能当作成功，发送未确认时不重试刷屏。
@@ -32,6 +33,8 @@ class AgentOutcome:
     tool_calls: int
     sent: int
     error: str | None = None
+    wait_for_messages: bool = False
+    topic: str = ""
 
 
 class ReactAgent:
@@ -70,6 +73,7 @@ class ReactAgent:
                         assistant["tool_calls"] = calls
                     messages.append(assistant)
                     if not calls:
+                        send_result = None
                         content = message.get("content")
                         text = content.strip() if isinstance(content, str) else ""
                         if text in {"[不插话]", "不插话"}:
@@ -77,7 +81,12 @@ class ReactAgent:
                         if not registry.output_attempted and "send_message" in registry.bindings:
                             text = "\n".join(dict.fromkeys(registry.receipts)) or text
                             if text:
-                                await registry.execute("send_message", {"text": text})
+                                send_result = await registry.execute("send_message", {"text": text})
+                        if text and "wait_for_messages" in registry.bindings:
+                            state = json.dumps(send_result, ensure_ascii=False) if send_result is not None else "此前已有发送尝试，不再重复提交最终文字。"
+                            messages.append({"role": "user", "content": "【真实发送回执】" + state
+                                             + "\n发送成功后用wait_for_messages继续话题或finish退出；被拒绝则根据回执修正，不声称已发送。"})
+                            continue
                         final_result = await registry.execute("finish", {})
                         if final_result.get("ok") is True:
                             break
@@ -106,7 +115,7 @@ class ReactAgent:
                         key_field = "image_id" if name == "get_message_image" else "sticker_id"
                         key = f"{name}:{arguments.get(key_field)}" if isinstance(arguments, dict) else ""
                         if finished:
-                            result = {"ok": False, "error": "finish之后不执行其他动作。"}
+                            result = {"ok": False, "error": "结束工具之后不执行其他动作。"}
                         elif call_id in cached:
                             previous_signature, previous_result = cached[call_id]
                             result = previous_result if previous_signature == signature else {"ok": False, "error": "同一个调用编号不能更换动作或参数。"}
@@ -138,4 +147,4 @@ class ReactAgent:
         if registry.receipts and not registry.output_attempted and "send_message" in registry.bindings:
             await registry.execute("send_message", {"text": "\n".join(dict.fromkeys(registry.receipts))})
         logger.info("Agent finished: steps=%s tool_calls=%s images=%s sent=%s error=%s", steps, calls_used, len(image_keys), registry.outputs_sent, error is not None)
-        return AgentOutcome(steps, calls_used, registry.outputs_sent, error)
+        return AgentOutcome(steps, calls_used, registry.outputs_sent, error, registry.wait_for_messages, registry.topic)

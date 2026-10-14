@@ -12,6 +12,7 @@ class MessageView:
     mentions: list[int] = field(default_factory=list)
     # 只保留当前事件的图片引用，不下载、不保存图片内容。
     images: list[dict[str, str]] = field(default_factory=list)
+    reply_to: str = ""
 
 
 def parse_message(message: object) -> MessageView:
@@ -24,6 +25,7 @@ def parse_message(message: object) -> MessageView:
     text_parts: list[str] = []
     mentions: list[int] = []
     images: list[dict[str, str]] = []
+    reply_to = ""
     for segment in message:
         if not isinstance(segment, dict):
             continue
@@ -45,8 +47,22 @@ def parse_message(message: object) -> MessageView:
                 "url": data.get("url", "")[:8193] if isinstance(data.get("url"), str) else "",
                 "file_size": str(data.get("file_size", ""))[:20],
             })
+        elif kind == "reply":
+            reply_to = normalize_message_id(data.get("id"))
         # 语音、视频等其他消息段暂不参与解析。
-    return MessageView(text="".join(text_parts).strip(), mentions=mentions, images=images)
+    return MessageView(text="".join(text_parts).strip(), mentions=mentions, images=images, reply_to=reply_to)
+
+
+def normalize_message_id(value: object) -> str:
+    """OneBot 消息号可能为负数；不接受任意 CQ 码或非数字目标。"""
+    if type(value) not in {int, str}:
+        return ""
+    text = str(value)
+    return text if text and len(text) <= 24 and text.lstrip("-").isdigit() and text.count("-") <= 1 else ""
+
+
+def reply_segment(message_id: str) -> dict[str, Any]:
+    return {"type": "reply", "data": {"id": message_id}}
 
 
 def text_segment(text: str) -> dict[str, Any]:

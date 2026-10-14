@@ -19,7 +19,7 @@ from app.tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
 COLLECT_STICKER_TOOL = {"type": "function", "function": {
-    "name": "collect_sticker", "description": "将当前群消息中已查看的合适表情包收藏到共享图库。先get_message_image并在下一轮看完画面再决定；一轮最多一张，不收照片、截图或敏感内容。",
+    "name": "collect_sticker", "description": "将本批新群消息中已查看的合适表情收藏到共享图库。先get_message_image并在下一轮看完画面再决定；每批最多一张，不收照片、截图或敏感内容。",
     "parameters": {"type": "object", "properties": {
         "image_id": {"type": "string", "maxLength": 20},
         "note": {"type": "string", "maxLength": 80, "description": "可选的简短收藏理由或聊天场景。"},

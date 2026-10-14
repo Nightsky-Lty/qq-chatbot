@@ -11,6 +11,7 @@ from app.bot import BotService
 from app.config import Settings, get_settings
 from app.database import Database
 from app.llm import DeepSeekClient
+from app.models import normalize_message_id
 from app.reminders import ReminderService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -42,13 +43,13 @@ class OneBotConnection:
         """向指定 QQ 发送私聊消息；使用私聊动作，不向群发送或附加 @。"""
         await self._send_action("send_private_msg", {"user_id": user_id, "message": message})
 
-    async def send_private_confirmed(self, user_id: int, message: list[dict[str, Any]]) -> None:
+    async def send_private_confirmed(self, user_id: int, message: list[dict[str, Any]]) -> str:
         """Agent和提醒使用确认式发送；NapCat成功不代表用户已读。"""
-        await self._send_action("send_private_msg", {"user_id": user_id, "message": message}, confirmed=True)
+        return await self._send_action("send_private_msg", {"user_id": user_id, "message": message}, confirmed=True)
 
-    async def send_group_confirmed(self, group_id: int, message: list[dict[str, Any]]) -> None:
+    async def send_group_confirmed(self, group_id: int, message: list[dict[str, Any]]) -> str:
         """Agent发送工具等待NapCat确认；只能由后台任务调用，不能阻塞事件接收。"""
-        await self._send_action("send_group_msg", {"group_id": group_id, "message": message}, confirmed=True)
+        return await self._send_action("send_group_msg", {"group_id": group_id, "message": message}, confirmed=True)
 
     def handle_response(self, response: dict[str, Any]) -> None:
         """用 echo 唤醒等待中的发送；普通回复失败只记状态码，不打印消息内容。"""
@@ -67,7 +68,7 @@ class OneBotConnection:
                 # 发送阶段尚未进入 await 的 Future 也不会产生未消费异常。
                 future.exception()
 
-    async def _send_action(self, action: str, params: dict[str, Any], *, confirmed: bool = False) -> None:
+    async def _send_action(self, action: str, params: dict[str, Any], *, confirmed: bool = False) -> str:
         """串行提交 OneBot 动作，群聊和私聊共用序号，防止并发写入。"""
         # 同一连接上的发送操作串行执行，避免并发写入。
         echo = ""
@@ -87,6 +88,9 @@ class OneBotConnection:
                     raise OneBotSendError("NapCat没有及时确认发送") from exc
                 if response.get("status") != "ok" or response.get("retcode") != 0:
                     raise OneBotSendError(f"NapCat发送失败，状态码{response.get('retcode')}")
+                data = response.get("data")
+                return normalize_message_id(data.get("message_id")) if isinstance(data, dict) else ""
+            return ""
         finally:
             self.pending.pop(echo, None)
             if future is not None and not future.done():

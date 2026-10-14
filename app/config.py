@@ -35,15 +35,23 @@ class Settings(BaseSettings):
     evaluate_prefix: str = "/锐评"
     mimic_prefix: str = "/模仿"
     # 冷却单位为秒；上下文和模仿样本限制按消息条数计算。
-    ai_cooldown_seconds: int = 8
-    # 限制后台请求总数，不建立无上限队列；满额时请用户稍后重试。
+    ai_cooldown_seconds: int = Field(default=8, ge=0, le=600)
+    # 限制模型运行总数；群话题有界排队，私聊/模仿满额时提示重试。
     ai_max_concurrency: int = Field(default=3, ge=1, le=16)
     agent_max_steps: int = Field(default=8, ge=2, le=16)
     agent_max_tool_calls: int = Field(default=16, ge=4, le=32)
     agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
-    context_message_limit: int = Field(default=40, ge=1)
-    # 自动接话按最近活跃群友判断，与手动提问的冷却独立。
-    auto_chat_enabled: bool = True
+    context_message_limit: int = Field(default=80, ge=1, le=200)
+    context_max_chars: int = Field(default=24000, ge=1000, le=100000)
+    chat_batch_seconds: float = Field(default=3, ge=0, le=10)
+    chat_batch_max_messages: int = Field(default=30, ge=3, le=100)
+    chat_max_pending_groups: int = Field(default=32, ge=1, le=100)
+    chat_queue_wait_seconds: int = Field(default=120, ge=10, le=600)
+    chat_active_idle_seconds: int = Field(default=180, ge=10, le=3600)
+    chat_active_max_seconds: int = Field(default=900, ge=30, le=7200)
+    group_reply_max_chars: int = Field(default=100, ge=10, le=500)
+    # 兼容旧 .env 的字段；三人自动接话入口已由群话题状态机替代，不再读取人数配置。
+    auto_chat_enabled: bool = False
     auto_chat_min_users: int = Field(default=3, ge=3)
     auto_chat_window_seconds: int = Field(default=180, ge=1)
     auto_chat_cooldown_seconds: int = Field(default=30, ge=1)
@@ -65,7 +73,7 @@ class Settings(BaseSettings):
     sticker_preview_limit: int = Field(default=3, ge=1, le=3)
     sticker_directory: Path = Path("app/sticker_images")
     sticker_collect_enabled: bool = True
-    sticker_collect_auto_enabled: bool = True
+    sticker_collect_auto_enabled: bool = False
     sticker_collected_directory: Path = Path("data/collected_stickers")
     sticker_collect_observe_seconds: int = Field(default=300, ge=30, le=3600)
     sticker_collect_cooldown_seconds: int = Field(default=60, ge=0)

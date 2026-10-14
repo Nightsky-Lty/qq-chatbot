@@ -25,6 +25,8 @@ class ToolRegistry:
         self.outputs_sent = 0
         self.delivery_uncertain = False
         self.allow_silent = False
+        self.wait_for_messages = False
+        self.topic = ""
 
     def register(self, definition: dict[str, Any], handler: Handler, *, terminal: bool = False) -> None:
         name = definition["function"]["name"]
@@ -66,6 +68,14 @@ class ToolRegistry:
 
 
 FINISH_TOOL = {"type": "function", "function": {
-    "name": "finish", "description": "结束本轮处理。正常聊天先用发送工具回复；主动观察可不发消息直接结束。",
+    "name": "finish", "description": "结束处理；群话题进入低活跃度，之后不再无@接话。想继续参与群话题用wait_for_messages。私聊正常回应后结束。",
     "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+}}
+
+WAIT_FOR_MESSAGES_TOOL = {"type": "function", "function": {
+    "name": "wait_for_messages", "description": "本批处理完成，继续参与当前群话题，等待新消息而不立即请求模型。无新消息不发言；话题结束应finish。",
+    "parameters": {"type": "object", "properties": {
+        "topic": {"type": "string", "minLength": 1, "maxLength": 120,
+                  "description": "当前单一话题的简短锚点，不记录所有历史话题。"},
+    }, "required": ["topic"], "additionalProperties": False},
 }}

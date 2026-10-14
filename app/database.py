@@ -9,7 +9,7 @@ from pathlib import Path
 
 # 数据表用途：member_lists 存名单，list_members 存成员，trigger_keywords 存关键词，
 # keyword_list_bindings 保存关键词到名单的唯一绑定；外键防止悬空引用。
-# messages 存群聊文本，普通文字发言可用作当前群的模仿样本。
+# messages 存群聊文本、机器人成功回复和引用对象；群友普通文字可作当前群的模仿样本。
 # private_messages 只存每位用户与机器人的私聊，不作为群聊上下文或模仿样本。
 # WAL 日志模式允许读写操作更好地共存；群号参与键值，隔离不同群的数据。
 SCHEMA = """
@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS messages (
     user_id INTEGER NOT NULL,
     nickname TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
+    message_id TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'user',
+    reply_to_message_id TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_group_time
@@ -107,6 +110,11 @@ class Database:
         with self._lock:
             self.connection.executescript(SCHEMA)
         with self._lock, self.connection:
+            columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(messages)")}
+            for name, default in (("message_id", ""), ("role", "user"), ("reply_to_message_id", "")):
+                if name not in columns:
+                    self.connection.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_onebot ON messages(group_id,message_id)")
             # 旧库的授权表和样本资格字段不再读写，原样保留，避免为升级重建消息表。
             self._migrate_legacy_lists()
 
@@ -300,31 +308,41 @@ class Database:
             return cursor.rowcount > 0
 
     def log_message(
-        self, group_id: int, user_id: int, nickname: str, content: str
-    ) -> None:
+        self, group_id: int, user_id: int, nickname: str, content: str, *, message_id: str = "",
+        role: str = "user", reply_to_message_id: str = "",
+    ) -> int:
         """保存非空群聊文本，最多 4000 字，不再检查或记录模仿授权。"""
         if not content:
-            return
+            return 0
         with self._lock, self.connection:
-            self.connection.execute(
-                """INSERT INTO messages(group_id,user_id,nickname,content,created_at)
-                   VALUES(?,?,?,?,?)""",
-                (group_id, user_id, nickname, content[:4000], int(time.time())),
+            cursor = self.connection.execute(
+                """INSERT INTO messages(group_id,user_id,nickname,content,created_at,message_id,role,reply_to_message_id)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (group_id, user_id, nickname, content[:4000], int(time.time()), message_id, role, reply_to_message_id),
             )
+            return int(cursor.lastrowid)
 
-    def recent_messages(self, group_id: int, limit: int) -> list[sqlite3.Row]:
+    def recent_messages(self, group_id: int, limit: int, *, before_id: int | None = None) -> list[sqlite3.Row]:
         """取当前群最新的 limit 条消息，再按从旧到新的顺序返回给模型。"""
         with self._lock:
-            rows = list(
-                self.connection.execute(
-                    """SELECT user_id,nickname,content FROM messages
-                       WHERE group_id=? ORDER BY id DESC LIMIT ?""",
-                    (group_id, limit),
-                )
-            )
+            boundary = " AND (id < ? OR role='assistant')" if before_id is not None else ""
+            params = (group_id, before_id, limit) if before_id is not None else (group_id, limit)
+            rows = list(self.connection.execute(
+                "SELECT id,user_id,nickname,content,message_id,role,reply_to_message_id,created_at FROM messages"
+                f" WHERE group_id=?{boundary} ORDER BY id DESC LIMIT ?", params,
+            ))
         # 倒序查询便于限制最新条数，反转后符合聊天上下文的时间顺序。
         rows.reverse()
         return rows
+
+    def is_bot_message(self, group_id: int, message_id: str) -> bool:
+        if not message_id:
+            return False
+        with self._lock:
+            return self.connection.execute(
+                "SELECT 1 FROM messages WHERE group_id=? AND message_id=? AND role='assistant' LIMIT 1",
+                (group_id, message_id),
+            ).fetchone() is not None
 
     def log_private_message(self, user_id: int, role: str, content: str) -> None:
         """保存私聊用户文本或已提交发送的机器人回复，每条最多 4000 字。"""
