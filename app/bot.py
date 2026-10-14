@@ -42,7 +42,6 @@ HELP_TEXT = """可用命令：
 只有完整发送已绑定的关键词，才会 @ 对应名单；改绑需先解绑。
 /问 内容（或直接 @机器人）
 /锐评 内容
-/删除我的数据
 /模仿 @某人 主题（无需授权，至少需要 5 条本群普通文字发言）
 /帮助
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
@@ -54,7 +53,6 @@ HELP_TEXT = """可用命令：
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 /问 内容
 /锐评 内容
-/删除我的数据（删除你的私聊记录和提醒，不影响群聊）
 /帮助
 可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
 提醒使用北京时间，目前只支持一次性提醒。
@@ -383,12 +381,6 @@ class BotService:
         if text == "/帮助":
             await self._send_text(send_private, user_id, PRIVATE_HELP_TEXT)
             return
-        if text == "/删除我的数据":
-            # 先取消该用户的私聊生成，避免删除后旧回复重新写入历史。
-            await self.cancel_pending(key=("private", user_id, user_id))
-            deleted, reminders_deleted = self.db.delete_private_data(user_id)
-            await self._send_text(send_private, user_id, f"已删除你的 {deleted} 条私聊记录和 {reminders_deleted} 条提醒记录，群聊数据不受影响。")
-            return
         group_only = ("/名单", "/关键词", self.settings.mimic_prefix)
         if text.startswith(group_only):
             await self._send_text(send_private, user_id, "这个功能只支持群聊，请在群里使用。私聊发 /帮助 可以查看可用命令。")
@@ -450,12 +442,6 @@ class BotService:
         if text in {"/允许模仿", "/禁止模仿"}:
             # 旧指令只做停用提示，不能让用户误以为仍然控制样本使用权限。
             await self._send_text(send_group, group_id, f"模仿授权功能已移除，这个旧指令不再生效。群内可以直接使用 {self.settings.mimic_prefix} @某人 [主题]。")
-            return True
-        if text == "/删除我的数据":
-            # 自动接话还有内存快照，一并取消并移除，避免已删消息继续作为新上下文。
-            await self.cancel_pending(key=("group", group_id, 0))
-            deleted, memories_deleted = self.db.delete_group_user_data(group_id, user_id)
-            await self._send_text(send_group, group_id, f"已删除你在本群保存的 {deleted} 条消息、成员档案和 {memories_deleted} 条长期记忆；之后的新发言仍会保存。")
             return True
         if text.startswith(self.settings.mimic_prefix):
             await self._mimic(group_id, user_id, text, view.mentions, send_group, entry=entry)
