@@ -175,6 +175,7 @@ class BotService:
         await self.conversations.close()
         await self.cancel_pending()
         await self.sticker_indexer.close()
+        await self.memory.close()
         self._confirmed_senders.clear()
 
     def _finish_ai_task(self, task: asyncio.Task[None]) -> None:
@@ -343,7 +344,7 @@ class BotService:
                                  ({"消息号": entry.reply_to, "内容": "未在本群历史中找到"} if entry.reply_to else None)),
                     "图片编号": image_ids.get(entry.storage_id, []), "图片数量": len(entry.images),
                 })
-            memories = self.memory.retrieve(
+            memories = await self.memory.retrieve(
                 group_id,
                 " ".join(entry.text for entry in batch.candidates if entry.text),
                 user_ids=related_ids,
@@ -780,7 +781,7 @@ class BotService:
                     if not 0.75 <= confidence <= 1 or not 0 <= importance <= 1:
                         return {"ok": False, "error": "置信度或重要度超出范围。"}
                     try:
-                        memory_id, created = self.memory.remember(
+                        memory_id, created = await self.memory.remember(
                             context_id, subject, memory_type, arguments["content"],
                             source_user_id=source.user_id, confidence=float(confidence),
                             importance=float(importance), source_message_id=source_id,

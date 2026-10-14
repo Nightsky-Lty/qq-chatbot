@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS memories (
     memory_type TEXT NOT NULL,
     content TEXT NOT NULL,
     vector TEXT NOT NULL DEFAULT '{}',
+    hash_vector TEXT NOT NULL DEFAULT '{}',
+    embedding_model TEXT NOT NULL DEFAULT 'hash-blake2b-512-v1',
+    embedding_dimensions INTEGER NOT NULL DEFAULT 512,
     importance REAL NOT NULL DEFAULT 0.5,
     confidence REAL NOT NULL DEFAULT 0.8,
     source_message_id TEXT NOT NULL DEFAULT '',
@@ -145,6 +148,21 @@ class Database:
                 if name not in columns:
                     self.connection.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_onebot ON messages(group_id,message_id)")
+            memory_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(memories)")}
+            memory_migrations = (
+                ("hash_vector", "TEXT NOT NULL DEFAULT '{}'"),
+                ("embedding_model", "TEXT NOT NULL DEFAULT 'hash-blake2b-512-v1'"),
+                ("embedding_dimensions", "INTEGER NOT NULL DEFAULT 512"),
+            )
+            for name, definition in memory_migrations:
+                if name not in memory_columns:
+                    self.connection.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
+            # 升级前的vector就是哈希向量，复制一份作为所有后端的故障降级索引。
+            self.connection.execute(
+                """UPDATE memories SET hash_vector=vector
+                   WHERE (hash_vector='' OR hash_vector='{}')
+                       AND embedding_model='hash-blake2b-512-v1'"""
+            )
             # 旧库的授权表和样本资格字段不再读写，原样保留，避免为升级重建消息表。
             self._migrate_legacy_lists()
 
@@ -437,6 +455,9 @@ class Database:
         memory_type: str,
         content: str,
         vector: str,
+        hash_vector: str,
+        embedding_model: str,
+        embedding_dimensions: int,
         *,
         confidence: float,
         importance: float,
@@ -454,20 +475,23 @@ class Database:
             if existing is None:
                 cursor = self.connection.execute(
                     """INSERT INTO memories
-                       (group_id,user_id,source_user_id,memory_type,content,vector,importance,confidence,
-                        source_message_id,created_at,updated_at,last_accessed_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,0)""",
-                    (group_id, user_id, source_user_id, memory_type, content, vector, importance, confidence,
-                     source_message_id, now, now),
+                       (group_id,user_id,source_user_id,memory_type,content,vector,hash_vector,
+                        embedding_model,embedding_dimensions,importance,confidence,source_message_id,
+                        created_at,updated_at,last_accessed_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                    (group_id, user_id, source_user_id, memory_type, content, vector, hash_vector,
+                     embedding_model, embedding_dimensions, importance, confidence, source_message_id, now, now),
                 )
                 memory_id, created = int(cursor.lastrowid), True
             else:
                 memory_id, created = int(existing["id"]), False
                 self.connection.execute(
-                    """UPDATE memories SET source_user_id=?,vector=?,
+                    """UPDATE memories SET source_user_id=?,vector=?,hash_vector=?,
+                       embedding_model=?,embedding_dimensions=?,
                        importance=max(importance,?),confidence=max(confidence,?),
                        source_message_id=?,updated_at=? WHERE id=?""",
-                    (source_user_id, vector, importance, confidence, source_message_id, now, memory_id),
+                    (source_user_id, vector, hash_vector, embedding_model, embedding_dimensions,
+                     importance, confidence, source_message_id, now, memory_id),
                 )
             stale = self.connection.execute(
                 """SELECT id FROM memories WHERE group_id=? AND user_id=?
@@ -492,6 +516,25 @@ class Database:
                     ORDER BY updated_at DESC LIMIT ?""",
                 (group_id, *targets, limit),
             ))
+
+    def memories_needing_embedding(self, embedding_model: str, limit: int) -> list[sqlite3.Row]:
+        """为后台迁移读取尚未使用当前模型的记忆，不改变聊天请求的延迟。"""
+        with self._lock:
+            return list(self.connection.execute(
+                """SELECT id,content FROM memories WHERE embedding_model<>?
+                   ORDER BY updated_at DESC,id DESC LIMIT ?""",
+                (embedding_model, limit),
+            ))
+
+    def update_memory_embedding(
+        self, memory_id: int, vector: str, embedding_model: str, embedding_dimensions: int
+    ) -> bool:
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """UPDATE memories SET vector=?,embedding_model=?,embedding_dimensions=? WHERE id=?""",
+                (vector, embedding_model, embedding_dimensions, memory_id),
+            )
+            return cursor.rowcount > 0
 
     def list_user_memories(self, group_id: int, user_id: int, limit: int = 20) -> list[sqlite3.Row]:
         with self._lock:

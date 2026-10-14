@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
     context_message_limit: int = Field(default=80, ge=1, le=200)
     context_max_chars: int = Field(default=24000, ge=1000, le=100000)
-    # 群成员长期记忆：SQLite 持久化，使用本地稀疏向量做混合 RAG，不依赖额外服务。
+    # 群成员长期记忆：SQLite 持久化，使用本地向量做混合 RAG，不依赖额外服务。
     memory_enabled: bool = True
     memory_auto_capture_enabled: bool = True
     memory_retrieval_limit: int = Field(default=8, ge=1, le=30)
@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     memory_max_per_user: int = Field(default=200, ge=10, le=2000)
     memory_max_chars: int = Field(default=200, ge=20, le=500)
     memory_min_confidence: float = Field(default=0.8, ge=0.5, le=1.0)
+    # bge_onnx 使用只读挂载的本地 INT8 模型；加载或推理失败时自动退回哈希向量。
+    embedding_provider: Literal["hash", "bge_onnx"] = "hash"
+    embedding_model_path: Path = Path("/app/models/bge-small-zh-v1.5")
+    embedding_model_file: str = "model_quantized.onnx"
+    embedding_max_length: int = Field(default=128, ge=16, le=512)
+    embedding_threads: int = Field(default=2, ge=1, le=4)
+    embedding_backfill_batch_size: int = Field(default=16, ge=1, le=64)
+    embedding_min_similarity: float = Field(default=0.35, ge=0, le=1)
+    embedding_query_prefix: str = "为这个句子生成表示以用于检索相关文章："
     chat_batch_seconds: float = Field(default=3, ge=0, le=10)
     chat_batch_max_messages: int = Field(default=30, ge=3, le=100)
     chat_max_pending_groups: int = Field(default=32, ge=1, le=100)

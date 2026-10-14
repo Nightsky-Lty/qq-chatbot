@@ -1,17 +1,27 @@
-"""群成员长期记忆：本地稀疏向量、混合检索和受控写入。"""
+"""群成员长期记忆：BGE/哈希向量、混合检索和受控写入。"""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
+import asyncio
+import logging
 import re
 import time
-from collections import Counter
 from typing import Any, Iterable
 
 from app.config import Settings
 from app.database import Database
+from app.embeddings import (
+    HASH_MODEL_ID,
+    EmbeddingProvider,
+    HashEmbeddingProvider,
+    create_embedding_provider,
+    sparse_vector,
+    tokens,
+    vector_similarity,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 MEMORY_TYPES = {"profile", "preference", "event", "relationship", "group_meme", "explicit"}
@@ -36,48 +46,74 @@ def contains_sensitive_memory(text: str) -> bool:
     return any(pattern.search(text) for pattern in _SENSITIVE_PATTERNS)
 
 
-def _tokens(text: str) -> list[str]:
-    """生成适合中英文短聊天的词元；中文使用单字和双字片段。"""
-    lowered = text.casefold()
-    tokens = re.findall(r"[a-z0-9_]+", lowered)
-    chunks = re.findall(r"[\u3400-\u9fff]+", lowered)
-    for chunk in chunks:
-        tokens.extend(chunk)
-        tokens.extend(chunk[index:index + 2] for index in range(len(chunk) - 1))
-    return tokens
-
-
-def sparse_vector(text: str, dimensions: int = 512) -> str:
-    """无外部依赖的特征哈希向量，序列化后可持久化在 SQLite。"""
-    counts: Counter[int] = Counter()
-    for token in _tokens(text):
-        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-        counts[int.from_bytes(digest, "big") % dimensions] += 1
-    norm = math.sqrt(sum(value * value for value in counts.values())) or 1.0
-    return json.dumps({str(key): value / norm for key, value in counts.items()}, separators=(",", ":"))
-
-
-def vector_similarity(left: str, right: str) -> float:
-    try:
-        a = json.loads(left)
-        b = json.loads(right)
-    except (TypeError, ValueError):
-        return 0.0
-    if not isinstance(a, dict) or not isinstance(b, dict):
-        return 0.0
-    if len(a) > len(b):
-        a, b = b, a
-    return sum(float(value) * float(b.get(key, 0.0)) for key, value in a.items())
-
-
 class MemoryService:
     """保存经过约束的长期记忆，并为群聊构建可审计的 RAG 结果。"""
 
-    def __init__(self, settings: Settings, database: Database):
+    def __init__(
+        self, settings: Settings, database: Database, provider: EmbeddingProvider | None = None
+    ):
         self.settings = settings
         self.db = database
+        self.provider = provider or create_embedding_provider(settings)
+        self.hash_provider = HashEmbeddingProvider()
+        self._backfill_task: asyncio.Task[None] | None = None
 
-    def remember(
+    async def start(self) -> None:
+        """预热向量模型；失败时保持服务可用，并自动退回特征哈希。"""
+        if not self.settings.memory_enabled:
+            return
+        ready = await self.provider.start()
+        if ready and self.provider.model_id != HASH_MODEL_ID:
+            self._backfill_task = asyncio.create_task(
+                self._backfill_embeddings(), name="memory-embedding-backfill"
+            )
+
+    async def close(self) -> None:
+        if self._backfill_task is not None and not self._backfill_task.done():
+            self._backfill_task.cancel()
+            await asyncio.gather(self._backfill_task, return_exceptions=True)
+        self._backfill_task = None
+
+    async def _document_embedding(self, content: str) -> tuple[str, str, int]:
+        """生成主向量；模型不可用时本次写入使用可检索的哈希向量。"""
+        if self.provider.available:
+            try:
+                vector = (await self.provider.embed_documents([content]))[0]
+                return vector, self.provider.model_id, self.provider.dimensions
+            except Exception as exc:
+                logger.warning("Embedding inference failed; using hash fallback: error=%s", type(exc).__name__)
+        vector = await self.hash_provider.embed_query(content)
+        return vector, self.hash_provider.model_id, self.hash_provider.dimensions
+
+    async def _backfill_embeddings(self) -> None:
+        """在后台分批把旧记忆升级为当前模型，避免阻塞服务启动。"""
+        updated = 0
+        try:
+            while self.provider.available:
+                rows = self.db.memories_needing_embedding(
+                    self.provider.model_id, self.settings.embedding_backfill_batch_size
+                )
+                if not rows:
+                    break
+                vectors = await self.provider.embed_documents([row["content"] for row in rows])
+                if len(vectors) != len(rows):
+                    raise RuntimeError("Embedding后端返回数量与输入不一致")
+                for row, vector in zip(rows, vectors):
+                    self.db.update_memory_embedding(
+                        row["id"], vector, self.provider.model_id, self.provider.dimensions
+                    )
+                    updated += 1
+                # 给在线查询留出调度机会，避免大量旧记忆回填时持续占满 CPU。
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Memory embedding backfill stopped: error=%s updated=%s", type(exc).__name__, updated)
+        else:
+            if updated:
+                logger.info("Memory embedding backfill complete: updated=%s", updated)
+
+    async def remember(
         self,
         group_id: int,
         user_id: int,
@@ -99,16 +135,18 @@ class MemoryService:
             raise ValueError("这段内容可能包含敏感个人信息，不会写入长期记忆。")
         if not explicit and confidence < self.settings.memory_min_confidence:
             raise ValueError("这条信息不够确定，不写入长期记忆。")
+        hash_vector = sparse_vector(content)
+        vector, embedding_model, dimensions = await self._document_embedding(content)
         return self.db.save_memory(
             group_id, user_id, source_user_id if source_user_id is not None else user_id,
-            memory_type, content, sparse_vector(content),
+            memory_type, content, vector, hash_vector, embedding_model, dimensions,
             confidence=max(0.0, min(1.0, confidence)),
             importance=max(0.0, min(1.0, importance)),
             source_message_id=source_message_id,
             max_per_user=self.settings.memory_max_per_user,
         )
 
-    def retrieve(
+    async def retrieve(
         self, group_id: int, query: str, *, user_ids: Iterable[int], limit: int | None = None
     ) -> list[dict[str, Any]]:
         """先按群和参与者过滤，再按向量、重要度、新鲜度进行混合排序。"""
@@ -118,14 +156,24 @@ class MemoryService:
         rows = self.db.memory_candidates(
             group_id, targets, max(self.settings.memory_candidate_limit, self.settings.memory_retrieval_limit)
         )
-        query_vector = sparse_vector(query)
-        query_terms = {token for token in _tokens(query) if len(token) > 1}
+        hash_query_vector = sparse_vector(query)
+        dense_query_vector: str | None = None
+        if query.strip() and self.provider.model_id != HASH_MODEL_ID and self.provider.available:
+            try:
+                dense_query_vector = await self.provider.embed_query(query)
+            except Exception as exc:
+                logger.warning("Query embedding failed; using hash fallback: error=%s", type(exc).__name__)
+        query_terms = {token for token in tokens(query) if len(token) > 1}
         now = int(time.time())
         ranked: list[tuple[float, Any]] = []
         normalized_query = "".join(query.casefold().split())
         for row in rows:
-            similarity = vector_similarity(query_vector, row["vector"])
-            content_terms = {token for token in _tokens(row["content"]) if len(token) > 1}
+            use_dense = dense_query_vector is not None and row["embedding_model"] == self.provider.model_id
+            similarity = vector_similarity(
+                dense_query_vector if use_dense else hash_query_vector,
+                row["vector"] if use_dense else (row["hash_vector"] or row["vector"]),
+            )
+            content_terms = {token for token in tokens(row["content"]) if len(token) > 1}
             lexical_overlap = bool(query_terms & content_terms)
             content_key = "".join(row["content"].casefold().split())
             exact = 0.15 if content_key and normalized_query and (
@@ -138,9 +186,10 @@ class MemoryService:
                 row["memory_type"] in {"profile", "preference", "relationship", "explicit"}
                 and row["user_id"] in targets
             )
-            # 事件和群梗只有与本轮存在字面/片段联系才召回，避免“认识这个人”退化成
-            # 每轮都把他全部往事塞给模型；稳定档案则始终可作为辨人背景。
-            if not stable_for_person and not lexical_overlap and not exact:
+            # 稳定档案始终可作为辨人背景；事件和群梗还需字面或语义相关，避免把
+            # 某人的全部往事塞进每一轮上下文。
+            semantically_related = use_dense and similarity >= self.settings.embedding_min_similarity
+            if not stable_for_person and not lexical_overlap and not exact and not semantically_related:
                 continue
             score = similarity * 0.62 + row["importance"] * 0.13 + row["confidence"] * 0.08
             score += freshness * 0.05 + same_person + exact

@@ -19,7 +19,7 @@
 | 群表情收藏 | LLM按需查看当前群图片并决定调用 `collect_sticker`，独立审核、去重后加入共享图库 |
 | 内容锐评 | 使用 `/锐评` 主动提交要评价的文本 |
 | 发言风格模仿 | 直接 `/模仿 @某人 主题`，使用目标用户在本群的普通文字发言，无需授权 |
-| 长期成员记忆 | 按群号和 QQ 号保存别名及稳定事实，使用本地混合 RAG 召回，支持本人查看和删除 |
+| 长期成员记忆 | 按群号和 QQ 号保存别名及稳定事实，使用本地 BGE/哈希混合 RAG 自动召回，不增加群命令 |
 | 数据持久化 | SQLite 保存名单、关键词、群消息、成员记忆、独立的私聊记录及提醒 |
 
 模仿功能使用样本提示词，不训练或微调模型。机器人处理文本、@、QQ引用和本批新消息中的图片，语音和视频暂不支持。低活跃期普通群消息仅保存历史，不调用聊天模型；@或聊天命令唤醒后，话题活跃期间无需每条@。私聊的普通文字或图片会调用AI。
@@ -33,7 +33,7 @@
 | `app/llm.py` | 单次DeepSeek请求及独立图片审核，不维护业务工具循环 |
 | `app/agent.py` | 模型/工具迭代、观察、图片预算、步骤/超时限制及同调用编号去重 |
 | `app/tools.py` | 每次请求独立注册定义和执行器、校验参数，不注册任意Python函数 |
-| `app/memory.py` | 群成员长期记忆写入约束、本地稀疏向量和混合 RAG 排序 |
+| `app/memory.py` | 群成员长期记忆写入约束、BGE/哈希向量和混合 RAG 排序 |
 | `app/messaging.py` | 注册 `send_message(text, reply_to_message_id?)`，引用校验、短句限制、去重、保存成功发送 |
 | `app/conversation.py` | 按群固定聚批、串行有界队列、话题活跃期和超时 |
 | `app/bot.py` | 路由和授权范围、绑定工具到真实当前会话、并发与冷却 |
@@ -59,9 +59,9 @@
 
 每次群话题运行均带近期历史，不再依赖“刚才/这个”等关键词，默认最多80条；群历史单条最多提供1000字，总字符预算24000，从最新向前保留。历史与本批新消息分开，标注消息号、QQ、昵称、角色和引用对象；本批明确标记可回复消息及默认焦点。历史只作理解背景，不补答旧问题，不把不同人的话题合并成长文。历史不重复包含本批用户消息，也不混入下一批用户消息；上一轮运行期间收到的追问会带上上一轮成功发送的机器人回复。群聊成功文字和表情占位也写入历史，旧数据库自动新增字段、不清空旧记录。私聊默认最多80条历史，不含当前问题；不保存思考、图片字节或下载URL。增加历史可能增加API输入、费用和耗时。
 
-群聊另有按 `(群号, QQ号)` 隔离的长期成员记忆。群名片变化会保留为别名，但不会把同一 QQ 当成新人；昵称相同的不同 QQ 也不会合并。每轮除群近期历史外，会补充当前发言人的定向历史，并解析本批 `@` 成员及引用消息的作者和原文。长期记忆先按当前群及相关 QQ 过滤，再使用本地中英文稀疏向量、置信度、重要度和时间新鲜度混合排序，不需要额外向量数据库或 embedding API。
+群聊另有按 `(群号, QQ号)` 隔离的长期成员记忆。群名片变化会保留为别名，但不会把同一 QQ 当成新人；昵称相同的不同 QQ 也不会合并。每轮除群近期历史外，会补充当前发言人的定向历史，并解析本批 `@` 成员及引用消息的作者和原文。长期记忆先按当前群及相关 QQ 过滤，再用本地 `BAAI/bge-small-zh-v1.5` ONNX INT8 语义向量、置信度、重要度和时间新鲜度混合排序，不需要额外向量数据库或 embedding API。
 
-模型只可从本批有明确来源的消息中静默保存稳定资料、偏好、重要经历、固定称呼和群梗；一次性情绪、普通寒暄、猜测和常见敏感个人信息会被拒绝。记忆功能不提供额外群指令。当前实现侧重无依赖和可迁移性，后续可以保持表结构和检索接口不变，将向量生成/检索替换成 pgvector、Qdrant 或其他 embedding 服务。
+模型只可从本批有明确来源的消息中静默保存稳定资料、偏好、重要经历、固定称呼和群梗；一次性情绪、普通寒暄、猜测和常见敏感个人信息会被拒绝。记忆功能不提供额外群指令。模型缺失或单次推理失败时自动退回 512 维特征哈希，服务不会因此停止；模型就绪并重启机器人后，后台分批重建旧记忆向量。SQLite 同时保留哈希向量用于降级，不需要清空旧数据库。
 
 ## 聊天图片识别
 
@@ -197,7 +197,21 @@ ADMIN_QQ_IDS=你的管理员QQ号
 
 `ADMIN_QQ_IDS` 是发出管理命令的用户 QQ 号，支持逗号分隔，也支持 JSON 数组；群主和群管理员同样具有管理权限。不要把占位文字直接作为真实配置使用。
 
-### 3. 启动两个服务
+### 3. 准备本地 Embedding 模型
+
+模型不提交到 Git，也不打进镜像。建议在内存更充足的电脑上导出，再把目录传到服务器；项目脚本使用官方 Optimum 工具生成 AVX2 INT8 ONNX：
+
+```bash
+python3 -m venv .venv-export
+. .venv-export/bin/activate
+python -m pip install -U pip "optimum-onnx[onnxruntime]" torch transformers
+sh scripts/export_bge_onnx.sh
+rsync -av models/bge-small-zh-v1.5-int8/ 用户名@服务器IP:~/qq-chatbot/models/bge-small-zh-v1.5-int8/
+```
+
+服务器默认从 `./models/bge-small-zh-v1.5-int8` 只读挂载模型。若模型暂未上传，机器人会记录警告并自动使用哈希检索；无需 GPU。
+
+### 4. 启动两个服务
 
 ```bash
 sudo docker compose config --quiet
@@ -208,7 +222,7 @@ curl http://127.0.0.1:8080/health
 
 Compose 会先启动 Python 服务，再启动 NapCat，自动初始化数组消息格式的反向 WebSocket 连接。`/health` 仅检查 Python 服务是否可以响应，不代表 QQ 已登录或 DeepSeek 请求成功。
 
-### 4. 登录机器人 QQ
+### 5. 登录机器人 QQ
 
 在自己电脑上新开终端，使用实际用户名和服务器 IP 建立 SSH 转发：
 
@@ -222,7 +236,7 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 
 两个容器通过内部网络通信，服务器公网无需开放 8080 或 6099 端口。数据库和 QQ 登录状态保存在 Docker 数据卷中，普通容器重建会保留数据。
 
-### 5. 加群使用
+### 6. 加群使用
 
 把机器人 QQ 加入目标群，先发送 `/帮助` 确认 QQ 收发，再用 `/问 你好` 确认 DeepSeek 请求。
 
@@ -353,6 +367,14 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 | `MEMORY_MAX_PER_USER` | `200` | 每位成员在每个群最多保留的长期记忆数 |
 | `MEMORY_MAX_CHARS` | `200` | 单条长期记忆最大字数 |
 | `MEMORY_MIN_CONFIDENCE` | `0.8` | 模型自动写入长期记忆的最低置信度 |
+| `EMBEDDING_PROVIDER` | `bge_onnx` | `bge_onnx` 使用本地 BGE ONNX；`hash` 强制使用轻量哈希 |
+| `EMBEDDING_MODEL_PATH` | `/app/models/bge-small-zh-v1.5` | 容器内模型和 tokenizer 目录 |
+| `EMBEDDING_MODEL_FILE` | `model_quantized.onnx` | 模型目录中的 ONNX 文件名 |
+| `EMBEDDING_MAX_LENGTH` | `128` | 单条记忆/查询的最大 token 长度 |
+| `EMBEDDING_THREADS` | `2` | ONNX Runtime CPU 推理线程数；4 vCPU 服务器建议保持 2 |
+| `EMBEDDING_BACKFILL_BATCH_SIZE` | `16` | 后台升级旧记忆向量的每批条数 |
+| `EMBEDDING_MIN_SIMILARITY` | `0.35` | 非稳定事件仅凭语义召回时的最低相似度 |
+| `EMBEDDING_QUERY_PREFIX` | `为这个句子生成表示以用于检索相关文章：` | BGE 检索查询前缀；通常无需修改 |
 | `CHAT_BATCH_SECONDS` | `3` | 群话题固定聚批等待秒数，不因新消息重置 |
 | `CHAT_BATCH_MAX_MESSAGES` | `30` | 每群等待批次最多消息数，满额明确提问会提示重试 |
 | `CHAT_MAX_PENDING_GROUPS` | `32` | 等待/活跃群状态的数量上限 |
@@ -441,6 +463,8 @@ app/
 ├── main.py       # FastAPI 入口、生命周期和 OneBot WebSocket 收发
 ├── bot.py        # 群/私聊分发、召集、后台聊天、锐评和模仿逻辑
 ├── database.py   # SQLite 表结构和读写操作
+├── memory.py     # 长期记忆约束、混合召回和后台向量升级
+├── embeddings.py # BGE ONNX CPU 推理、池化归一化和哈希降级
 ├── llm.py        # DeepSeek API 调用和异常处理
 ├── agent.py      # ReAct循环、工具观察、预算及终止
 ├── conversation.py # 群聚批、串行有界队列和话题活跃状态
@@ -460,6 +484,7 @@ config.env         # 可提交的普通配置，随 git pull 更新
 docs/deployment.md # Ubuntu 安装、部署和管理说明
 Dockerfile         # Python 机器人镜像
 compose.yaml       # 机器人与 NapCat 的容器编排
+scripts/           # BGE ONNX INT8 模型导出脚本
 .env.example       # 本地私密配置模板，不包含真实密钥
 pyproject.toml     # Python 依赖声明
 uv.lock            # Python 依赖版本锁定
@@ -484,6 +509,8 @@ uv.lock            # Python 依赖版本锁定
 **模仿提示样本不足**：无需授权，但目标用户至少要有 5 条保存在当前群的普通文字发言；以 `/` 开头的指令、空文本、其他群或私聊记录不计入。升级前的普通文字也可使用，过期或由部署者清理的消息不能使用。
 
 **云服务器内存较小**：先用 `docker stats --no-stream` 观察 QQ、NapCat 和机器人占用，再决定是否增加 Swap 或升级内存。调用 DeepSeek API 不需要 GPU。
+
+**日志提示 Embedding model unavailable**：确认宿主机存在 `models/bge-small-zh-v1.5-int8/model_quantized.onnx` 和 `tokenizer.json`，执行 `sudo docker compose exec bot ls -lh /app/models/bge-small-zh-v1.5` 检查挂载。模型不可用期间会自动使用哈希检索，不影响聊天启动。
 
 ## 数据与当前限制
 
