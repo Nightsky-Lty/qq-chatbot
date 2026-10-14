@@ -16,6 +16,11 @@ from app.stickers import image_mime
 
 logger = logging.getLogger(__name__)
 
+# NapCat types/constant.ts 的 IMAGE_HTTP_HOST_NT 使用 qq.com.cn，不能漏掉 .cn。
+QQ_IMAGE_HOSTS = frozenset({
+    "multimedia.nt.qq.com.cn", "multimedia.nt.qq.com", "gchat.qpic.cn", "c2cpicdw.qpic.cn",
+})
+
 
 CHAT_IMAGE_TOOL = {
     "type": "function",
@@ -102,7 +107,7 @@ class ChatImageService:
         # NapCat 的新/旧 QQ 图片地址。禁止任意网站、IP、凭证、特殊端口和本地路径。
         host = parts.hostname
         if (parts.scheme not in {"http", "https"}
-                or host not in {"multimedia.nt.qq.com", "gchat.qpic.cn", "c2cpicdw.qpic.cn"}
+                or host not in QQ_IMAGE_HOSTS
                 or parts.username is not None or parts.password is not None
                 or port not in {None, 80 if parts.scheme == "http" else 443}):
             raise ValueError("图片来源不受支持，仅允许QQ原始图片下载地址。")
