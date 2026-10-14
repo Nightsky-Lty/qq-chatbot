@@ -63,6 +63,36 @@ CREATE INDEX IF NOT EXISTS idx_messages_group_time
     ON messages(group_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_user_time
     ON messages(group_id, user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    role TEXT NOT NULL DEFAULT 'member',
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    source_user_id INTEGER NOT NULL,
+    memory_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    vector TEXT NOT NULL DEFAULT '{}',
+    importance REAL NOT NULL DEFAULT 0.5,
+    confidence REAL NOT NULL DEFAULT 0.8,
+    source_message_id TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_accessed_at INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(group_id, user_id, memory_type, content)
+);
+CREATE INDEX IF NOT EXISTS idx_memories_group_user
+    ON memories(group_id, user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_source_user
+    ON memories(group_id, source_user_id);
 CREATE TABLE IF NOT EXISTS private_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -322,6 +352,173 @@ class Database:
             )
             return int(cursor.lastrowid)
 
+    def upsert_group_member(self, group_id: int, user_id: int, display_name: str, role: str = "member") -> None:
+        """以群号和 QQ 号维护稳定成员身份，并保留最近使用过的昵称。"""
+        display_name = display_name.strip()[:100] or str(user_id)
+        now = int(time.time())
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                "SELECT display_name,aliases_json FROM group_members WHERE group_id=? AND user_id=?",
+                (group_id, user_id),
+            ).fetchone()
+            aliases: list[str] = []
+            if row is not None:
+                try:
+                    aliases = [str(value) for value in json.loads(row["aliases_json"]) if str(value).strip()]
+                except (TypeError, ValueError):
+                    aliases = []
+                previous = row["display_name"].strip()
+                if previous and previous != display_name and previous not in aliases:
+                    aliases.append(previous)
+            aliases = [alias for alias in aliases if alias != display_name][-10:]
+            self.connection.execute(
+                """INSERT INTO group_members
+                   (group_id,user_id,display_name,aliases_json,role,first_seen_at,last_seen_at)
+                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(group_id,user_id) DO UPDATE SET
+                   display_name=excluded.display_name,aliases_json=excluded.aliases_json,
+                   role=excluded.role,last_seen_at=excluded.last_seen_at""",
+                (group_id, user_id, display_name, json.dumps(aliases, ensure_ascii=False), role, now, now),
+            )
+
+    def group_members(self, group_id: int, user_ids: set[int]) -> list[dict]:
+        """查询本轮相关成员；昵称只展示，身份始终由 QQ 号确定。"""
+        if not user_ids:
+            return []
+        placeholders = ",".join("?" for _ in user_ids)
+        with self._lock:
+            rows = list(self.connection.execute(
+                f"""SELECT user_id,display_name,aliases_json,role,last_seen_at FROM group_members
+                    WHERE group_id=? AND user_id IN ({placeholders}) ORDER BY user_id""",
+                (group_id, *sorted(user_ids)),
+            ))
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["aliases"] = json.loads(item.pop("aliases_json"))
+            except (TypeError, ValueError):
+                item["aliases"] = []
+            result.append(item)
+        return result
+
+    def message_by_onebot_id(self, group_id: int, message_id: str) -> sqlite3.Row | None:
+        """解析 QQ 引用目标；只返回同群消息，防止跨群关联。"""
+        if not message_id:
+            return None
+        with self._lock:
+            return self.connection.execute(
+                """SELECT id,user_id,nickname,content,message_id,role,reply_to_message_id,created_at
+                   FROM messages WHERE group_id=? AND message_id=? ORDER BY id DESC LIMIT 1""",
+                (group_id, message_id),
+            ).fetchone()
+
+    def recent_user_messages(
+        self, group_id: int, user_id: int, limit: int, *, before_id: int | None = None
+    ) -> list[sqlite3.Row]:
+        """补充当前成员自己的近期发言，避免被活跃群消息挤出上下文。"""
+        if limit <= 0:
+            return []
+        boundary = " AND id<?" if before_id is not None else ""
+        params = (group_id, user_id, before_id, limit) if before_id is not None else (group_id, user_id, limit)
+        with self._lock:
+            rows = list(self.connection.execute(
+                """SELECT id,user_id,nickname,content,message_id,role,reply_to_message_id,created_at
+                   FROM messages WHERE group_id=? AND user_id=?""" + boundary + " ORDER BY id DESC LIMIT ?",
+                params,
+            ))
+        rows.reverse()
+        return rows
+
+    def save_memory(
+        self,
+        group_id: int,
+        user_id: int,
+        source_user_id: int,
+        memory_type: str,
+        content: str,
+        vector: str,
+        *,
+        confidence: float,
+        importance: float,
+        source_message_id: str,
+        max_per_user: int,
+    ) -> tuple[int, bool]:
+        """幂等保存记忆，并限制每位成员在每个群的记忆总量。"""
+        now = int(time.time())
+        with self._lock, self.connection:
+            existing = self.connection.execute(
+                """SELECT id FROM memories
+                   WHERE group_id=? AND user_id=? AND memory_type=? AND content=?""",
+                (group_id, user_id, memory_type, content),
+            ).fetchone()
+            if existing is None:
+                cursor = self.connection.execute(
+                    """INSERT INTO memories
+                       (group_id,user_id,source_user_id,memory_type,content,vector,importance,confidence,
+                        source_message_id,created_at,updated_at,last_accessed_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,0)""",
+                    (group_id, user_id, source_user_id, memory_type, content, vector, importance, confidence,
+                     source_message_id, now, now),
+                )
+                memory_id, created = int(cursor.lastrowid), True
+            else:
+                memory_id, created = int(existing["id"]), False
+                self.connection.execute(
+                    """UPDATE memories SET source_user_id=?,vector=?,
+                       importance=max(importance,?),confidence=max(confidence,?),
+                       source_message_id=?,updated_at=? WHERE id=?""",
+                    (source_user_id, vector, importance, confidence, source_message_id, now, memory_id),
+                )
+            stale = self.connection.execute(
+                """SELECT id FROM memories WHERE group_id=? AND user_id=?
+                   ORDER BY importance DESC,confidence DESC,updated_at DESC LIMIT -1 OFFSET ?""",
+                (group_id, user_id, max_per_user),
+            ).fetchall()
+            if stale:
+                placeholders = ",".join("?" for _ in stale)
+                self.connection.execute(
+                    f"DELETE FROM memories WHERE id IN ({placeholders})",
+                    tuple(row["id"] for row in stale),
+                )
+            return memory_id, created
+
+    def memory_candidates(self, group_id: int, user_ids: set[int], limit: int) -> list[sqlite3.Row]:
+        """在向量打分前按群和相关成员过滤；user_id=0 表示全群记忆。"""
+        targets = sorted(user_ids | {0})
+        placeholders = ",".join("?" for _ in targets)
+        with self._lock:
+            return list(self.connection.execute(
+                f"""SELECT * FROM memories WHERE group_id=? AND user_id IN ({placeholders})
+                    ORDER BY updated_at DESC LIMIT ?""",
+                (group_id, *targets, limit),
+            ))
+
+    def list_user_memories(self, group_id: int, user_id: int, limit: int = 20) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.connection.execute(
+                """SELECT id,memory_type,content,confidence,importance,updated_at FROM memories
+                   WHERE group_id=? AND user_id=? ORDER BY updated_at DESC,id DESC LIMIT ?""",
+                (group_id, user_id, limit),
+            ))
+
+    def delete_user_memory(self, group_id: int, user_id: int, memory_id: int) -> bool:
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM memories WHERE group_id=? AND user_id=? AND id=?",
+                (group_id, user_id, memory_id),
+            )
+            return cursor.rowcount > 0
+
+    def touch_memories(self, memory_ids: list[int]) -> None:
+        if not memory_ids:
+            return
+        placeholders = ",".join("?" for _ in memory_ids)
+        with self._lock, self.connection:
+            self.connection.execute(
+                f"UPDATE memories SET last_accessed_at=? WHERE id IN ({placeholders})",
+                (int(time.time()), *memory_ids),
+            )
+
     def recent_messages(self, group_id: int, limit: int, *, before_id: int | None = None) -> list[sqlite3.Row]:
         """取当前群最新的 limit 条消息，再按从旧到新的顺序返回给模型。"""
         with self._lock:
@@ -472,6 +669,21 @@ class Database:
                 (group_id, user_id),
             )
             return cursor.rowcount
+
+    def delete_group_user_data(self, group_id: int, user_id: int) -> tuple[int, int]:
+        """原子删除本人在当前群的消息、成员档案及作为本人来源的长期记忆。"""
+        with self._lock, self.connection:
+            messages = self.connection.execute(
+                "DELETE FROM messages WHERE group_id=? AND user_id=?", (group_id, user_id)
+            )
+            memories = self.connection.execute(
+                "DELETE FROM memories WHERE group_id=? AND (user_id=? OR source_user_id=?)",
+                (group_id, user_id, user_id),
+            )
+            self.connection.execute(
+                "DELETE FROM group_members WHERE group_id=? AND user_id=?", (group_id, user_id)
+            )
+            return messages.rowcount, memories.rowcount
 
     def purge_old_messages(self, retention_days: int) -> int:
         """清理过期消息及已完成/取消的提醒；待办不清理，返回总删除条数。"""

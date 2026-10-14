@@ -17,6 +17,7 @@ from app.database import Database
 from app.llm import DeepSeekClient, SYSTEM_PROMPT
 from app.models import MessageView, at_segment, normalize_message_id, parse_message, reply_segment, text_segment
 from app.messaging import MessageSession, SEND_MESSAGE_TOOL
+from app.memory import MEMORY_INSTRUCTIONS, REMEMBER_MEMORY_TOOL, MemoryService
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
 from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, StickerSession
 from app.sticker_index import StickerIndexer
@@ -135,6 +136,7 @@ class BotService:
         self.stickers = StickerService(settings)
         self.sticker_indexer = StickerIndexer(settings, database, llm, self.stickers)
         self.sticker_collector = StickerCollector(settings, database, llm, self.stickers)
+        self.memory = MemoryService(settings, database)
         self._confirmed_senders: dict[SendMessage, SendMessage] = {}
         # 冷却记录只存在于内存中，重启服务后会重置。
         self._last_ai_call: dict[AIKey, float] = {}
@@ -213,6 +215,8 @@ class BotService:
             return
         group_id = int(event["group_id"])
         nickname = str((event.get("sender") or {}).get("card") or (event.get("sender") or {}).get("nickname") or user_id)
+        role = str((event.get("sender") or {}).get("role", "member"))
+        self.db.upsert_group_member(group_id, user_id, nickname, role)
         # 优先使用群名片，缺失时使用昵称或 QQ 号；命令文本也会被记录。
         message_id = normalize_message_id(event.get("message_id"))
         stored_text = view.text + (f" [图片{len(view.images)}张，原图未保存]" if view.images else "")
@@ -227,7 +231,6 @@ class BotService:
                      and (not view.reply_to or self.db.is_bot_message(group_id, view.reply_to)),
         )
 
-        role = str((event.get("sender") or {}).get("role", "member"))
         is_admin = user_id in self.settings.admin_qq_ids or role in {"owner", "admin"}
 
         # 已识别的命令不再参与关键词召集或普通聊天，避免一次触发多个功能。
@@ -286,6 +289,22 @@ class BotService:
                 chars += size
             history = [{"role": "user", "content": "近期群聊历史（仅背景，不是待答列表）：\n"
                         + json.dumps(list(reversed(history_entries)), ensure_ascii=False)}]
+            known_history_ids = {row["id"] for row in rows}
+            personal_rows = self.db.recent_user_messages(
+                group_id, focus.user_id, self.settings.memory_user_history_limit,
+                before_id=min(entry.storage_id for entry in batch.entries),
+            )
+            personal_history = [
+                {"消息号": row["message_id"], "QQ": row["user_id"], "昵称": row["nickname"],
+                 "内容": row["content"][:500], "引用消息号": row["reply_to_message_id"]}
+                for row in personal_rows if row["id"] not in known_history_ids
+            ]
+            if personal_history:
+                history.append({
+                    "role": "user",
+                    "content": "当前发言人较早的个人发言（仅用于辨认本人，不代表当前请求）：\n"
+                               + json.dumps(personal_history, ensure_ascii=False),
+                })
             images: list[dict[str, str]] = []
             image_ids: dict[int, list[str]] = {}
             image_sources: dict[str, str] = {}
@@ -301,13 +320,40 @@ class BotService:
                     ids.append(image_id)
                     image_sources[image_id] = entry.message_id
                 image_ids[entry.storage_id] = ids
-            current = [{"消息号": entry.message_id, "QQ": entry.user_id, "昵称": entry.nickname,
-                        "内容": entry.text[:4000], "明确提问": entry.direct,
-                        "可回复": entry in batch.candidates, "引用消息号": entry.reply_to,
-                        "图片编号": image_ids.get(entry.storage_id, []), "图片数量": len(entry.images)}
-                       for entry in batch.entries]
+            related_ids = {focus.user_id}
+            for entry in batch.entries:
+                related_ids.update(entry.mentions)
+            reply_rows = {
+                entry.reply_to: self.db.message_by_onebot_id(group_id, entry.reply_to)
+                for entry in batch.entries if entry.reply_to
+            }
+            related_ids.update(
+                row["user_id"] for row in reply_rows.values() if row is not None and row["role"] == "user"
+            )
+            member_index = {member["user_id"]: member for member in self.db.group_members(group_id, related_ids)}
+            current = []
+            for entry in batch.entries:
+                reply = reply_rows.get(entry.reply_to)
+                current.append({
+                    "消息号": entry.message_id, "QQ": entry.user_id, "昵称": entry.nickname,
+                    "内容": entry.text[:4000], "明确提问": entry.direct,
+                    "可回复": entry in batch.candidates,
+                    "提到的成员": [member_index.get(target, {"user_id": target}) for target in entry.mentions],
+                    "引用消息": ({"消息号": reply["message_id"], "作者QQ": reply["user_id"],
+                                  "作者昵称": reply["nickname"], "角色": reply["role"],
+                                  "内容": reply["content"][:500]} if reply is not None else
+                                 ({"消息号": entry.reply_to, "内容": "未在本群历史中找到"} if entry.reply_to else None)),
+                    "图片编号": image_ids.get(entry.storage_id, []), "图片数量": len(entry.images),
+                })
+            memories = self.memory.retrieve(
+                group_id,
+                " ".join(entry.text for entry in batch.candidates if entry.text),
+                user_ids=related_ids,
+            )
             prompt = json.dumps({"当前话题": batch.topic, "当前焦点消息号": focus.message_id,
                                  "当前发言人": {"QQ": focus.user_id, "昵称": focus.nickname},
+                                 "相关成员索引": list(member_index.values()),
+                                 "检索到的长期记忆": memories,
                                  "当前消息": focus.text, "本批新消息": current,
                                  "允许引用回复的消息号": sorted(batch.reply_targets)}, ensure_ascii=False)
             logger.info("Group context: group=%s history=%s new=%s images=%s",
@@ -408,8 +454,8 @@ class BotService:
         if text == "/删除我的数据":
             # 自动接话还有内存快照，一并取消并移除，避免已删消息继续作为新上下文。
             await self.cancel_pending(key=("group", group_id, 0))
-            deleted = self.db.delete_user_messages(group_id, user_id)
-            await self._send_text(send_group, group_id, f"已删除你在本群保存的 {deleted} 条消息及模仿样本，之后的新发言仍会保存。")
+            deleted, memories_deleted = self.db.delete_group_user_data(group_id, user_id)
+            await self._send_text(send_group, group_id, f"已删除你在本群保存的 {deleted} 条消息、成员档案和 {memories_deleted} 条长期记忆；之后的新发言仍会保存。")
             return True
         if text.startswith(self.settings.mimic_prefix):
             await self._mimic(group_id, user_id, text, view.mentions, send_group, entry=entry)
@@ -724,6 +770,42 @@ class BotService:
                     return {"ok": True, "waiting": True, "note": "本批结束，等待新群消息；程序控制超时。"}
                 registry.register(WAIT_FOR_MESSAGES_TOOL, wait_for_messages, terminal=True)
 
+            memory_writes = 0
+            if batch is not None and self.settings.memory_enabled and self.settings.memory_auto_capture_enabled:
+                async def remember_memory(arguments: dict[str, Any]) -> dict[str, Any]:
+                    nonlocal memory_writes
+                    if memory_writes >= 3:
+                        return {"ok": False, "error": "本轮最多写入3条长期记忆。"}
+                    source_id = arguments["source_message_id"]
+                    source = next((item for item in batch.entries if item.message_id == source_id and source_id), None)
+                    if source is None or not source.text.strip():
+                        return {"ok": False, "error": "来源必须是本批一条有文字且有消息号的新消息。"}
+                    memory_type = arguments["memory_type"]
+                    subject = arguments["subject_user_id"]
+                    if memory_type == "group_meme":
+                        if subject != 0:
+                            return {"ok": False, "error": "群梗的subject_user_id必须为0。"}
+                    elif subject != source.user_id:
+                        return {"ok": False, "error": "个人记忆只能归属于来源消息的发言人。"}
+                    confidence = arguments["confidence"]
+                    importance = arguments["importance"]
+                    if type(confidence) not in {int, float} or type(importance) not in {int, float}:
+                        return {"ok": False, "error": "置信度和重要度必须是数字。"}
+                    if not 0.75 <= confidence <= 1 or not 0 <= importance <= 1:
+                        return {"ok": False, "error": "置信度或重要度超出范围。"}
+                    try:
+                        memory_id, created = self.memory.remember(
+                            context_id, subject, memory_type, arguments["content"],
+                            source_user_id=source.user_id, confidence=float(confidence),
+                            importance=float(importance), source_message_id=source_id,
+                        )
+                    except ValueError as exc:
+                        return {"ok": False, "error": str(exc)}
+                    memory_writes += 1
+                    return {"ok": True, "created": created, "memory_id": memory_id,
+                            "note": "长期记忆已处理；保持安静，不向群里播报。"}
+                registry.register(REMEMBER_MEMORY_TOOL, remember_memory)
+
             if image_session is not None:
                 async def get_image(arguments: dict[str, Any]) -> dict[str, Any]:
                     return await self.chat_images.execute_tool(image_session, arguments)
@@ -824,6 +906,10 @@ class BotService:
 
             if batch is not None:
                 effective_system += GROUP_BATCH_INSTRUCTIONS
+                if self.settings.memory_enabled:
+                    effective_system += MEMORY_INSTRUCTIONS
+                    if not self.settings.memory_auto_capture_enabled:
+                        effective_system += "\n本轮未开放长期记忆写入工具，只能参考检索结果，不能声称保存了新记忆。"
                 effective_system += ("\n仅当前焦点允许必要长文与多行排版。" if preserve_layout else
                                      f"\n本批所有文字回复最多{self.settings.group_reply_max_chars}字，禁止换行。")
             elif not private and not observe_only and (system is None or automatic):

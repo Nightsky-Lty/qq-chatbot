@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
     context_message_limit: int = Field(default=80, ge=1, le=200)
     context_max_chars: int = Field(default=24000, ge=1000, le=100000)
+    # 群成员长期记忆：SQLite 持久化，使用本地稀疏向量做混合 RAG，不依赖额外服务。
+    memory_enabled: bool = True
+    memory_auto_capture_enabled: bool = True
+    memory_retrieval_limit: int = Field(default=8, ge=1, le=30)
+    memory_candidate_limit: int = Field(default=300, ge=20, le=2000)
+    memory_user_history_limit: int = Field(default=12, ge=0, le=50)
+    memory_max_per_user: int = Field(default=200, ge=10, le=2000)
+    memory_max_chars: int = Field(default=200, ge=20, le=500)
+    memory_min_confidence: float = Field(default=0.8, ge=0.5, le=1.0)
     chat_batch_seconds: float = Field(default=3, ge=0, le=10)
     chat_batch_max_messages: int = Field(default=30, ge=3, le=100)
     chat_max_pending_groups: int = Field(default=32, ge=1, le=100)
