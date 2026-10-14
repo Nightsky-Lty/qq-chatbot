@@ -6,7 +6,11 @@ ARG UV_DEFAULT_INDEX=https://pypi.org/simple
 ENV UV_PYTHON_DOWNLOADS=never \
     UV_DEFAULT_INDEX=${UV_DEFAULT_INDEX}
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project --no-cache
+RUN uv export --frozen --no-dev --no-emit-project \
+        --format requirements-txt --output-file /tmp/requirements.txt \
+    && uv venv /app/.venv \
+    && uv pip install --python /app/.venv/bin/python \
+        --no-cache --require-hashes --requirements /tmp/requirements.txt
 
 FROM python:3.12-slim-bookworm AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
