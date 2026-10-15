@@ -152,11 +152,11 @@ cp app/sticker_images/manifest.example.json app/sticker_images/manifest.json
 
 回复后模型调用`wait_for_messages(topic)`保留话题；被@或聊天命令唤醒后，提示词要求成功回应后默认等待，不因答完当前一句或暂时没有新消息就退出。后续普通群消息可再次唤醒本批判断，是否接话、看图、发文字或表情仍由模型决定，活跃期间不重复接话概率抽签。明确告别、要求停止、话题确实结束或明显转向时仍可`finish`立即结束话题；之后新@可重新唤醒，普通消息需等待随机接话冷却结束并再次抽中。收图另由程序按图片独立抽签。无新消息时不循环调用模型，也不定时自言自语。
 
-活跃状态只保存在内存。默认600秒（10分钟）无成功发言后退出，单个活跃期最多1800秒（30分钟）；模型不发言的等待不刷新寿命。上述是超时上限，模型调用finish仍能提前退出，并非强制驻留。重启、断线、删除群数据或Agent失败都会结束对应话题。可在config.env调整：
+活跃状态只保存在内存。默认300秒（5分钟）无成功发言后退出，单个活跃期最多1800秒（30分钟）；模型不发言的等待不刷新寿命。上述是超时上限，模型调用finish仍能提前退出，并非强制驻留。重启、断线、删除群数据或Agent失败都会结束对应话题。可在config.env调整：
 
 ```dotenv
 CHAT_BATCH_SECONDS=3
-CHAT_ACTIVE_IDLE_SECONDS=600
+CHAT_ACTIVE_IDLE_SECONDS=300
 CHAT_ACTIVE_MAX_SECONDS=1800
 CONTEXT_MESSAGE_LIMIT=80
 CONTEXT_MAX_CHARS=24000
@@ -396,7 +396,7 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 | `CHAT_BATCH_MAX_MESSAGES` | `30` | 每群等待批次最多消息数，满额明确提问会提示重试 |
 | `CHAT_MAX_PENDING_GROUPS` | `32` | 等待/活跃群状态的数量上限 |
 | `CHAT_QUEUE_WAIT_SECONDS` | `120` | 群提问排队最长等待秒数 |
-| `CHAT_ACTIVE_IDLE_SECONDS` | `600` | 活跃期未成功发言的超时秒数，默认10分钟 |
+| `CHAT_ACTIVE_IDLE_SECONDS` | `300` | 活跃期未成功发言的超时秒数，默认5分钟 |
 | `CHAT_ACTIVE_MAX_SECONDS` | `1800` | 单个活跃期最长秒数，默认30分钟，不因继续发言无限延长 |
 | `GROUP_REPLY_MAX_CHARS` | `100` | 普通群回复硬字数上限，禁止换行拼接话题 |
 | `RANDOM_CHAT_ENABLED` | `true` | 低活跃期是否由程序随机唤醒普通消息 |
