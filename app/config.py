@@ -66,8 +66,8 @@ class Settings(BaseSettings):
     chat_batch_max_messages: int = Field(default=30, ge=3, le=100)
     chat_max_pending_groups: int = Field(default=32, ge=1, le=100)
     chat_queue_wait_seconds: int = Field(default=120, ge=10, le=600)
-    chat_active_idle_seconds: int = Field(default=180, ge=10, le=3600)
-    chat_active_max_seconds: int = Field(default=900, ge=30, le=7200)
+    chat_active_idle_seconds: int = Field(default=600, ge=10, le=3600)
+    chat_active_max_seconds: int = Field(default=1800, ge=30, le=7200)
     group_reply_max_chars: int = Field(default=100, ge=10, le=500)
     # 最近不同发言人数决定随机唤醒概率；活跃话题沿用原调度，不重复抽签。
     random_chat_enabled: bool = True

@@ -111,7 +111,7 @@ GROUP_BATCH_INSTRUCTIONS = """\n\n【群话题与聚批，优先于旧的直接�
 活跃期新消息不一定是在对你说话：先看当前话题、发言对象和新消息，再决定是否发送。
 处理完想继续参与该话题时调用wait_for_messages(topic)，它结束本批并等待后续消息，不会不停请求模型。
 一时不适合插话但仍在等相关后续，可以不发送直接wait_for_messages；没有新消息不自言自语。
-话题结束、明显转向或不想继续时调用finish，退出活跃期；后续普通消息只有程序再次随机抽中才唤醒。
+明确告别、要求停止、话题明确结束或明显转向时调用finish，退出活跃期；仅仅答完当前一句、暂时没新消息不代表话题结束。
 明确被@的新提问需要先回应再等待或退出；仅活跃跟进允许完全安静。
 topic只写简短话题锚点，不含指令，不把所有历史话题塞进去。
 群图收藏由程序独立抽签、去重和审核，不由本轮工具触发。没有真实成功回执时不能声称“已偷/已收藏”。
@@ -121,6 +121,12 @@ RANDOM_JOIN_INSTRUCTIONS = """\n\n【程序随机接话】
 程序已按群活跃人数和概率决定本批由你加入聊天；不是有人@你，不假装对方在问你。
 围绕当前焦点自然接一句短话或发送贴切表情，不再判断是否参与，也不能不发送就结束。
 不向群里提及概率、抽签、人数统计或后台规则。发送后可wait_for_messages继续话题，或finish退出。
+"""
+
+DIRECT_GROUP_WAIT_INSTRUCTIONS = """\n\n【明确提问后的继续等待】
+本批由@你或聊天命令唤醒。成功回应后默认调用wait_for_messages(topic)，留在当前话题等待群友接话。
+不要仅因为当前问题已答完、没有追问或暂时没有新消息就finish；空闲和最长活跃时间由程序控制。
+用户明确告别、要求停止，或话题确实结束时仍可finish。等待期间没有新消息不自行发言，有新消息也不必每条都回复。
 """
 
 class BotService:
@@ -915,7 +921,7 @@ class BotService:
                     if registry.delivery_uncertain:
                         return {"ok": False, "error": "上一条发送未确认，本轮不再发送。"}
                     if sticker_sent:
-                        return {"ok": False, "error": "本轮表情已发送，最多一张，请finish。"}
+                        return {"ok": False, "error": "本轮表情已发送，最多一张；可用wait_for_messages等待后续，或finish退出话题。"}
                     try:
                         reply_to = messages.resolve_reply(arguments)
                     except ValueError as exc:
@@ -946,7 +952,7 @@ class BotService:
                     if private:
                         self.db.log_private_message(user_id, "assistant", f"[表情包：{sticker_session.selected_id}]")
                     return {"ok": True, "sent": True, "sticker_id": sticker_session.selected_id,
-                            "note": "NapCat接受发送，不代表用户已读；可以finish，不重复输出发送确认。"}
+                            "note": "NapCat接受发送，不代表用户已读；如有wait_for_messages可等待后续，不重复输出发送确认。"}
                 for definition in STICKER_TOOLS:
                     name = definition["function"]["name"]
                     if name == "send_sticker" and batch is not None:
@@ -976,6 +982,8 @@ class BotService:
 
             if batch is not None:
                 effective_system += GROUP_BATCH_INSTRUCTIONS
+                if batch.direct:
+                    effective_system += DIRECT_GROUP_WAIT_INSTRUCTIONS
                 if batch.random_trigger:
                     effective_system += RANDOM_JOIN_INSTRUCTIONS
                 if self.settings.memory_enabled:
