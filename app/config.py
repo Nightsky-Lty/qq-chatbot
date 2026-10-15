@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     chat_active_idle_seconds: int = Field(default=300, ge=10, le=3600)
     chat_active_max_seconds: int = Field(default=1800, ge=30, le=7200)
     group_reply_max_chars: int = Field(default=100, ge=10, le=500)
+    # 主动戳一戳由LLM决定；每轮最多一次，同一群/私聊共用跨轮冷却。
+    poke_enabled: bool = True
+    poke_cooldown_seconds: int = Field(default=60, ge=1, le=3600)
     # 最近不同发言人数决定随机唤醒概率；活跃话题沿用原调度，不重复抽签。
     random_chat_enabled: bool = True
     random_chat_window_seconds: int = Field(default=120, ge=10, le=3600)

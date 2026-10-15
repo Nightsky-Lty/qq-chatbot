@@ -21,6 +21,7 @@ from app.models import (
     parse_poke_event, reply_segment, text_segment,
 )
 from app.messaging import MessageSession, SEND_MESSAGE_TOOL
+from app.poking import PokeService, PokeSession, SendPoke, SEND_POKE_TOOL, POKE_TOOL_INSTRUCTIONS
 from app.memory import MEMORY_INSTRUCTIONS, REMEMBER_MEMORY_TOOL, MemoryService
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
 from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, StickerSession
@@ -138,7 +139,7 @@ POKE_INSTRUCTIONS = """\n\n【戳一戳动作通知】
 标记为戳一戳的内容来自程序收到的真实动作通知，不是用户说出的原话，也不是新的事实或长期记忆素材。
 对方戳了你是在唤醒你，像被@一样正常回应；同一人有后续文字时优先接住后续内容，没有文字时可自然接一句或用可用的表情回应。
 戳一戳通知没有可引用的消息号，不能编造reply_to_message_id；有真实后续消息时仍可按允许列表引用。
-当前没有主动戳人的工具，不能声称已经戳回去。历史动作通知仅作背景，不重复回应。
+是否能戳回取决于本轮是否注册send_poke；只依据真实工具成功回执，不假装已戳回。历史动作通知仅作背景，不重复回应。
 """
 
 class BotService:
@@ -166,7 +167,9 @@ class BotService:
             settings, database, llm, self.stickers, slots=self._ai_slots, announce=self._announce_collected,
         )
         self.memory = MemoryService(settings, database)
+        self.pokes = PokeService(settings)
         self._confirmed_senders: dict[SendMessage, SendMessage] = {}
+        self._poke_senders: dict[SendMessage, SendPoke] = {}
         # 冷却记录只存在于内存中，重启服务后会重置。
         self._last_ai_call: dict[AIKey, float] = {}
         self._trigger_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -210,6 +213,9 @@ class BotService:
             await asyncio.gather(*tasks, return_exceptions=True)
         if send_message is not None and key is None:
             self._confirmed_senders.pop(send_message, None)
+            self._poke_senders.pop(send_message, None)
+            if confirmed is not None:
+                self._poke_senders.pop(confirmed, None)
 
     async def close(self) -> None:
         """阻止接受新请求并取消所有后台任务，在关闭模型客户端前调用。"""
@@ -220,6 +226,7 @@ class BotService:
         await self.sticker_indexer.close()
         await self.memory.close()
         self._confirmed_senders.clear()
+        self._poke_senders.clear()
 
     def _finish_ai_task(self, task: asyncio.Task[None]) -> None:
         """任务结束后回收名额；尚未开始就被取消的任务也必须回收。"""
@@ -234,6 +241,7 @@ class BotService:
     async def handle_event(
         self, event: dict[str, Any], send_group: SendGroup, send_private: SendPrivate | None = None,
         *, send_group_confirmed: SendGroup | None = None, send_private_confirmed: SendPrivate | None = None,
+        send_poke_confirmed: SendPoke | None = None,
     ) -> None:
         """动作通知先分流；消息沿用私聊、群命令和活跃话题处理流程。"""
         if self._closed:
@@ -253,6 +261,10 @@ class BotService:
             self._confirmed_senders[send_group] = send_group_confirmed
         if send_private is not None and send_private_confirmed is not None:
             self._confirmed_senders[send_private] = send_private_confirmed
+        if send_poke_confirmed is not None:
+            self._poke_senders[send_group_confirmed or send_group] = send_poke_confirmed
+            if send_private is not None:
+                self._poke_senders[send_private_confirmed or send_private] = send_poke_confirmed
         if poke is not None:
             await self._handle_poke(poke, send_group, send_private)
             return
@@ -911,6 +923,16 @@ class BotService:
                 send_definition["function"]["parameters"]["properties"].pop("at_user_ids")
                 send_definition["function"]["parameters"]["properties"].pop("reply_to_message_id")
             registry.register(send_definition, send_text)
+
+            poke_sender = self._poke_senders.get(send_message)
+            if (self.settings.poke_enabled and poke_sender is not None and not observe_only
+                    and (batch is not None or private)):
+                poke_session = PokeSession(
+                    self.pokes, messages, poke_sender, default_user_id=user_id,
+                    allowed_targets={user_id} if private else set(allowed_mentions),
+                )
+                registry.register(SEND_POKE_TOOL, poke_session.execute)
+                effective_system += POKE_TOOL_INSTRUCTIONS
 
             async def finish(arguments: dict[str, Any]) -> dict[str, Any]:
                 if not automatic and not registry.output_attempted:

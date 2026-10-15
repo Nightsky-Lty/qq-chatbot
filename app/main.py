@@ -51,6 +51,13 @@ class OneBotConnection:
         """Agent发送工具等待NapCat确认；只能由后台任务调用，不能阻塞事件接收。"""
         return await self._send_action("send_group_msg", {"group_id": group_id, "message": message}, confirmed=True)
 
+    async def send_poke_confirmed(self, group_id: int | None, user_id: int) -> None:
+        """戳一戳是独立OneBot动作，不是文字消息段；私聊不传group_id。"""
+        params = {"user_id": user_id}
+        if group_id is not None:
+            params["group_id"] = group_id
+        await self._send_action("send_poke", params, confirmed=True)
+
     def handle_response(self, response: dict[str, Any]) -> None:
         """用 echo 唤醒等待中的发送；普通回复失败只记状态码，不打印消息内容。"""
         echo = response.get("echo")
@@ -161,6 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         event, connection.send_group, connection.send_private,
                         send_group_confirmed=connection.send_group_confirmed,
                         send_private_confirmed=connection.send_private_confirmed,
+                        send_poke_confirmed=connection.send_poke_confirmed,
                     )
                 except Exception:
                     # 单条业务事件异常只记录日志，继续处理连接上的后续事件。
