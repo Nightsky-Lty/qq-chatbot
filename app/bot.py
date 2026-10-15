@@ -10,6 +10,7 @@ from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
 from app.config import Settings
+from app.balance import BalanceService, BalanceUnavailable
 from app.agent import AgentOutcome, ReactAgent
 from app.conversation import GroupBatch, GroupConversations, GroupMessage
 from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
@@ -43,6 +44,7 @@ HELP_TEXT = """可用命令：
 /问 内容（或直接 @机器人）
 /锐评 内容
 /模仿 @某人 主题（无需授权，至少需要 5 条本群普通文字发言）
+/余额（仅机器人管理员）
 /帮助
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
 @机器人或使用/问、/锐评唤醒，等3秒聚合连发文字和图片，模型按需看图。
@@ -53,6 +55,7 @@ HELP_TEXT = """可用命令：
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 /问 内容
 /锐评 内容
+/余额（仅机器人管理员）
 /帮助
 可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
 提醒使用北京时间，目前只支持一次性提醒。
@@ -134,6 +137,7 @@ class BotService:
         self.settings = settings
         self.db = database
         self.llm = llm
+        self.balance = BalanceService(settings, llm.client)
         self.agent = ReactAgent(settings, llm)
         self.reminders = reminders
         self.chat_images = ChatImageService(settings)
@@ -154,6 +158,8 @@ class BotService:
         # 保存强引用和来源连接，断线或关闭时可以取消对应任务。
         self._ai_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
         self._pending_ai_users: set[AIKey] = set()
+        self._balance_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
+        self._pending_balance_users: set[AIKey] = set()
         self.conversations = GroupConversations(settings, self._run_group_batch)
         self._closed = False
 
@@ -174,6 +180,12 @@ class BotService:
             and (key is None or task_key == key
                  or (key[0] == "group" and task_key[0] == "group" and task_key[1] == key[1]))
         ]
+        tasks.extend(
+            task for task, (sender, task_key) in self._balance_tasks.items()
+            if (send_message is None or sender in {send_message, confirmed})
+            and (key is None or task_key == key
+                 or (key[0] == "group" and task_key[0] == "group" and task_key[1] == key[1]))
+        )
         for task in tasks:
             task.cancel()
         if tasks:
@@ -221,6 +233,17 @@ class BotService:
             self._confirmed_senders[send_private] = send_private_confirmed
         # 群收图逐张抽签，不沿用聊天看图的前三张限制；模型上下文仍最多3张。
         view = parse_message(event.get("message"), image_limit=None if event["message_type"] == "group" else 3)
+        command = view.text.strip()
+        if self_id and self_id in view.mentions:
+            command = re.sub(rf"@{self_id}(?!\d)", "", command).strip()
+        if command == "/余额":
+            private = event["message_type"] == "private"
+            sender = send_private if private else send_group
+            if sender is not None:
+                target = user_id if private else int(event["group_id"])
+                await self._queue_balance(user_id, target, sender, private=private)
+            # 在聊天入库、群图收集和聚批之前分流，命令和余额回执均不进模型上下文。
+            return
         image_session = ChatImageSession(view.images) if view.images and self.settings.chat_image_enabled else None
         if event["message_type"] == "private":
             if send_private is not None:
@@ -268,6 +291,42 @@ class BotService:
         if entry.text.startswith("/") and not entry.direct:
             return
         await self._queue_group(group_id, entry, send_group)
+
+    async def _queue_balance(self, user_id: int, target: int, sender: SendMessage, *, private: bool) -> None:
+        if self._closed:
+            return
+        if user_id not in self.settings.admin_qq_ids:
+            await self._send_text(sender, target, "只有机器人管理员可以查询 API 余额。")
+            return
+        key = ("private" if private else "group", target, user_id)
+        if key in self._pending_balance_users:
+            await self._send_text(sender, target, "余额正在查询中，请稍等。")
+            return
+        if len(self._balance_tasks) >= 32:
+            await self._send_text(sender, target, "余额查询较多，请稍后重试。")
+            return
+        task_sender = self._confirmed_senders.get(sender, sender)
+        self._pending_balance_users.add(key)
+        task = asyncio.create_task(self._run_balance(target, task_sender), name="balance-query")
+        self._balance_tasks[task] = (task_sender, key)
+        task.add_done_callback(self._finish_balance_task)
+
+    async def _run_balance(self, target: int, sender: SendMessage) -> None:
+        try:
+            text = await self.balance.get_text()
+        except BalanceUnavailable as exc:
+            text = str(exc)
+        # 后台任务才使用确认式发送；不经过MessageSession，因此不会写聊天历史。
+        await self._send_text(sender, target, text)
+
+    def _finish_balance_task(self, task: asyncio.Task[None]) -> None:
+        entry = self._balance_tasks.pop(task, None)
+        if entry is not None:
+            self._pending_balance_users.discard(entry[1])
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.warning("Balance command failed: error=%s", type(error).__name__)
 
     async def _queue_group(self, group_id: int, entry: GroupMessage, sender: SendGroup) -> None:
         status = await self.conversations.submit(group_id, entry, sender)
