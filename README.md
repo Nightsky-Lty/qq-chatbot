@@ -34,12 +34,14 @@
 | `app/agent.py` | 模型/工具迭代、观察、图片预算、步骤/超时限制及同调用编号去重 |
 | `app/tools.py` | 每次请求独立注册定义和执行器、校验参数，不注册任意Python函数 |
 | `app/memory.py` | 群成员长期记忆写入约束、BGE/哈希向量和混合 RAG 排序 |
-| `app/messaging.py` | 注册 `send_message(text, reply_to_message_id?)`，引用校验、短句限制、去重、保存成功发送 |
+| `app/messaging.py` | 注册 `send_message(text, reply_to_message_id?, at_user_ids?)`，引用/@校验、短句限制、去重、保存成功发送 |
 | `app/conversation.py` | 按群固定聚批、串行有界队列、话题活跃期和超时 |
 | `app/bot.py` | 路由和授权范围、绑定工具到真实当前会话、并发与冷却 |
 | `app/main.py` | OneBot传输，后台发送等待响应，断线取消对应任务 |
 
-可注册工具：`send_message`、`finish`、群话题的 `wait_for_messages(topic)`；表情的 `search_stickers`、`list_stickers`、`get_sticker_image`、`send_sticker`；本批图片的 `get_message_image`；私聊的三个提醒工具。群图收藏改由程序后台随机处理，不再注册`collect_sticker`给聊天模型。列表按开关和场景裁剪；模仿只注册发送与结束。发送不接受目标QQ或群号；群聊文字和表情默认普通发送，省略reply_to_message_id仍回应当前焦点，不自动显示引用框。只有模型显式填写该参数时才显示QQ引用，只接受本批允许的新消息号，不能引用历史或其他群。图片工具不接受任意URL或路径。
+可注册工具：`send_message`、`finish`、群话题的 `wait_for_messages(topic)`；表情的 `search_stickers`、`list_stickers`、`get_sticker_image`、`send_sticker`；本批图片的 `get_message_image`；私聊的三个提醒工具。群图收藏改由程序后台随机处理，不再注册`collect_sticker`给聊天模型。列表按开关和场景裁剪；模仿只注册发送与结束。发送会话目标由程序固定，不能更换群号或私聊收件人；群聊文字和表情默认普通发送，省略reply_to_message_id仍回应当前焦点，不自动显示引用框。只有模型显式填写该参数时才显示QQ引用，只接受本批允许的新消息号，不能引用历史或其他群。图片工具不接受任意URL或路径。
+
+群聊 `send_message` 可选 `at_user_ids`，例如 `{"text":"一起来聊聊？","at_user_ids":[123456789]}`，通过真实 OneBot `at` 消息段主动点名，不是文本假@。每次最多3个QQ号、重复目标只@一次，不能@全体或机器人自己；只允许本批发言人、已提供的近期历史发言人及本轮相关已知群成员，服务端按上下文快照校验，不能从正文猜测QQ号或跨群@。默认不@，模型可按当前话题主动邀请或提醒；可同时填写 `reply_to_message_id`，引用和@互相独立。分条仅第一条带@，发送去重包含@目标，成功后在历史文字中保留 `@QQ号`。私聊不提供引用或@参数，也不允许使用@参数。
 
 默认最多8次模型决策、16个工具调用、120秒整轮超时，聊天与表情查看共用最多3张原图；终止后的同批动作不再执行。模型调用发送工具后，不会再次发送最后的普通文本；未调用发送工具却直接返回最终文字时，只通过同一个发送工具兼容提交一次。失败/超时已经尝试发送时不做无条件补发。
 
