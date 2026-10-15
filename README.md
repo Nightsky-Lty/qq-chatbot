@@ -544,7 +544,7 @@ app/
 ├── conversation.py # 群聚批、串行有界队列和话题活跃状态
 ├── tools.py      # 工具注册表、参数校验及finish定义
 ├── messaging.py  # 当前会话的send_message工具、限量和确认状态
-├── persona.py    # 完整小鲸鱼角色卡、说话习惯和24组回复示例
+├── persona.py    # 适配ReAct工具的小鲸鱼角色卡、群聊习惯和回复示例
 ├── reminders.py  # 私聊提醒工具、时间校验、到期通知和失败重试
 ├── stickers.py   # 本地表情目录、视觉查看工具及发送限制
 ├── sticker_index.py # 后台视觉标注、哈希缓存及风险隔离
