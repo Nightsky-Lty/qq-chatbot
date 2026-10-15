@@ -61,17 +61,15 @@ class OneBotConnection:
 
     async def get_ai_characters(self, group_id: int) -> Any:
         """只查询当前群可用音色，不合成或发送；原始结果交给语音层筛选。"""
-        return await self._request_action("get_ai_characters", {"group_id": group_id, "chat_type": 2}, confirmed=True)
+        # NapCat发送接口固定使用Sound=1；查询同一类型，避免把歌声音色ID交给普通语音接口。
+        return await self._request_action("get_ai_characters", {"group_id": group_id, "chat_type": 1}, confirmed=True)
 
-    async def send_ai_voice_confirmed(self, group_id: int, character_id: str, text: str) -> str:
-        """NapCat合成并直接发送群语音，合成较慢时最多等45秒。"""
+    async def send_ai_voice_confirmed(self, group_id: int, character_id: str, text: str) -> str | None:
+        """NapCat合成并直接发送群语音；成功状态即确认，当前接口不返回真实消息号。"""
         data = await self._request_action("send_group_ai_record", {
             "group_id": group_id, "character": character_id, "text": text,
         }, confirmed=True, timeout=45)
-        message_id = normalize_message_id(data.get("message_id")) if isinstance(data, dict) else ""
-        if not message_id:
-            raise OneBotSendError("NapCat语音回执缺少有效消息号，不能重试")
-        return message_id
+        return normalize_message_id(data.get("message_id")) or None if isinstance(data, dict) else None
 
     def handle_response(self, response: dict[str, Any]) -> None:
         """用 echo 唤醒等待中的发送；普通回复失败只记状态码，不打印消息内容。"""

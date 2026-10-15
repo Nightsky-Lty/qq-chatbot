@@ -14,7 +14,7 @@ from app.models import normalize_message_id
 
 logger = logging.getLogger(__name__)
 GetCharacters = Callable[[int], Awaitable[Any]]
-SendVoice = Callable[[int, str, str], Awaitable[str]]
+SendVoice = Callable[[int, str, str], Awaitable[str | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,20 +196,19 @@ class VoiceSession:
                 # 可能已经发出但回执丢失，失败/取消之后不得补发或切换文字重试。
                 async with asyncio.timeout(45):
                     sent_id = await self.transport.send(messages.target, voice_id, text)
-                if not normalize_message_id(sent_id):
-                    raise ValueError("missing voice message id")
+                message_id = normalize_message_id(sent_id)
                 registry.outputs_sent += 1
                 messages.count += 1
                 messages.spoken_texts.add(text)
                 messages.delivered_texts.add(text)
                 messages.db.log_message(messages.target, messages.bot_id, "机器人",
                                         f"[AI语音，音色：{voices[voice_id]['name']}] {text}", role="assistant",
-                                        message_id=normalize_message_id(sent_id), reply_to_message_id=reply_to)
+                                        message_id=message_id, reply_to_message_id=reply_to)
             except Exception as exc:
                 logger.warning("AI voice send unconfirmed: error=%s", type(exc).__name__)
                 return {"ok": False, "error": "语音合成/发送失败或未确认，本轮不重试、不补发文字，不能声称已发送；若持续失败请检查QQ/NapCat支持情况。"}
             registry.delivery_uncertain = False
             messages.last_reply = reply_to
-            return {"ok": True, "sent": 1, "message_id": normalize_message_id(sent_id),
+            return {"ok": True, "sent": 1, "message_id": message_id,
                     "character_id": voice_id, "remaining": messages.limit - messages.count,
-                    "note": "NapCat已确认发送群AI语音，不代表群友已收听；文字已记入历史，不重复播报或再发同义文字。"}
+                    "note": "NapCat已确认发送群AI语音；当前接口不提供真实消息号，也不代表群友已收听。文字已记入历史，不重复播报或再发同义文字。"}
