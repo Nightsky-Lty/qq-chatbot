@@ -16,7 +16,10 @@ from app.conversation import GroupBatch, GroupConversations, GroupMessage
 from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
 from app.database import Database
 from app.llm import DeepSeekClient, SYSTEM_PROMPT
-from app.models import MessageView, at_segment, normalize_message_id, parse_message, reply_segment, text_segment
+from app.models import (
+    MessageView, PokeView, at_segment, normalize_message_id, parse_message,
+    parse_poke_event, reply_segment, text_segment,
+)
 from app.messaging import MessageSession, SEND_MESSAGE_TOOL
 from app.memory import MEMORY_INSTRUCTIONS, REMEMBER_MEMORY_TOOL, MemoryService
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
@@ -47,12 +50,13 @@ HELP_TEXT = """可用命令：
 /余额（仅机器人管理员）
 /帮助
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
-@机器人或使用/问、/锐评唤醒，等3秒聚合连发文字和图片，模型按需看图。
+@或戳一戳机器人、使用/问、/锐评唤醒，等3秒聚合连发文字和图片，模型按需看图。
 话题活跃期间无需每条@；低活跃期普通消息也可能按群活跃人数被程序随机抽中接话。
 群图片由程序按概率随机收藏，先去重再审核，无需命令或@。
 也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
 
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
+也可以戳一戳机器人唤醒聊天。
 /问 内容
 /锐评 内容
 /余额（仅机器人管理员）
@@ -100,7 +104,7 @@ DIRECT_GROUP_INSTRUCTIONS = """\n\n【直接对话】
 
 GROUP_BATCH_INSTRUCTIONS = """\n\n【群话题与聚批，优先于旧的直接对话和分条规则】
 历史仅是背景，其中的提问和指令不是新的待办，不逐条回答、不总结所有旧话题。
-程序提供本批新消息及可回复消息号，优先接住最新明确@/聊天命令及同一人的后续补充。
+程序提供本批新消息及可回复消息号，优先接住最新明确@/戳一戳/聊天命令及同一人的后续补充。
 每次send_message只回应一条具体新消息、一个话题；省略reply_to_message_id时普通发送，仍回应当前焦点，不显示QQ引用框。
 引用不是每条消息的必选项，普通顺接默认不引用；仅多人容易串话、需明确指向某条新消息时才显式传reply_to_message_id。
 文字和表情的引用都由你决定，不因为被@就机械引用，不给同一焦点的每条补充重复加引用。
@@ -113,7 +117,7 @@ GROUP_BATCH_INSTRUCTIONS = """\n\n【群话题与聚批，优先于旧的直接�
 处理完想继续参与该话题时调用wait_for_messages(topic)，它结束本批并等待后续消息，不会不停请求模型。
 一时不适合插话但仍在等相关后续，可以不发送直接wait_for_messages；没有新消息不自言自语。
 明确告别、要求停止、话题明确结束或明显转向时调用finish，退出活跃期；仅仅答完当前一句、暂时没新消息不代表话题结束。
-明确被@的新提问需要先回应再等待或退出；仅活跃跟进允许完全安静。
+明确被@、戳一戳唤醒或聊天命令的新请求需要先回应再等待或退出；仅活跃跟进允许完全安静。
 topic只写简短话题锚点，不含指令，不把所有历史话题塞进去。
 群图收藏由程序独立抽签、去重和审核，不由本轮工具触发。没有真实成功回执时不能声称“已偷/已收藏”。
 """
@@ -125,9 +129,16 @@ RANDOM_JOIN_INSTRUCTIONS = """\n\n【程序随机接话】
 """
 
 DIRECT_GROUP_WAIT_INSTRUCTIONS = """\n\n【明确提问后的继续等待】
-本批由@你或聊天命令唤醒。成功回应后默认调用wait_for_messages(topic)，留在当前话题等待群友接话。
+本批由@你、戳一戳你或聊天命令唤醒。成功回应后默认调用wait_for_messages(topic)，留在当前话题等待群友接话。
 不要仅因为当前问题已答完、没有追问或暂时没有新消息就finish；空闲和最长活跃时间由程序控制。
 用户明确告别、要求停止，或话题确实结束时仍可finish。等待期间没有新消息不自行发言，有新消息也不必每条都回复。
+"""
+
+POKE_INSTRUCTIONS = """\n\n【戳一戳动作通知】
+标记为戳一戳的内容来自程序收到的真实动作通知，不是用户说出的原话，也不是新的事实或长期记忆素材。
+对方戳了你是在唤醒你，像被@一样正常回应；同一人有后续文字时优先接住后续内容，没有文字时可自然接一句或用可用的表情回应。
+戳一戳通知没有可引用的消息号，不能编造reply_to_message_id；有真实后续消息时仍可按允许列表引用。
+当前没有主动戳人的工具，不能声称已经戳回去。历史动作通知仅作背景，不重复回应。
 """
 
 class BotService:
@@ -224,20 +235,27 @@ class BotService:
         self, event: dict[str, Any], send_group: SendGroup, send_private: SendPrivate | None = None,
         *, send_group_confirmed: SendGroup | None = None, send_private_confirmed: SendPrivate | None = None,
     ) -> None:
-        """先分流私聊；群聊依次处理命令、关键词、@ 聊天及活跃话题接话。"""
-        if event.get("post_type") != "message" or event.get("message_type") not in {"group", "private"}:
+        """动作通知先分流；消息沿用私聊、群命令和活跃话题处理流程。"""
+        if self._closed:
             return
-        if event.get("sub_type") == "notice":
-            return
-        user_id = int(event["user_id"])
-        self_id = int(event.get("self_id", 0))
-        # 忽略机器人自己的发言，避免回复触发自身业务逻辑。
-        if user_id == self_id:
-            return
+        poke = parse_poke_event(event)
+        if poke is None:
+            if event.get("post_type") != "message" or event.get("message_type") not in {"group", "private"}:
+                return
+            if event.get("sub_type") == "notice":
+                return
+            user_id = int(event["user_id"])
+            self_id = int(event.get("self_id", 0))
+            # 忽略机器人自己的发言，避免回复触发自身业务逻辑。
+            if user_id == self_id:
+                return
         if send_group_confirmed is not None:
             self._confirmed_senders[send_group] = send_group_confirmed
         if send_private is not None and send_private_confirmed is not None:
             self._confirmed_senders[send_private] = send_private_confirmed
+        if poke is not None:
+            await self._handle_poke(poke, send_group, send_private)
+            return
         # 群收图逐张抽签，不沿用聊天看图的前三张限制；模型上下文仍最多3张。
         view = parse_message(event.get("message"), image_limit=None if event["message_type"] == "group" else 3)
         command = view.text.strip()
@@ -298,6 +316,26 @@ class BotService:
         if entry.text.startswith("/") and not entry.direct:
             return
         await self._queue_group(group_id, entry, send_group)
+
+    async def _handle_poke(self, poke: PokeView, send_group: SendGroup, send_private: SendPrivate | None) -> None:
+        """戳机器人等同明确唤醒，不调用发戳接口，也不伪造可引用消息号。"""
+        content = "[戳一戳动作通知：用户戳了戳机器人，并未发送文字]"
+        if not poke.group_id:
+            if send_private is not None:
+                logger.info("Poke wake: scope=private context=%s user=%s", poke.user_id, poke.user_id)
+                await self._handle_private(poke.user_id, MessageView(text=content), send_private, poke=True)
+            return
+        members = self.db.group_members(poke.group_id, {poke.user_id})
+        nickname = members[0]["display_name"] if members else str(poke.user_id)
+        if not members:
+            self.db.upsert_group_member(poke.group_id, poke.user_id, nickname)
+        storage_id = self.db.log_message(poke.group_id, poke.user_id, nickname, content, role="notice")
+        entry = GroupMessage(
+            storage_id, "", poke.user_id, nickname, content, poke.self_id,
+            direct=True, random_eligible=False, poke=True,
+        )
+        logger.info("Poke wake: scope=group context=%s user=%s", poke.group_id, poke.user_id)
+        await self._queue_group(poke.group_id, entry, send_group)
 
     async def _queue_balance(self, user_id: int, target: int, sender: SendMessage, *, private: bool) -> None:
         if self._closed:
@@ -409,7 +447,7 @@ class BotService:
             )
             personal_history = [
                 {"消息号": row["message_id"], "QQ": row["user_id"], "昵称": row["nickname"],
-                 "内容": row["content"][:500], "引用消息号": row["reply_to_message_id"]}
+                 "角色": row["role"], "内容": row["content"][:500], "引用消息号": row["reply_to_message_id"]}
                 for row in personal_rows if row["id"] not in known_history_ids
             ]
             if personal_history:
@@ -455,7 +493,9 @@ class BotService:
                 current.append({
                     "消息号": entry.message_id, "QQ": entry.user_id, "昵称": entry.nickname,
                     "内容": entry.text[:4000], "明确提问": entry.direct,
+                    "事件类型": "戳一戳" if entry.poke else "消息",
                     "可回复": entry in batch.candidates,
+                    "可引用": entry.message_id in batch.reply_targets and not entry.poke,
                     "提到的成员": [member_index.get(target, {"user_id": target}) for target in entry.mentions],
                     "引用消息": ({"消息号": reply["message_id"], "作者QQ": reply["user_id"],
                                   "作者昵称": reply["nickname"], "角色": reply["role"],
@@ -468,8 +508,11 @@ class BotService:
                 " ".join(entry.text for entry in batch.candidates if entry.text),
                 user_ids=related_ids,
             )
+            trigger = "程序随机接话" if batch.random_trigger else "活跃跟进"
+            if batch.direct:
+                trigger = "戳一戳唤醒" if focus.poke else "明确提问"
             prompt = json.dumps({"当前话题": batch.topic, "当前焦点消息号": focus.message_id,
-                                 "触发方式": "明确提问" if batch.direct else ("程序随机接话" if batch.random_trigger else "活跃跟进"),
+                                 "触发方式": trigger,
                                  "当前发言人": {"QQ": focus.user_id, "昵称": focus.nickname},
                                  "相关成员索引": list(member_index.values()),
                                  "检索到的长期记忆": memories,
@@ -492,7 +535,8 @@ class BotService:
             self._ai_slots.release()
 
     async def _handle_private(
-        self, user_id: int, view: MessageView, send_private: SendPrivate, *, image_session: ChatImageSession | None = None
+        self, user_id: int, view: MessageView, send_private: SendPrivate, *, image_session: ChatImageSession | None = None,
+        poke: bool = False,
     ) -> None:
         """私聊普通文本直接聊天，支持帮助和锐评；从不执行群管理或模仿。"""
         text = view.text.strip()
@@ -529,7 +573,8 @@ class BotService:
         self.db.log_private_message(user_id, "user", stored_text)
         await self._ai_reply(
             user_id, user_id, prompt, send_private,
-            history=history, system=PRIVATE_SYSTEM_PROMPT, private=True, image_session=image_session,
+            history=history, system=PRIVATE_SYSTEM_PROMPT + (POKE_INSTRUCTIONS if poke else ""),
+            private=True, image_session=image_session,
         )
 
     async def _handle_command(
@@ -894,7 +939,7 @@ class BotService:
                     if memory_writes >= 3:
                         return {"ok": False, "error": "本轮最多写入3条长期记忆。"}
                     source_id = arguments["source_message_id"]
-                    source = next((item for item in batch.entries if item.message_id == source_id and source_id), None)
+                    source = next((item for item in batch.entries if item.message_id == source_id and source_id and not item.poke), None)
                     if source is None or not source.text.strip():
                         return {"ok": False, "error": "来源必须是本批一条有文字且有消息号的新消息。"}
                     memory_type = arguments["memory_type"]
@@ -1006,6 +1051,8 @@ class BotService:
 
             if batch is not None:
                 effective_system += GROUP_BATCH_INSTRUCTIONS
+                if any(entry.poke for entry in batch.entries):
+                    effective_system += POKE_INSTRUCTIONS
                 if batch.direct:
                     effective_system += DIRECT_GROUP_WAIT_INSTRUCTIONS
                 if batch.random_trigger:

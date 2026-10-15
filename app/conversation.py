@@ -31,6 +31,8 @@ class GroupMessage:
     random_trigger: bool = False
     # QQ补发的离线旧消息不参加随机抽签，但仍可保存并用于理解上下文。
     random_eligible: bool = True
+    # 动作通知没有可引用的OneBot消息号，不冒充普通文字或记忆来源。
+    poke: bool = False
 
 
 @dataclass(slots=True)
@@ -68,7 +70,7 @@ class GroupBatch:
 
     @property
     def reply_targets(self) -> set[str]:
-        return {entry.message_id for entry in self.candidates if entry.message_id}
+        return {entry.message_id for entry in self.candidates if entry.message_id and not entry.poke}
 
 
 @dataclass(slots=True)

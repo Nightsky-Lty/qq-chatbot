@@ -1,4 +1,4 @@
-"""解析 OneBot 文本、@ 和当前图片引用，并构造发出的消息段。"""
+"""解析 OneBot 消息、戳一戳通知和当前图片引用，并构造发出的消息段。"""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,6 +13,38 @@ class MessageView:
     # 只保留当前事件的图片引用，不下载、不保存图片内容。
     images: list[dict[str, str]] = field(default_factory=list)
     reply_to: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PokeView:
+    """已确认由他人戳向机器人的通知；group_id=0 表示私聊。"""
+
+    user_id: int
+    self_id: int
+    group_id: int = 0
+
+
+def parse_poke_event(event: dict[str, Any]) -> PokeView | None:
+    """NapCat 的私聊 user_id 是会话对象，sender_id 才是实际发起者。"""
+    if (event.get("post_type"), event.get("notice_type"), event.get("sub_type")) != ("notice", "notify", "poke"):
+        return None
+
+    def event_id(value: object) -> int:
+        if type(value) is int:
+            return value if 0 <= value <= 2**63 - 1 else -1
+        if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 19:
+            number = int(value)
+            return number if number <= 2**63 - 1 else -1
+        return -1
+
+    self_id = event_id(event.get("self_id"))
+    target_id = event_id(event.get("target_id"))
+    group_id = event_id(event.get("group_id", 0))
+    actor = event.get("user_id") if group_id > 0 else event.get("sender_id", event.get("user_id"))
+    user_id = event_id(actor)
+    if self_id <= 0 or user_id <= 0 or group_id < 0 or target_id != self_id or user_id == self_id:
+        return None
+    return PokeView(user_id=user_id, self_id=self_id, group_id=group_id)
 
 
 def parse_message(message: object, *, image_limit: int | None = 3) -> MessageView:

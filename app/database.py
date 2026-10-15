@@ -9,7 +9,7 @@ from pathlib import Path
 
 # 数据表用途：member_lists 存名单，list_members 存成员，trigger_keywords 存关键词，
 # keyword_list_bindings 保存关键词到名单的唯一绑定；外键防止悬空引用。
-# messages 存群聊文本、机器人成功回复和引用对象；群友普通文字可作当前群的模仿样本。
+# messages 存群聊文本、机器人成功回复和动作通知；只有user普通文字可作本群模仿样本。
 # private_messages 只存每位用户与机器人的私聊，不作为群聊上下文或模仿样本。
 # WAL 日志模式允许读写操作更好地共存；群号参与键值，隔离不同群的数据。
 SCHEMA = """
@@ -704,12 +704,12 @@ class Database:
             )
 
     def style_samples(self, group_id: int, user_id: int, limit: int) -> list[str]:
-        """取目标用户在当前群的最新普通文字，排除空文本及 / 指令，不读私聊。"""
+        """取目标用户在当前群的普通文字；排除动作通知、机器人回复、空文本及 / 指令。"""
         with self._lock:
             rows = list(
                 self.connection.execute(
                     """SELECT content FROM messages
-                       WHERE group_id=? AND user_id=?
+                       WHERE group_id=? AND user_id=? AND role='user'
                            AND trim(content)<>'' AND ltrim(content) NOT LIKE '/%'
                        ORDER BY id DESC LIMIT ?""",
                     (group_id, user_id, limit),
