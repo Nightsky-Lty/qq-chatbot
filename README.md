@@ -74,7 +74,7 @@
 
 `/模仿` 使用独立提示词，模仿目标用户在当前群的说话方式，不叠加小鲸鱼语气，也不声称自己就是该用户。修改默认人设后重新构建 `bot` 容器即可生效。
 
-所有DeepSeek API请求（聊天、看图、表情入库和收藏审核）默认发送 `thinking: {"type": "enabled"}` 与 `reasoning_effort: "low"`。参数依据[DeepSeek思考模式文档](https://api-docs.deepseek.com/guides/thinking_mode/)。ReAct后续请求完整回传本轮assistant的 `reasoning_content`，包括无工具调用但仍需继续的轮次；推理只存在本轮内存，不发QQ、不记录日志、不写聊天数据库。已完成对话只以角色/文字组成的背景数据提供，不伪造缺少原始思考的assistant历史。工具选择仍为auto（不显式传字段，采用有tools时的API默认行为）；不开启强制工具调用。思考模式省略无效的temperature，默认每次4096个生成token供推理和最终输出共同使用，QQ短句限制不变；可以在config.env关闭思考，或改low/high/max。开启思考可能增加延迟和API费用。
+所有DeepSeek API请求（聊天、看图、表情入库和收藏审核）默认发送 `thinking: {"type": "enabled"}` 与 `reasoning_effort: "high"`。参数依据[DeepSeek思考模式文档](https://api-docs.deepseek.com/guides/thinking_mode/)。ReAct后续请求完整回传本轮assistant的 `reasoning_content`，包括无工具调用但仍需继续的轮次；推理只存在本轮内存，不发QQ、不记录日志、不写聊天数据库。已完成对话只以角色/文字组成的背景数据提供，不伪造缺少原始思考的assistant历史。工具选择仍为auto（不显式传字段，采用有tools时的API默认行为）；不开启强制工具调用。思考模式省略无效的temperature，默认每次4096个生成token供推理和最终输出共同使用，QQ短句限制不变；可以在config.env关闭思考，或改low/high/max。开启思考可能增加延迟和API费用。
 
 聊天、锐评和模仿在后台执行，不阻塞消息接收、名单管理或关键词召集。群话题每群一个运行，运行期间的新消息排入下一批；最多32个等待/活跃群、每批最多30条等待消息，等待超过120秒的明确提问提示重新@。群话题、私聊和模仿共用默认3个并发模型运行；群话题在冷却/名额不足时等待，私聊和模仿保留已有的冷却/忙碌提示。断线、关闭服务或群内删除数据时取消相关话题及本地排队任务，不保证撤销提供商已处理的请求或费用。
 
@@ -290,7 +290,7 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 | `查看我的提醒` | 通过工具读取本人的未完成提醒 |
 | `取消提醒3` | 通过工具取消属于本人的未完成提醒 #3 |
 
-私聊使用相同小鲸鱼群友人设和低强度思考设置。名单、关键词、模仿命令只能在群里使用；在私聊里会返回提示，绝不操作群配置。开启聊天看图后，纯图片消息也会交给模型，由它决定是否看图；语音、视频仍不支持。未知 `/` 命令会提示查看帮助。
+私聊使用相同小鲸鱼群友人设和high强度思考设置。名单、关键词、模仿命令只能在群里使用；在私聊里会返回提示，绝不操作群配置。开启聊天看图后，纯图片消息也会交给模型，由它决定是否看图；语音、视频仍不支持。未知 `/` 命令会提示查看帮助。
 
 私聊保存在独立的 `private_messages` 表，按用户 QQ 号隔离，不与任何群或其他用户混用，也不作为模仿样本。首次启动新版会自动创建表，无需清空旧数据库。
 
@@ -383,7 +383,7 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 基础地址 |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 请求使用的模型名，以账号可用模型为准 |
 | `DEEPSEEK_THINKING_ENABLED` | `true` | 所有DeepSeek请求是否开启思考，包括图片审核 |
-| `DEEPSEEK_REASONING_EFFORT` | `low` | 思考强度，可选low/high/max |
+| `DEEPSEEK_REASONING_EFFORT` | `high` | 思考强度，可选low/high/max |
 | `DEEPSEEK_THINKING_MAX_TOKENS` | `4096` | 思考模式每次推理和最终输出的共同token上限，512～16384 |
 | `ONEBOT_ACCESS_TOKEN` | 空 | NapCat 与机器人连接认证；部署时设置随机值 |
 | `NAPCAT_WEBUI_TOKEN` | 无 | 云端 NapCat 管理页面密码，与 OneBot Token 分开设置 |
@@ -554,7 +554,7 @@ uv.lock            # Python 依赖版本锁定
 
 **帮助能回复，但 AI 不回复**：检查 API Key、模型名、余额和服务器网络，查看 bot 日志中的 DeepSeek 请求错误。
 
-**AI 回复很慢**：默认已开启low强度思考，思考、原图输入以及多步工具调用可能增加延迟。Agent在后台运行，不阻塞管理命令；日志 `Agent handled: ... elapsed=...s` 记录整轮工具/发送处理耗时，`Agent finished` 显示轮数和动作数。可将 `DEEPSEEK_THINKING_ENABLED=false` 关闭思考，或缩短上下文；同时检查API网络和提供商响应。
+**AI 回复很慢**：默认已开启high强度思考，思考、原图输入以及多步工具调用可能增加延迟。Agent在后台运行，不阻塞管理命令；日志 `Agent handled: ... elapsed=...s` 记录整轮工具/发送处理耗时，`Agent finished` 显示轮数和动作数。可将 `DEEPSEEK_THINKING_ENABLED=false` 关闭思考，或缩短上下文；同时检查API网络和提供商响应。
 
 **群里普通聊天不接话**：低活跃期默认按不同发言人数随机唤醒，每群抽中后冷却60秒，不保证每条回复；可以@或/问直接唤醒。日志Random group join显示参与人数和概率，Group batch显示批次，Group context显示群历史/自身回复数量，Group conversation state显示活跃状态。scope=auto表示活跃跟进处理，不保证实际发言。@其他人或引用其他人的消息不作为随机回复对象。
 
