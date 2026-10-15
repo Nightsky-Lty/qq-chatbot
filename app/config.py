@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     agent_max_steps: int = Field(default=8, ge=2, le=16)
     agent_max_tool_calls: int = Field(default=16, ge=4, le=32)
     agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
+    # 无Key的Bing网页搜索；公网只读抓取，共用全局并发上限2。
+    web_search_enabled: bool = True
+    web_search_max_results: int = Field(default=5, ge=1, le=8)
+    web_search_max_calls: int = Field(default=2, ge=1, le=4)
+    web_fetch_max_calls: int = Field(default=2, ge=1, le=4)
+    web_timeout_seconds: int = Field(default=15, ge=3, le=30)
+    web_max_response_bytes: int = Field(default=1024 * 1024, ge=65536, le=5 * 1024 * 1024)
+    web_fetch_max_chars: int = Field(default=6000, ge=1000, le=12000)
     context_message_limit: int = Field(default=80, ge=1, le=200)
     context_max_chars: int = Field(default=24000, ge=1000, le=100000)
     context_bot_reply_limit: int = Field(default=12, ge=0, le=50)

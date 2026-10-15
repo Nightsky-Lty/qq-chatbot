@@ -28,6 +28,7 @@ from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, St
 from app.sticker_index import StickerIndexer
 from app.sticker_collect import CollectionJob, StickerCollector
 from app.tools import FINISH_TOOL, WAIT_FOR_MESSAGES_TOOL, ToolRegistry
+from app.web_search import WEB_INSTRUCTIONS, WEB_TOOLS, WebSearchService, WebSession, user_urls
 
 logger = logging.getLogger(__name__)
 # 发送回调由连接层提供：业务层传入群号或 QQ 号和消息段，不直接操作 WebSocket。
@@ -160,6 +161,7 @@ class BotService:
         self.agent = ReactAgent(settings, llm)
         self.reminders = reminders
         self.chat_images = ChatImageService(settings)
+        self.web_search = WebSearchService(settings)
         self.stickers = StickerService(settings)
         self.sticker_indexer = StickerIndexer(settings, database, llm, self.stickers)
         self._ai_slots = asyncio.Semaphore(settings.ai_max_concurrency)
@@ -933,6 +935,21 @@ class BotService:
                 )
                 registry.register(SEND_POKE_TOOL, poke_session.execute)
                 effective_system += POKE_TOOL_INSTRUCTIONS
+
+            if self.settings.web_search_enabled and not observe_only and (batch is not None or private):
+                # 仅本批可回复消息/当前私聊文本中的URL；不授权历史、记忆或下一批链接。
+                current_texts = [entry.text for entry in batch.candidates] if batch else [prompt]
+                web_session = WebSession(allowed_urls=user_urls(current_texts))
+                for definition in WEB_TOOLS:
+                    name = definition["function"]["name"]
+                    async def web_handler(arguments: dict[str, Any], tool_name: str = name) -> dict[str, Any]:
+                        return await self.web_search.execute_tool(web_session, tool_name, arguments)
+                    registry.register(definition, web_handler)
+                effective_system += WEB_INSTRUCTIONS + (
+                    f"\n本轮最多搜索{self.settings.web_search_max_calls}次，每次最多"
+                    f"{self.settings.web_search_max_results}条结果；读取{self.settings.web_fetch_max_calls}页，"
+                    f"每页正文最多{self.settings.web_fetch_max_chars}字。重复请求复用本轮结果。"
+                )
 
             async def finish(arguments: dict[str, Any]) -> dict[str, Any]:
                 if not automatic and not registry.output_attempted:
