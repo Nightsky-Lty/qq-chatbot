@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     # 主动戳一戳由LLM决定；每轮最多一次，同一群/私聊共用跨轮冷却。
     poke_enabled: bool = True
     poke_cooldown_seconds: int = Field(default=60, ge=1, le=3600)
+    # NapCat调用QQ AI语音，无本地TTS模型；空音色使用当前群真实列表第一项。
+    voice_enabled: bool = True
+    voice_character_id: str = Field(default="", max_length=128)
+    voice_max_chars: int = Field(default=100, ge=10, le=500)
+    voice_cooldown_seconds: int = Field(default=60, ge=1, le=3600)
     # 最近不同发言人数决定随机唤醒概率；活跃话题沿用原调度，不重复抽签。
     random_chat_enabled: bool = True
     random_chat_window_seconds: int = Field(default=120, ge=10, le=3600)

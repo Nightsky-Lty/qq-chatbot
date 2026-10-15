@@ -13,6 +13,7 @@ from app.database import Database
 from app.llm import DeepSeekClient
 from app.models import normalize_message_id
 from app.reminders import ReminderService
+from app.voice import VoiceTransport
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # HTTP 请求日志会包含 QQ 图片链接中的临时签名，不输出完整 URL。
@@ -58,6 +59,20 @@ class OneBotConnection:
             params["group_id"] = group_id
         await self._send_action("send_poke", params, confirmed=True)
 
+    async def get_ai_characters(self, group_id: int) -> Any:
+        """只查询当前群可用音色，不合成或发送；原始结果交给语音层筛选。"""
+        return await self._request_action("get_ai_characters", {"group_id": group_id, "chat_type": 2}, confirmed=True)
+
+    async def send_ai_voice_confirmed(self, group_id: int, character_id: str, text: str) -> str:
+        """NapCat合成并直接发送群语音，合成较慢时最多等45秒。"""
+        data = await self._request_action("send_group_ai_record", {
+            "group_id": group_id, "character": character_id, "text": text,
+        }, confirmed=True, timeout=45)
+        message_id = normalize_message_id(data.get("message_id")) if isinstance(data, dict) else ""
+        if not message_id:
+            raise OneBotSendError("NapCat语音回执缺少有效消息号，不能重试")
+        return message_id
+
     def handle_response(self, response: dict[str, Any]) -> None:
         """用 echo 唤醒等待中的发送；普通回复失败只记状态码，不打印消息内容。"""
         echo = response.get("echo")
@@ -76,6 +91,11 @@ class OneBotConnection:
                 future.exception()
 
     async def _send_action(self, action: str, params: dict[str, Any], *, confirmed: bool = False) -> str:
+        data = await self._request_action(action, params, confirmed=confirmed)
+        return normalize_message_id(data.get("message_id")) if isinstance(data, dict) else ""
+
+    async def _request_action(self, action: str, params: dict[str, Any], *, confirmed: bool = False,
+                              timeout: float = 15) -> Any:
         """串行提交 OneBot 动作，群聊和私聊共用序号，防止并发写入。"""
         # 同一连接上的发送操作串行执行，避免并发写入。
         echo = ""
@@ -90,14 +110,13 @@ class OneBotConnection:
                 await self.websocket.send_json({"action": action, "params": params, "echo": echo})
             if future is not None:
                 try:
-                    response = await asyncio.wait_for(future, timeout=15)
+                    response = await asyncio.wait_for(future, timeout=timeout)
                 except TimeoutError as exc:
                     raise OneBotSendError("NapCat没有及时确认发送") from exc
                 if response.get("status") != "ok" or response.get("retcode") != 0:
                     raise OneBotSendError(f"NapCat发送失败，状态码{response.get('retcode')}")
-                data = response.get("data")
-                return normalize_message_id(data.get("message_id")) if isinstance(data, dict) else ""
-            return ""
+                return response.get("data")
+            return None
         finally:
             self.pending.pop(echo, None)
             if future is not None and not future.done():
@@ -169,6 +188,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         send_group_confirmed=connection.send_group_confirmed,
                         send_private_confirmed=connection.send_private_confirmed,
                         send_poke_confirmed=connection.send_poke_confirmed,
+                        voice_transport=VoiceTransport(connection.get_ai_characters, connection.send_ai_voice_confirmed),
                     )
                 except Exception:
                     # 单条业务事件异常只记录日志，继续处理连接上的后续事件。

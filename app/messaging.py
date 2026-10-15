@@ -38,6 +38,8 @@ class MessageSession:
         self.limit = max_messages if max_messages is not None else (1 if private or automatic else 2)
         self.count = 0
         self.sent_texts: set[str] = set()
+        self.delivered_texts: set[str] = set()
+        self.spoken_texts: set[str] = set()
         self.lock = lock
         self.reply_targets = reply_targets or set()
         self.default_reply = default_reply
@@ -98,6 +100,8 @@ class MessageSession:
         async with self.lock:
             if self.registry.delivery_uncertain:
                 return {"ok": False, "error": "上一条发送未确认，本轮不再发送，避免重复。"}
+            if text in self.spoken_texts:
+                return {"ok": True, "duplicate": True, "note": "同一句话本轮已用语音发送，不重复文字提交。"}
             signature = json.dumps([reply_to, text, sorted(mentions)], ensure_ascii=False)
             if signature in self.sent_texts:
                 return {"ok": True, "duplicate": True, "note": "此文字本轮已经发送，不重复提交。"}
@@ -124,6 +128,7 @@ class MessageSession:
                     self.count += 1
                     sent += 1
                     self.registry.outputs_sent += 1
+                    self.delivered_texts.add(part)
                     if self.private:
                         self.db.log_private_message(self.target, "assistant", part)
                     else:
@@ -134,6 +139,7 @@ class MessageSession:
                 return {"ok": False, "error": "QQ发送未确认，本轮不自动重试。请结束，不能声称用户已收到。"}
             self.registry.delivery_uncertain = False
             self.sent_texts.add(signature)
+            self.delivered_texts.add(text)
             self.last_reply = reply_to
             return {"ok": True, "sent": sent, "remaining": self.limit - self.count,
                     "note": "NapCat接受发送，不代表用户已读；无需再把同样文字作为最终回答输出。"}

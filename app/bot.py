@@ -31,6 +31,7 @@ from app.sticker_collect import (
 )
 from app.tools import FINISH_TOOL, WAIT_FOR_MESSAGES_TOOL, ToolRegistry
 from app.web_search import WEB_INSTRUCTIONS, WEB_TOOLS, WebSearchService, WebSession, user_urls
+from app.voice import LIST_VOICE_CHARACTERS_TOOL, SEND_VOICE_TOOL, VOICE_INSTRUCTIONS, VoiceService, VoiceSession, VoiceTransport
 
 logger = logging.getLogger(__name__)
 # 发送回调由连接层提供：业务层传入群号或 QQ 号和消息段，不直接操作 WebSocket。
@@ -54,6 +55,7 @@ HELP_TEXT = """可用命令：
 /余额（仅机器人管理员）
 /帮助
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
+群聊也可以要求语音回复，使用QQ提供的AI音色；暂不识别收到的语音。
 @或戳一戳机器人、使用/问、/锐评唤醒，等3秒聚合连发文字和图片，模型按需看图。
 话题活跃期间无需每条@；低活跃期普通消息也可能按群活跃人数被程序随机抽中接话。
 群图片可按概率随机收藏，也可在聊天中要求收藏当前表情图，先去重再审核。
@@ -172,8 +174,10 @@ class BotService:
         )
         self.memory = MemoryService(settings, database)
         self.pokes = PokeService(settings)
+        self.voices = VoiceService(settings)
         self._confirmed_senders: dict[SendMessage, SendMessage] = {}
         self._poke_senders: dict[SendMessage, SendPoke] = {}
+        self._voice_transports: dict[SendMessage, VoiceTransport] = {}
         # 冷却记录只存在于内存中，重启服务后会重置。
         self._last_ai_call: dict[AIKey, float] = {}
         self._trigger_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -216,6 +220,10 @@ class BotService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         if send_message is not None and key is None:
+            transport = self._voice_transports.pop(confirmed or send_message, None)
+            if transport is not None:
+                self.voices.clear_lookup(transport.get_characters)
+            self._voice_transports.pop(send_message, None)
             self._confirmed_senders.pop(send_message, None)
             self._poke_senders.pop(send_message, None)
             if confirmed is not None:
@@ -231,6 +239,8 @@ class BotService:
         await self.memory.close()
         self._confirmed_senders.clear()
         self._poke_senders.clear()
+        self._voice_transports.clear()
+        self.voices.clear()
 
     def _finish_ai_task(self, task: asyncio.Task[None]) -> None:
         """任务结束后回收名额；尚未开始就被取消的任务也必须回收。"""
@@ -246,6 +256,7 @@ class BotService:
         self, event: dict[str, Any], send_group: SendGroup, send_private: SendPrivate | None = None,
         *, send_group_confirmed: SendGroup | None = None, send_private_confirmed: SendPrivate | None = None,
         send_poke_confirmed: SendPoke | None = None,
+        voice_transport: VoiceTransport | None = None,
     ) -> None:
         """动作通知先分流；消息沿用私聊、群命令和活跃话题处理流程。"""
         if self._closed:
@@ -269,6 +280,8 @@ class BotService:
             self._poke_senders[send_group_confirmed or send_group] = send_poke_confirmed
             if send_private is not None:
                 self._poke_senders[send_private_confirmed or send_private] = send_poke_confirmed
+        if voice_transport is not None:
+            self._voice_transports[send_group_confirmed or send_group] = voice_transport
         if poke is not None:
             await self._handle_poke(poke, send_group, send_private)
             return
@@ -946,6 +959,17 @@ class BotService:
                 )
                 registry.register(SEND_POKE_TOOL, poke_session.execute)
                 effective_system += POKE_TOOL_INSTRUCTIONS
+
+            voice_transport = self._voice_transports.get(send_message)
+            if (self.settings.voice_enabled and voice_transport is not None and batch is not None
+                    and not private and not observe_only):
+                voice_session = VoiceSession(self.voices, messages, voice_transport)
+                registry.register(LIST_VOICE_CHARACTERS_TOOL, voice_session.list_characters)
+                registry.register(SEND_VOICE_TOOL, voice_session.execute)
+                effective_system += VOICE_INSTRUCTIONS + (
+                    f"\n本轮语音最多{min(self.settings.voice_max_chars, self.settings.group_reply_max_chars)}字，"
+                    f"本群语音间隔至少{self.settings.voice_cooldown_seconds}秒。"
+                )
 
             if self.settings.web_search_enabled and not observe_only and (batch is not None or private):
                 # 仅本批可回复消息/当前私聊文本中的URL；不授权历史、记忆或下一批链接。
