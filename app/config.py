@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     sticker_prompt_rotate_seconds: int = Field(default=3600, ge=60, le=86400)
     sticker_directory: Path = Path("app/sticker_images")
     sticker_collect_enabled: bool = True
-    sticker_collect_probability: float = Field(default=0.10, ge=0, le=1)
+    sticker_collect_probability: float = Field(default=0.20, ge=0, le=1)
     sticker_collect_queue_size: int = Field(default=32, ge=1, le=200)
     sticker_collect_queue_wait_seconds: int = Field(default=120, ge=10, le=600)
     # 旧图片观察配置仅兼容读取，随机收图不依赖聊天话题或观察模型。

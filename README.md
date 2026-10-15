@@ -83,7 +83,7 @@
 
 ## 自动收藏群友表情
 
-每张新群图片由程序独立抽签，默认`STICKER_COLLECT_PROBABILITY=0.10`，不依赖聊天模型是否参与、是否调用工具或有没有@机器人。与按活跃人数变化的随机接话概率分开配置；群消息中超过3张的图片也参与抽签，聊天模型的看图上下文仍限前3张。私聊、机器人自身图片、历史引用、合并转发中的内嵌图片、视频、QQ系统face段不参与，过期补发消息不参加抽签。
+每张新群图片由程序独立抽签，默认`STICKER_COLLECT_PROBABILITY=0.20`，不依赖聊天模型是否参与、是否调用工具或有没有@机器人。与按活跃人数变化的随机接话概率分开配置；群消息中超过3张的图片也参与抽签，聊天模型的看图上下文仍限前3张。私聊、机器人自身图片、历史引用、合并转发中的内嵌图片、视频、QQ系统face段不参与，过期补发消息不参加抽签。
 
 抽中后进入单个后台工作队列，最多等待32张图片引用，默认排队超过120秒丢弃；队列满或冷却中跳过，不在OneBot收消息循环里等待下载/模型。下载沿用受信QQ CDN、超时和大小校验；计算SHA-256，先检查实际人工/收藏图库，包含尚未标注或被禁用的文件。字节完全相同的图片直接跳过，不重新审核、保存或发确认；图库文件变化时重新计算哈希。压缩、裁剪或改字会改变哈希，暂不做感知去重。
 
@@ -415,7 +415,7 @@ ssh -N -L 16099:127.0.0.1:6099 用户名@服务器IP
 | `STICKER_PROMPT_ROTATE_SECONDS` | `3600` | 文字预览轮换周期秒数，范围60～86400 |
 | `STICKER_DIRECTORY` | `app/sticker_images` | 本地图片目录；Compose固定为 `/app/app/sticker_images` |
 | `STICKER_COLLECT_ENABLED` | `true` | 是否由程序后台随机收图，不影响既有收藏 |
-| `STICKER_COLLECT_PROBABILITY` | `0.10` | 每张新群图片的独立抽签概率，0～1；0关闭 |
+| `STICKER_COLLECT_PROBABILITY` | `0.20` | 每张新群图片的独立抽签概率，0～1；0关闭 |
 | `STICKER_COLLECT_QUEUE_SIZE` | `32` | 后台图片引用等待数量上限，不提前下载 |
 | `STICKER_COLLECT_QUEUE_WAIT_SECONDS` | `120` | 最大排队时长及允许的新消息年龄（秒） |
 | `STICKER_COLLECTED_DIRECTORY` | `data/collected_stickers` | 收藏目录；Compose固定为 `/app/data/collected_stickers` |
