@@ -1,4 +1,4 @@
-"""程序随机收图：有界后台队列、SHA-256去重、视觉审核和原子落盘。"""
+"""收藏工具与随机收图共用：SHA-256去重、视觉审核和原子落盘。"""
 
 import asyncio
 import base64
@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from time import monotonic, time
 from typing import Any, Awaitable, Callable
 
+import httpx
+
 from app.chat_images import ChatImageService
 from app.config import Settings
 from app.database import Database
@@ -20,6 +22,24 @@ from app.stickers import EXTENSIONS, StickerService, file_signature
 
 logger = logging.getLogger(__name__)
 Sender = Callable[[int, list[dict[str, Any]]], Awaitable[Any]]
+
+COLLECT_STICKER_TOOL = {"type": "function", "function": {
+    "name": "collect_sticker",
+    "description": "收藏本批新群消息的一张表情/梗图到共享图库。可按语境主动收藏或响应用户要求；先哈希去重，再独立视觉审核，成功回执之前不能声称已收藏。每轮最多尝试一张，不是发送表情工具。",
+    "parameters": {"type": "object", "properties": {
+        "image_id": {"type": "string", "minLength": 1, "maxLength": 32,
+                     "description": "程序列出的本轮可收藏图片编号，如image_1；不能传历史图片、URL、路径或自选群号。"},
+    }, "required": ["image_id"], "additionalProperties": False},
+}}
+
+COLLECT_INSTRUCTIONS = """\n\n【收藏本批群表情】
+本轮提供collect_sticker(image_id)。用户要求收图，或当前群图适合留作表情时可主动调用；不强制每张都收。
+后台仍独立按概率抽图，不能假定抽中或成功；工具与后台共用哈希去重、视觉审核、冷却和容量限制。
+每轮只尝试一张，失败后不换图绕过限制；只能使用下面列出的本批真实编号，不能收藏历史、私聊、网页图或编造地址。
+看图和收藏是不同动作：get_message_image只看图，收藏工具独立审核，不要求先看图；审核摘要不代表你已亲自看过原图。
+只有ok=true且created=true才可说新收藏成功，然后用send_message自然接一句；重复时只能说已有，拒绝/冷却/失败不能声称成功。
+工具收藏由本轮你回复，不再额外后台播报；概率后台只对真正新入库的图片确认一次。收藏不是给QQ账号点收藏，也不是向群里发图。
+"""
 
 
 @dataclass(slots=True)
@@ -36,6 +56,14 @@ class CollectionJob:
 Announcement = Callable[[CollectionJob], Awaitable[None]]
 
 
+@dataclass(slots=True)
+class CollectionSession:
+    jobs: dict[str, CollectionJob]
+    cached: dict[str, dict[str, Any]] = field(default_factory=dict)
+    attempted: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class StickerCollector:
     def __init__(self, settings: Settings, db: Database, llm: DeepSeekClient, stickers: StickerService,
                  *, slots: asyncio.Semaphore, announce: Announcement):
@@ -49,17 +77,18 @@ class StickerCollector:
         self._closed = False
         self._last_reviewed: dict[int, float] = {}
         self._file_hashes: dict[str, tuple[tuple, str]] = {}
+        # 两条入口必须串行完成检查/审核/写入，防止重复审核和突破容量。
+        self._collect_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
         return (not self._closed and self.settings.sticker_enabled
-                and self.settings.sticker_vision_enabled and self.settings.sticker_collect_enabled
-                and self.settings.sticker_collect_probability > 0)
+                and self.settings.sticker_vision_enabled and self.settings.sticker_collect_enabled)
 
     def submit(self, group_id: int, user_id: int, bot_id: int, message_id: str,
                images: list[dict[str, str]], sender: Sender) -> None:
         """每张图片独立抽签；队列只存引用，不在OneBot接收循环下载/等待LLM。"""
-        if not self.enabled:
+        if not self.enabled or self.settings.sticker_collect_probability <= 0:
             return
         now = monotonic()
         self._last_reviewed = {group: at for group, at in self._last_reviewed.items()
@@ -147,23 +176,66 @@ class StickerCollector:
             os.unlink(temporary)
         return True
 
-    async def _collect(self, job: CollectionJob) -> bool:
-        if monotonic() - self._last_reviewed.get(job.group_id, float("-inf")) < self.settings.sticker_collect_cooldown_seconds:
-            return False
-        mime, data = await self.images.load(job.image)
+    def _cooling(self, group_id: int) -> bool:
+        return monotonic() - self._last_reviewed.get(group_id, float("-inf")) < self.settings.sticker_collect_cooldown_seconds
+
+    @staticmethod
+    def _rejected(status: str, error: str) -> dict[str, Any]:
+        return {"ok": False, "created": False, "status": status, "error": error}
+
+    async def execute_tool(self, session: CollectionSession, arguments: dict[str, Any],
+                           *, loaded_images: dict[str, tuple[str, bytes]] | None = None) -> dict[str, Any]:
+        image_id = arguments.get("image_id")
+        if not isinstance(image_id, str) or image_id not in session.jobs or set(arguments) != {"image_id"}:
+            return self._rejected("invalid_image", "只能收藏程序列出的本批新群图片编号。")
+        async with session.lock:
+            if image_id in session.cached:
+                return session.cached[image_id]
+            if session.attempted:
+                return self._rejected("limit", "本轮最多尝试收藏一张，不换图绕过限制。")
+            session.attempted = True
+            try:
+                # 群Agent已持有AI并发额度，不能再申请同一个额度，否则单并发会死锁。
+                result = await self._collect(session.jobs[image_id], source="agent",
+                                             loaded=(loaded_images or {}).get(image_id))
+            except (ValueError, httpx.HTTPError, OSError, TimeoutError) as exc:
+                logger.warning("Sticker collection tool failed: error=%s", type(exc).__name__)
+                result = self._rejected("unavailable", "图片获取或收藏失败，可能链接过期、格式不支持或图库不可写；未确认收藏成功。")
+            session.cached[image_id] = result
+            return result
+
+    async def _collect(self, job: CollectionJob, *, source: str = "random",
+                       loaded: tuple[str, bytes] | None = None) -> dict[str, Any]:
+        async with self._collect_lock:
+            if not self.enabled:
+                return self._rejected("disabled", "收藏已关闭或视觉审核不可用。")
+            if monotonic() - job.queued_at > self.settings.sticker_collect_queue_wait_seconds:
+                return self._rejected("expired", "当前图片已超过收藏处理时限，请重新发送。")
+            # 随机入口冷却时不下载；工具仍可先确认是否已经入库，但不能绕过审核冷却。
+            if source == "random" and self._cooling(job.group_id):
+                return self._rejected("cooldown", "本群图片审核冷却中，未新收藏。")
+            return await self._collect_locked(job, source=source, loaded=loaded)
+
+    async def _collect_locked(self, job: CollectionJob, *, source: str,
+                              loaded: tuple[str, bytes] | None) -> dict[str, Any]:
+        mime, data = loaded if loaded is not None else await self.images.load(job.image)
+        if len(data) > self.images.max_bytes:
+            return self._rejected("too_large", "图片超过收藏大小限制。")
         content_hash = hashlib.sha256(data).hexdigest()
         if await asyncio.to_thread(self._find_duplicate, content_hash):
             logger.info("Sticker collection skipped: reason=duplicate group=%s", job.group_id)
-            return False
+            return {"ok": True, "created": False, "status": "duplicate", "note": "图库已有相同内容，不重新审核或保存，不播报新收藏成功。"}
+        if self._cooling(job.group_id):
+            return self._rejected("cooldown", "本群图片审核冷却中，未新收藏。")
         if not await asyncio.to_thread(self._has_room, len(data)):
             logger.info("Sticker collection skipped: reason=capacity group=%s", job.group_id)
-            return False
+            return self._rejected("capacity", "收藏图库容量已满，不自动删除旧图。")
         record = self.db.get_sticker_annotation(content_hash)
         if record and (record["status"] == "quarantined"
                        or (record["status"] == "error" and record["next_attempt_at"] > time())):
-            return False
+            return self._rejected("review_blocked", "该图片已被审核拒绝或仍在审核失败退避期，不能重复提交审核。")
         if len(await asyncio.to_thread(self.stickers._catalog, raw=True)) >= 500:
-            return False
+            return self._rejected("capacity", "人工和收藏图库已达到扫描数量上限。")
         # 尝试审核也占用冷却，连续收到不合格图片时不连续消耗API。
         self._last_reviewed[job.group_id] = monotonic()
         metadata = (record or {}).get("metadata", {})
@@ -176,22 +248,30 @@ class StickerCollector:
                 self.db.save_sticker_annotation(content_hash, "error", {}, attempts=attempts,
                                                 next_attempt_at=int(time()) + delay)
                 logger.warning("Sticker collection review failed: error=%s", type(exc).__name__)
-                return False
+                return self._rejected("review_error", "图片审核失败，尚未收藏；暂不重复审核。")
         if (not metadata.get("safe") or metadata.get("selfie") is not False
                 or metadata.get("warnings") or metadata.get("is_sticker") is not True):
             self.db.save_sticker_annotation(content_hash, "quarantined", metadata)
             logger.info("Sticker collection skipped: reason=review_rejected group=%s", job.group_id)
-            return False
+            return self._rejected("review_rejected", "未通过表情图及安全审核，未收藏；不保存普通照片、自拍、隐私截图或风险不明图片。")
         extension = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}[mime]
         sticker_id = f"collected:{content_hash}.{extension}"
         self.db.save_sticker_annotation(content_hash, "ready", metadata)
-        created = await asyncio.to_thread(self._write_new, sticker_id, data)
+        write = asyncio.create_task(asyncio.to_thread(self._write_new, sticker_id, data))
+        try:
+            created = await asyncio.shield(write)
+        except asyncio.CancelledError:
+            # 写盘线程无法取消，完成前不释放收藏锁，否则另一入口可能重入。
+            await write
+            raise
         signature = file_signature(self.stickers.path_for_id(sticker_id).stat())
         self.stickers.annotations = {**self.stickers.annotations, sticker_id: {
             "hash": content_hash, "signature": signature, "record": self.db.get_sticker_annotation(content_hash),
         }}
-        logger.info("Sticker collected: group=%s created=%s source=random", job.group_id, created)
-        return created
+        logger.info("Sticker collected: group=%s created=%s source=%s", job.group_id, created, source)
+        return {"ok": True, "created": created, "status": "collected" if created else "duplicate",
+                "sticker_id": sticker_id,
+                "note": "审核通过并新入库，可简短确认，不额外后台播报。" if created else "相同图片已在图库，不重复播报新收藏成功。"}
 
     async def _run(self) -> None:
         while not self.queue.empty() and not self._closed:
@@ -202,7 +282,7 @@ class StickerCollector:
                     if monotonic() - job.queued_at > self.settings.sticker_collect_queue_wait_seconds:
                         continue
                     async with asyncio.timeout(self.settings.agent_timeout_seconds):
-                        if await self._collect(job):
+                        if (await self._collect(job)).get("created") is True:
                             await self.announce(job)
             except asyncio.CancelledError:
                 raise

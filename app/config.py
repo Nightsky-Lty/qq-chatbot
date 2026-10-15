@@ -116,7 +116,7 @@ class Settings(BaseSettings):
     sticker_collect_probability: float = Field(default=0.20, ge=0, le=1)
     sticker_collect_queue_size: int = Field(default=32, ge=1, le=200)
     sticker_collect_queue_wait_seconds: int = Field(default=120, ge=10, le=600)
-    # 旧图片观察配置仅兼容读取，随机收图不依赖聊天话题或观察模型。
+    # 旧图片观察配置仅兼容读取，随机入口不依赖话题；概率0仅停随机，保留收藏工具。
     sticker_collect_auto_enabled: bool = False
     sticker_collected_directory: Path = Path("data/collected_stickers")
     sticker_collect_observe_seconds: int = Field(default=300, ge=30, le=3600)

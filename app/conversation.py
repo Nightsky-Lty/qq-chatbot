@@ -33,6 +33,8 @@ class GroupMessage:
     random_eligible: bool = True
     # 动作通知没有可引用的OneBot消息号，不冒充普通文字或记忆来源。
     poke: bool = False
+    # 仅入口确认时间足够新的普通群图片可供主动收藏，不从历史补收。
+    collectible: bool = False
 
 
 @dataclass(slots=True)

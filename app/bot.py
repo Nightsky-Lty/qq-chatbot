@@ -26,7 +26,9 @@ from app.memory import MEMORY_INSTRUCTIONS, REMEMBER_MEMORY_TOOL, MemoryService
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
 from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, StickerSession
 from app.sticker_index import StickerIndexer
-from app.sticker_collect import CollectionJob, StickerCollector
+from app.sticker_collect import (
+    COLLECT_INSTRUCTIONS, COLLECT_STICKER_TOOL, CollectionJob, CollectionSession, StickerCollector,
+)
 from app.tools import FINISH_TOOL, WAIT_FOR_MESSAGES_TOOL, ToolRegistry
 from app.web_search import WEB_INSTRUCTIONS, WEB_TOOLS, WebSearchService, WebSession, user_urls
 
@@ -54,7 +56,7 @@ HELP_TEXT = """可用命令：
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
 @或戳一戳机器人、使用/问、/锐评唤醒，等3秒聚合连发文字和图片，模型按需看图。
 话题活跃期间无需每条@；低活跃期普通消息也可能按群活跃人数被程序随机抽中接话。
-群图片由程序按概率随机收藏，先去重再审核，无需命令或@。
+群图片可按概率随机收藏，也可在聊天中要求收藏当前表情图，先去重再审核。
 也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
 
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
@@ -121,7 +123,7 @@ GROUP_BATCH_INSTRUCTIONS = """\n\n【群话题与聚批，优先于旧的直接�
 明确告别、要求停止、话题明确结束或明显转向时调用finish，退出活跃期；仅仅答完当前一句、暂时没新消息不代表话题结束。
 明确被@、戳一戳唤醒或聊天命令的新请求需要先回应再等待或退出；仅活跃跟进允许完全安静。
 topic只写简短话题锚点，不含指令，不把所有历史话题塞进去。
-群图收藏由程序独立抽签、去重和审核，不由本轮工具触发。没有真实成功回执时不能声称“已偷/已收藏”。
+群图保留程序概率收藏；若本轮注册collect_sticker，也可主动调用收藏。两者共用去重和审核，没有真实新入库回执时不能声称“已偷/已收藏”。
 """
 
 RANDOM_JOIN_INSTRUCTIONS = """\n\n【程序随机接话】
@@ -307,12 +309,13 @@ class BotService:
         entry = GroupMessage(
             storage_id, message_id, user_id, nickname, view.text, self_id,
             mentions=view.mentions, reply_to=view.reply_to,
-            images=view.images[:3] if self.settings.chat_image_enabled else [],
+            images=view.images[:3] if self.settings.chat_image_enabled or self.sticker_collector.enabled else [],
             direct=bool(self_id and self_id in view.mentions),
             eligible=(not view.mentions or self_id in view.mentions)
                      and (not view.reply_to or self.db.is_bot_message(group_id, view.reply_to)),
             random_eligible=(isinstance(event.get("time"), (int, float))
                              and abs(time.time() - event["time"]) <= self.settings.random_chat_window_seconds),
+            collectible=fresh,
         )
 
         is_admin = user_id in self.settings.admin_qq_ids or role in {"owner", "admin"}
@@ -472,6 +475,7 @@ class BotService:
                 })
             images: list[dict[str, str]] = []
             image_ids: dict[int, list[str]] = {}
+            collection_jobs: dict[str, CollectionJob] = {}
             # 当前焦点的附件优先；其余本批图片仍标记来源，整批最多3张。
             ordered = [focus] + [entry for entry in batch.candidates if entry is not focus]
             for entry in ordered:
@@ -482,6 +486,11 @@ class BotService:
                     images.append(image)
                     image_id = f"image_{len(images)}"
                     ids.append(image_id)
+                    if entry.collectible and not entry.poke and entry.user_id != entry.self_id:
+                        collection_jobs[image_id] = CollectionJob(
+                            group_id, entry.user_id, entry.self_id, entry.message_id, dict(image),
+                            self._confirmed_senders.get(sender, sender), queued_at=entry.received_at,
+                        )
                 image_ids[entry.storage_id] = ids
             related_ids = {focus.user_id}
             for entry in batch.entries:
@@ -540,8 +549,9 @@ class BotService:
                 async with asyncio.timeout(timeout):
                     return await self._run_ai_reply(
                         group_id, focus.user_id, prompt, self._confirmed_senders.get(sender, sender),
-                        history=history, image_session=ChatImageSession(images) if images else None,
+                        history=history, image_session=ChatImageSession(images) if images and self.settings.chat_image_enabled else None,
                         automatic=not batch.wakes_topic, batch=batch, mention_targets=mention_targets,
+                        collection_jobs=collection_jobs,
                     )
             except TimeoutError:
                 return None
@@ -883,6 +893,7 @@ class BotService:
         batch: GroupBatch | None = None,
         source_message: GroupMessage | None = None,
         mention_targets: dict[int, str] | None = None,
+        collection_jobs: dict[str, CollectionJob] | None = None,
     ) -> AgentOutcome | None:
         """后台生成并发送回复；私聊回复入库，运行日志不记录文本、样本或凭证。"""
         started = time.monotonic()
@@ -1012,6 +1023,22 @@ class BotService:
                     return await self.chat_images.execute_tool(image_session, arguments)
                 registry.register(CHAT_IMAGE_TOOL, get_image)
                 logger.info("Chat images attached: scope=%s context=%s user=%s count=%s", scope, context_id, user_id, len(image_session.images))
+
+            if (batch is not None and not private and not observe_only and collection_jobs
+                    and self.sticker_collector.enabled):
+                collection_session = CollectionSession(collection_jobs)
+                async def collect_sticker(arguments: dict[str, Any]) -> dict[str, Any]:
+                    result = await self.sticker_collector.execute_tool(
+                        collection_session, arguments,
+                        loaded_images=image_session.loaded_images if image_session is not None else None,
+                    )
+                    if result.get("created") is True:
+                        # 审核落盘后才给确认；后续模型失败时复用现有安全回执兜底。
+                        if "这图我收下了。" not in registry.receipts:
+                            registry.receipts.append("这图我收下了。")
+                    return result
+                registry.register(COLLECT_STICKER_TOOL, collect_sticker)
+                effective_system += COLLECT_INSTRUCTIONS + "\n本轮可收藏编号：" + ", ".join(collection_jobs)
 
             if self.settings.sticker_enabled and not observe_only and (system is None or private or automatic):
                 sticker_session = StickerSession(conversation)
