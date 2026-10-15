@@ -68,7 +68,7 @@ class ToolRegistry:
 
 
 FINISH_TOOL = {"type": "function", "function": {
-    "name": "finish", "description": "结束处理；群话题进入低活跃度，之后不再无@接话。想继续参与群话题用wait_for_messages。私聊正常回应后结束。",
+    "name": "finish", "description": "结束当前处理，群话题回到低活跃度；后续明确提问或程序随机触发可重新唤醒。想继续当前话题用wait_for_messages。私聊正常回应后结束。",
     "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 }}
 

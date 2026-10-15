@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
     context_message_limit: int = Field(default=80, ge=1, le=200)
     context_max_chars: int = Field(default=24000, ge=1000, le=100000)
+    context_bot_reply_limit: int = Field(default=12, ge=0, le=50)
     # 群成员长期记忆：SQLite 持久化，使用本地向量做混合 RAG，不依赖额外服务。
     memory_enabled: bool = True
     memory_auto_capture_enabled: bool = True
@@ -68,6 +69,13 @@ class Settings(BaseSettings):
     chat_active_idle_seconds: int = Field(default=180, ge=10, le=3600)
     chat_active_max_seconds: int = Field(default=900, ge=30, le=7200)
     group_reply_max_chars: int = Field(default=100, ge=10, le=500)
+    # 最近不同发言人数决定随机唤醒概率；活跃话题沿用原调度，不重复抽签。
+    random_chat_enabled: bool = True
+    random_chat_window_seconds: int = Field(default=120, ge=10, le=3600)
+    random_chat_min_probability: float = Field(default=0.01, ge=0, le=1)
+    random_chat_probability_per_user: float = Field(default=0.02, ge=0, le=1)
+    random_chat_max_probability: float = Field(default=0.20, ge=0, le=1)
+    random_chat_cooldown_seconds: int = Field(default=60, ge=1, le=3600)
     # 兼容旧 .env 的字段；三人自动接话入口已由群话题状态机替代，不再读取人数配置。
     auto_chat_enabled: bool = False
     auto_chat_min_users: int = Field(default=3, ge=3)

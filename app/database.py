@@ -148,6 +148,7 @@ class Database:
                 if name not in columns:
                     self.connection.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_onebot ON messages(group_id,message_id)")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_group_role_id ON messages(group_id,role,id DESC)")
             memory_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(memories)")}
             memory_migrations = (
                 ("hash_vector", "TEXT NOT NULL DEFAULT '{}'"),
@@ -574,6 +575,18 @@ class Database:
         # 倒序查询便于限制最新条数，反转后符合聊天上下文的时间顺序。
         rows.reverse()
         return rows
+
+    def recent_bot_messages(self, group_id: int, limit: int) -> list[sqlite3.Row]:
+        """独立读取本群最近的机器人发言，避免被大量群友消息挤出窗口。"""
+        if limit <= 0:
+            return []
+        with self._lock:
+            rows = list(self.connection.execute(
+                """SELECT id,user_id,nickname,content,message_id,role,reply_to_message_id,created_at
+                   FROM messages WHERE group_id=? AND role='assistant' ORDER BY id DESC LIMIT ?""",
+                (group_id, limit),
+            ))
+        return list(reversed(rows))
 
     def is_bot_message(self, group_id: int, message_id: str) -> bool:
         if not message_id:

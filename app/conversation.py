@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -27,6 +28,9 @@ class GroupMessage:
     direct: bool = False
     eligible: bool = True
     received_at: float = field(default_factory=time.monotonic)
+    random_trigger: bool = False
+    # QQ补发的离线旧消息不参加随机抽签，但仍可保存并用于理解上下文。
+    random_eligible: bool = True
 
 
 @dataclass(slots=True)
@@ -41,8 +45,9 @@ class GroupBatch:
     @property
     def focus(self) -> GroupMessage:
         direct = [entry for entry in self.entries if entry.direct]
-        if direct:
-            last = direct[-1]
+        triggers = direct or [entry for entry in self.entries if entry.random_trigger]
+        if triggers:
+            last = triggers[-1]
             supplements = [entry for entry in self.candidates
                            if entry.user_id == last.user_id and entry.received_at >= last.received_at]
             return next((entry for entry in reversed(supplements) if entry.text), supplements[-1])
@@ -52,6 +57,14 @@ class GroupBatch:
     @property
     def direct(self) -> bool:
         return any(entry.direct for entry in self.entries)
+
+    @property
+    def random_trigger(self) -> bool:
+        return not self.direct and any(entry.random_trigger for entry in self.entries)
+
+    @property
+    def wakes_topic(self) -> bool:
+        return self.direct or self.random_trigger
 
     @property
     def reply_targets(self) -> set[str]:
@@ -78,14 +91,40 @@ class ConversationState:
 Runner = Callable[[int, GroupBatch, Sender], Awaitable[AgentOutcome | None]]
 
 
+@dataclass(slots=True)
+class GroupActivity:
+    participants: dict[int, float] = field(default_factory=dict)
+    last_triggered_at: float = float("-inf")
+
+
 class GroupConversations:
     def __init__(self, settings: Settings, runner: Runner):
         self.settings, self.runner = settings, runner
         self.states: dict[int, ConversationState] = {}
+        self.activity: dict[int, GroupActivity] = {}
         self.closed = False
 
+    def _record_activity(self, group_id: int, entry: GroupMessage, now: float) -> GroupActivity:
+        cutoff = now - self.settings.random_chat_window_seconds
+        for old_id, activity in list(self.activity.items()):
+            activity.participants = {user: seen for user, seen in activity.participants.items() if seen > cutoff}
+            if (not activity.participants
+                    and now - activity.last_triggered_at >= self.settings.random_chat_cooldown_seconds):
+                self.activity.pop(old_id, None)
+        activity = self.activity.setdefault(group_id, GroupActivity())
+        if entry.random_eligible and (entry.text.strip() or entry.images):
+            activity.participants[entry.user_id] = now
+        return activity
+
+    def random_probability(self, participants: int) -> float:
+        if participants <= 0:
+            return 0.0
+        return min(self.settings.random_chat_max_probability,
+                   self.settings.random_chat_min_probability
+                   + max(0, participants - 1) * self.settings.random_chat_probability_per_user)
+
     async def submit(self, group_id: int, entry: GroupMessage, sender: Sender) -> str:
-        """只入队，不等待计时或模型。低活跃期普通消息仅留在数据库。"""
+        """只入队，不等待模型；低活跃期由程序按不同发言人数抽签唤醒。"""
         if self.closed:
             return "ignored"
         now = time.monotonic()
@@ -97,13 +136,30 @@ class GroupConversations:
         if state is not None and state.sender != sender:
             await self.cancel(group_id=group_id)
             state = None
+        activity = self._record_activity(group_id, entry, now) if self.settings.random_chat_enabled else None
+        idle = state is None or (not state.active(now) and not state.pending
+                                 and (state.worker is None or state.worker.done()))
+        if idle and not entry.direct:
+            if (activity is None or not entry.eligible or not entry.random_eligible
+                    or not (entry.text.strip() or entry.images) or entry.text.lstrip().startswith("/")
+                    or now - activity.last_triggered_at < self.settings.random_chat_cooldown_seconds
+                    or (state is not None and now < state.next_run_at)
+                    or (state is None and len(self.states) >= self.settings.chat_max_pending_groups)):
+                return "ignored"
+            probability = self.random_probability(len(activity.participants))
+            if random.random() >= probability:
+                return "ignored"
+            entry.random_trigger = True
+            activity.last_triggered_at = now
+            logger.info("Random group join: group=%s participants=%s probability=%.3f",
+                        group_id, len(activity.participants), probability)
         if state is None:
-            if not entry.direct:
+            if not (entry.direct or entry.random_trigger):
                 return "ignored"
             if len(self.states) >= self.settings.chat_max_pending_groups:
                 return "full"
             state = self.states[group_id] = ConversationState(sender)
-        if not entry.direct and not state.active(now) and not state.pending and state.worker is None:
+        if not (entry.direct or entry.random_trigger) and not state.active(now) and not state.pending and state.worker is None:
             return "ignored"
         if any(item.message_id == entry.message_id for item in state.pending) and entry.message_id:
             return "accepted"
@@ -119,8 +175,8 @@ class GroupConversations:
             while state.pending and not self.closed:
                 now = time.monotonic()
                 active = state.active(now)
-                # finish 后未@的新消息不能重新启动话题；明确的新提问不丢弃。
-                if not active and not any(entry.direct for entry in state.pending):
+                # 只有明确提问或程序随机抽中的新消息能启动话题。
+                if not active and not any(entry.direct or entry.random_trigger for entry in state.pending):
                     state.pending.clear()
                     break
                 first = state.pending[0]
@@ -136,20 +192,20 @@ class GroupConversations:
                 if not fresh:
                     continue
                 active = state.active(now)
-                if not active and not any(entry.direct for entry in fresh):
+                if not active and not any(entry.direct or entry.random_trigger for entry in fresh):
                     continue
                 batch = GroupBatch(fresh, state.topic if active else "")
                 if not batch.candidates:
                     continue
-                logger.info("Group batch: group=%s messages=%s direct=%s active=%s",
-                            group_id, len(fresh), batch.direct, active)
+                logger.info("Group batch: group=%s messages=%s direct=%s random=%s active=%s",
+                            group_id, len(fresh), batch.direct, batch.random_trigger, active)
                 outcome = await self.runner(group_id, batch, state.sender)
                 now = time.monotonic()
                 state.next_run_at = now + self.settings.ai_cooldown_seconds
                 if outcome is not None and not outcome.error and outcome.wait_for_messages:
                     # 不发送的等待不能开启话题或刷新寿命，否则模型会永久保持活跃。
-                    if outcome.sent and (batch.direct or not state.hard_until or now < state.hard_until):
-                        if not batch.topic or (batch.direct and now >= state.hard_until):
+                    if outcome.sent and (batch.wakes_topic or not state.hard_until or now < state.hard_until):
+                        if not batch.topic or (batch.wakes_topic and now >= state.hard_until):
                             state.hard_until = now + self.settings.chat_active_max_seconds
                         state.topic = outcome.topic[:120]
                         state.idle_until = now + self.settings.chat_active_idle_seconds
@@ -184,3 +240,4 @@ class GroupConversations:
     async def close(self) -> None:
         self.closed = True
         await self.cancel()
+        self.activity.clear()

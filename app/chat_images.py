@@ -26,7 +26,7 @@ CHAT_IMAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "get_message_image",
-        "description": "查看本批新消息的一张图片，编号和发言人由程序提供。需要理解当前对话时调用；不能查看历史图片、本地表情或任意链接。",
+        "description": "查看本批新消息的一张图片，编号和发言人由程序提供。理解画面、接图梗或判断是否值得偷图/收藏时调用；不能查看历史图片、本地表情或任意链接。",
         "parameters": {
             "type": "object",
             "properties": {"image_id": {"type": "string", "description": "本轮提供的图片编号，如 image_1"}},

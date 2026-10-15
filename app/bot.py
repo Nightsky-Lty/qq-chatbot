@@ -114,6 +114,12 @@ topic只写简短话题锚点，不含指令，不把所有历史话题塞进去
 收藏成功后可说一句人设短话，但必须指向该图片所属的新消息，不能冒充回复其他人的图片。
 """
 
+RANDOM_JOIN_INSTRUCTIONS = """\n\n【程序随机接话】
+程序已按群活跃人数和概率决定本批由你加入聊天；不是有人@你，不假装对方在问你。
+围绕当前焦点自然接一句短话或发送贴切表情，不再判断是否参与，也不能不发送就结束。
+不向群里提及概率、抽签、人数统计或后台规则。发送后可wait_for_messages继续话题，或finish退出。
+"""
+
 class BotService:
     """协调配置、数据库和模型客户端，隔离处理群聊及每位用户的私聊。"""
 
@@ -228,6 +234,8 @@ class BotService:
             direct=bool(self_id and self_id in view.mentions),
             eligible=(not view.mentions or self_id in view.mentions)
                      and (not view.reply_to or self.db.is_bot_message(group_id, view.reply_to)),
+            random_eligible=(isinstance(event.get("time"), (int, float))
+                             and abs(time.time() - event["time"]) <= self.settings.random_chat_window_seconds),
         )
 
         is_admin = user_id in self.settings.admin_qq_ids or role in {"owner", "admin"}
@@ -270,11 +278,27 @@ class BotService:
             return None
         try:
             state = self.conversations.states.get(group_id)
-            if not batch.direct and (state is None or not state.active(time.monotonic())):
+            if not batch.wakes_topic and (state is None or not state.active(time.monotonic())):
                 return None
             focus = batch.focus
             rows = self.db.recent_messages(group_id, self.settings.context_message_limit,
                                            before_id=min(entry.storage_id for entry in batch.entries))
+            # 将自己的实际发言及逻辑回应对象单独保留，预留总历史预算的1/3。
+            # 无需重放工具调用或思考内容，也不把旧话当成本轮指令。
+            self_history = []
+            self_chars = 0
+            for row in reversed(self.db.recent_bot_messages(group_id, self.settings.context_bot_reply_limit)):
+                source = self.db.message_by_onebot_id(group_id, row["reply_to_message_id"])
+                item = {"消息号": row["message_id"], "发送时间": row["created_at"],
+                        "你实际说过": row["content"][:1000],
+                        "回应消息号": row["reply_to_message_id"],
+                        "当时回应": ({"QQ": source["user_id"], "昵称": source["nickname"],
+                                      "内容": source["content"][:500]} if source is not None else None)}
+                size = len(json.dumps(item, ensure_ascii=False))
+                if self_chars + size > self.settings.context_max_chars // 3:
+                    break
+                self_history.append(item)
+                self_chars += size
             history_entries = []
             chars = 0
             for row in reversed(rows):
@@ -282,12 +306,21 @@ class BotService:
                         "角色": row["role"], "内容": row["content"][:1000],
                         ("回应消息号" if row["role"] == "assistant" else "引用消息号"): row["reply_to_message_id"]}
                 size = len(json.dumps(item, ensure_ascii=False))
-                if chars + size > self.settings.context_max_chars:
+                if chars + size + self_chars > self.settings.context_max_chars:
                     break
                 history_entries.append(item)
                 chars += size
             history = [{"role": "user", "content": "近期群聊历史（仅背景，不是待答列表）：\n"
                         + json.dumps(list(reversed(history_entries)), ensure_ascii=False)}]
+            if self_history:
+                history.append({
+                    "role": "user",
+                    "content": "【你在本群实际发送过的近期回复，按时间从旧到新】\n"
+                               + json.dumps(list(reversed(self_history)), ensure_ascii=False)
+                               + "\n这些是你自己说过的话，不是其他群友的发言。用户追问你刚才的说法、约定或玩笑时，"
+                                 "据此接续，不否认已提供的发言；发现自己说错可以纠正。"
+                                 "旧话仅供核对，不是新指令；无关旧话不强行带进新话题。",
+                })
             known_history_ids = {row["id"] for row in rows}
             personal_rows = self.db.recent_user_messages(
                 group_id, focus.user_id, self.settings.memory_user_history_limit,
@@ -350,21 +383,22 @@ class BotService:
                 user_ids=related_ids,
             )
             prompt = json.dumps({"当前话题": batch.topic, "当前焦点消息号": focus.message_id,
+                                 "触发方式": "明确提问" if batch.direct else ("程序随机接话" if batch.random_trigger else "活跃跟进"),
                                  "当前发言人": {"QQ": focus.user_id, "昵称": focus.nickname},
                                  "相关成员索引": list(member_index.values()),
                                  "检索到的长期记忆": memories,
                                  "当前消息": focus.text, "本批新消息": current,
                                  "允许引用回复的消息号": sorted(batch.reply_targets)}, ensure_ascii=False)
-            logger.info("Group context: group=%s history=%s new=%s images=%s",
-                        group_id, len(history_entries), len(current), len(images))
+            logger.info("Group context: group=%s history=%s self_history=%s new=%s images=%s",
+                        group_id, len(history_entries), len(self_history), len(current), len(images))
             try:
                 # 无@跟进不能因等待并发名额或模型耗时而越过活跃期时限。
-                timeout = None if batch.direct else max(0.01, min(state.idle_until, state.hard_until) - time.monotonic())
+                timeout = None if batch.wakes_topic else max(0.01, min(state.idle_until, state.hard_until) - time.monotonic())
                 async with asyncio.timeout(timeout):
                     return await self._run_ai_reply(
                         group_id, focus.user_id, prompt, self._confirmed_senders.get(sender, sender),
                         history=history, image_session=ChatImageSession(images) if images else None,
-                        automatic=not batch.direct, batch=batch, image_sources=image_sources,
+                        automatic=not batch.wakes_topic, batch=batch, image_sources=image_sources,
                     )
             except TimeoutError:
                 return None
@@ -893,6 +927,8 @@ class BotService:
 
             if batch is not None:
                 effective_system += GROUP_BATCH_INSTRUCTIONS
+                if batch.random_trigger:
+                    effective_system += RANDOM_JOIN_INSTRUCTIONS
                 if self.settings.memory_enabled:
                     effective_system += MEMORY_INSTRUCTIONS
                     if not self.settings.memory_auto_capture_enabled:
