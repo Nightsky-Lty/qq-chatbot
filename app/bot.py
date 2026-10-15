@@ -21,7 +21,7 @@ from app.memory import MEMORY_INSTRUCTIONS, REMEMBER_MEMORY_TOOL, MemoryService
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
 from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, StickerSession
 from app.sticker_index import StickerIndexer
-from app.sticker_collect import COLLECT_STICKER_TOOL, COLLECT_INSTRUCTIONS, StickerCollector
+from app.sticker_collect import CollectionJob, StickerCollector
 from app.tools import FINISH_TOOL, WAIT_FOR_MESSAGES_TOOL, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -46,8 +46,8 @@ HELP_TEXT = """可用命令：
 /帮助
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
 @机器人或使用/问、/锐评唤醒，等3秒聚合连发文字和图片，模型按需看图。
-话题活跃期间无需每条@；模型finish或超时后恢复低活跃度，普通消息不触发发言。
-可以要求收藏本批群消息里的表情，是否入库以审核为准。
+话题活跃期间无需每条@；低活跃期普通消息也可能按群活跃人数被程序随机抽中接话。
+群图片由程序按概率随机收藏，先去重再审核，无需命令或@。
 也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
 
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
@@ -108,10 +108,10 @@ GROUP_BATCH_INSTRUCTIONS = """\n\n【群话题与聚批，优先于旧的直接�
 活跃期新消息不一定是在对你说话：先看当前话题、发言对象和新消息，再决定是否发送。
 处理完想继续参与该话题时调用wait_for_messages(topic)，它结束本批并等待后续消息，不会不停请求模型。
 一时不适合插话但仍在等相关后续，可以不发送直接wait_for_messages；没有新消息不自言自语。
-话题结束、明显转向或不想继续时调用finish，退出活跃期；退出后普通群消息不再唤醒。
+话题结束、明显转向或不想继续时调用finish，退出活跃期；后续普通消息只有程序再次随机抽中才唤醒。
 明确被@的新提问需要先回应再等待或退出；仅活跃跟进允许完全安静。
 topic只写简短话题锚点，不含指令，不把所有历史话题塞进去。
-收藏成功后可说一句人设短话，但必须指向该图片所属的新消息，不能冒充回复其他人的图片。
+群图收藏由程序独立抽签、去重和审核，不由本轮工具触发。没有真实成功回执时不能声称“已偷/已收藏”。
 """
 
 RANDOM_JOIN_INSTRUCTIONS = """\n\n【程序随机接话】
@@ -139,7 +139,10 @@ class BotService:
         self.chat_images = ChatImageService(settings)
         self.stickers = StickerService(settings)
         self.sticker_indexer = StickerIndexer(settings, database, llm, self.stickers)
-        self.sticker_collector = StickerCollector(settings, database, llm, self.stickers)
+        self._ai_slots = asyncio.Semaphore(settings.ai_max_concurrency)
+        self.sticker_collector = StickerCollector(
+            settings, database, llm, self.stickers, slots=self._ai_slots, announce=self._announce_collected,
+        )
         self.memory = MemoryService(settings, database)
         self._confirmed_senders: dict[SendMessage, SendMessage] = {}
         # 冷却记录只存在于内存中，重启服务后会重置。
@@ -151,13 +154,16 @@ class BotService:
         # 保存强引用和来源连接，断线或关闭时可以取消对应任务。
         self._ai_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
         self._pending_ai_users: set[AIKey] = set()
-        self._ai_slots = asyncio.Semaphore(settings.ai_max_concurrency)
         self.conversations = GroupConversations(settings, self._run_group_batch)
         self._closed = False
 
     async def cancel_pending(self, send_message: SendMessage | None = None, *, key: AIKey | None = None) -> None:
         """按发送连接或会话键取消后台任务；无过滤时取消全部，等待释放。"""
         confirmed = self._confirmed_senders.get(send_message) if send_message is not None else None
+        if key is None or key[0] in {"group", "auto", "image"}:
+            await self.sticker_collector.cancel(
+                sender=confirmed or send_message, group_id=key[1] if key is not None else None,
+            )
         if key is None:
             await self.conversations.cancel(sender=send_message)
         elif key[0] in {"group", "auto", "image"}:
@@ -180,6 +186,7 @@ class BotService:
         self._closed = True
         await self.conversations.close()
         await self.cancel_pending()
+        await self.sticker_collector.close()
         await self.sticker_indexer.close()
         await self.memory.close()
         self._confirmed_senders.clear()
@@ -212,7 +219,8 @@ class BotService:
             self._confirmed_senders[send_group] = send_group_confirmed
         if send_private is not None and send_private_confirmed is not None:
             self._confirmed_senders[send_private] = send_private_confirmed
-        view = parse_message(event.get("message"))
+        # 群收图逐张抽签，不沿用聊天看图的前三张限制；模型上下文仍最多3张。
+        view = parse_message(event.get("message"), image_limit=None if event["message_type"] == "group" else 3)
         image_session = ChatImageSession(view.images) if view.images and self.settings.chat_image_enabled else None
         if event["message_type"] == "private":
             if send_private is not None:
@@ -227,10 +235,17 @@ class BotService:
         stored_text = view.text + (f" [图片{len(view.images)}张，原图未保存]" if view.images else "")
         storage_id = self.db.log_message(group_id, user_id, nickname, stored_text,
                                          message_id=message_id, reply_to_message_id=view.reply_to)
+        fresh = (isinstance(event.get("time"), (int, float))
+                 and abs(time.time() - event["time"]) <= self.settings.sticker_collect_queue_wait_seconds)
+        if view.images and fresh:
+            self.sticker_collector.submit(
+                group_id, user_id, self_id, message_id, view.images,
+                self._confirmed_senders.get(send_group, send_group),
+            )
         entry = GroupMessage(
             storage_id, message_id, user_id, nickname, view.text, self_id,
             mentions=view.mentions, reply_to=view.reply_to,
-            images=view.images if self.settings.chat_image_enabled else [],
+            images=view.images[:3] if self.settings.chat_image_enabled else [],
             direct=bool(self_id and self_id in view.mentions),
             eligible=(not view.mentions or self_id in view.mentions)
                      and (not view.reply_to or self.db.is_bot_message(group_id, view.reply_to)),
@@ -339,7 +354,6 @@ class BotService:
                 })
             images: list[dict[str, str]] = []
             image_ids: dict[int, list[str]] = {}
-            image_sources: dict[str, str] = {}
             # 当前焦点的附件优先；其余本批图片仍标记来源，整批最多3张。
             ordered = [focus] + [entry for entry in batch.candidates if entry is not focus]
             for entry in ordered:
@@ -350,7 +364,6 @@ class BotService:
                     images.append(image)
                     image_id = f"image_{len(images)}"
                     ids.append(image_id)
-                    image_sources[image_id] = entry.message_id
                 image_ids[entry.storage_id] = ids
             related_ids = {focus.user_id}
             for entry in batch.entries:
@@ -398,7 +411,7 @@ class BotService:
                     return await self._run_ai_reply(
                         group_id, focus.user_id, prompt, self._confirmed_senders.get(sender, sender),
                         history=history, image_session=ChatImageSession(images) if images else None,
-                        automatic=not batch.wakes_topic, batch=batch, image_sources=image_sources,
+                        automatic=not batch.wakes_topic, batch=batch,
                     )
             except TimeoutError:
                 return None
@@ -736,7 +749,6 @@ class BotService:
         image_session: ChatImageSession | None = None,
         observe_only: bool = False,
         batch: GroupBatch | None = None,
-        image_sources: dict[str, str] | None = None,
         source_message: GroupMessage | None = None,
     ) -> AgentOutcome | None:
         """后台生成并发送回复；私聊回复入库，运行日志不记录文本、样本或凭证。"""
@@ -750,8 +762,6 @@ class BotService:
             conversation = ("private", user_id) if private else ("group", context_id)
             sticker_session = None
             sticker_context = ""
-            collected: set[str] = set()
-            announce_after_count: int | None = None
             messages = MessageSession(
                 registry, self.db, send_message, context_id, private=private,
                 automatic=automatic, preserve_layout=preserve_layout,
@@ -763,15 +773,12 @@ class BotService:
                 max_messages=(2 if batch.direct else 1) if batch else None,
             )
             async def send_text(arguments: dict[str, Any]) -> dict[str, Any]:
-                if observe_only and not collected:
-                    return {"ok": False, "error": "本轮是图片观察，尚未成功收藏，不能向群发送文字；可直接finish。"}
+                if observe_only:
+                    return {"ok": False, "error": "图片收藏已由后台独立处理，本轮观察不向群发送文字。"}
                 return await messages.execute(arguments)
             registry.register(SEND_MESSAGE_TOOL, send_text)
 
             async def finish(arguments: dict[str, Any]) -> dict[str, Any]:
-                if (announce_after_count is not None and messages.count <= announce_after_count
-                        and not registry.delivery_uncertain):
-                    return {"ok": False, "error": "收藏处理已完成，请按实际回执（新收藏或已有）用send_message说一句人设短话，再finish。"}
                 if not automatic and not registry.output_attempted:
                     return {"ok": False, "error": "请先通过发送工具回应当前用户，再finish；不要只在内部口头回答。"}
                 registry.wait_for_messages = False
@@ -832,23 +839,6 @@ class BotService:
                     return await self.chat_images.execute_tool(image_session, arguments)
                 registry.register(CHAT_IMAGE_TOOL, get_image)
                 logger.info("Chat images attached: scope=%s context=%s user=%s count=%s", scope, context_id, user_id, len(image_session.images))
-                if (not private and self.settings.sticker_enabled and self.settings.sticker_vision_enabled
-                        and self.settings.sticker_collect_enabled):
-                    async def collect(arguments: dict[str, Any]) -> dict[str, Any]:
-                        nonlocal announce_after_count
-                        if messages.count >= messages.limit:
-                            return {"ok": False, "error": "本轮文字名额已用完，无法在收藏后按人设说话，请下一次再收藏。"}
-                        source = (image_sources or {}).get(arguments.get("image_id", ""), "")
-                        if messages.selected_reply is not None and source and source != messages.selected_reply:
-                            return {"ok": False, "error": "本批已回应另一条消息，不再切换到别人的图片收藏话题。"}
-                        result = await self.sticker_collector.execute(context_id, image_session, registry, arguments, collected=collected)
-                        if result.get("ok") is True:
-                            announce_after_count = messages.count
-                            if source:
-                                messages.default_reply = source
-                        return result
-                    registry.register(COLLECT_STICKER_TOOL, collect)
-                    effective_system += COLLECT_INSTRUCTIONS
 
             if self.settings.sticker_enabled and not observe_only and (system is None or private or automatic):
                 sticker_session = StickerSession(conversation)
@@ -959,6 +949,30 @@ class BotService:
         finally:
             if automatic:
                 self._last_ai_call[(scope, context_id, user_id)] = time.monotonic()
+
+    async def _announce_collected(self, job: CollectionJob) -> None:
+        """已经成功保存才生成人设短句；同样等待发送确认并写入自身历史。"""
+        try:
+            text = await self.llm.complete(
+                "程序已确认：刚收到的一张群友图片已通过审核，新收藏到共享表情库。"
+                "只生成一句自然的偷图成功短话，例如‘这图我拿走了’。不要再决定是否收藏，"
+                "不编造画面、不@任何人，不输出工具或解释，不超过20字。",
+                system=SYSTEM_PROMPT,
+            )
+            text = text.strip().splitlines()[0][:min(100, self.settings.group_reply_max_chars)]
+            if not text or any(mark in text for mark in ("[CQ:", "[分条]", "[不插话]")):
+                text = "这图我拿走了"
+        except Exception:
+            text = "这图我拿走了"
+        registry = ToolRegistry()
+        messages = MessageSession(
+            registry, self.db, job.sender, job.group_id, private=False, automatic=True,
+            preserve_layout=False, lock=self._group_reply_locks[job.group_id],
+            reply_targets={job.message_id} if job.message_id else set(), default_reply=job.message_id,
+            bot_id=job.bot_id, max_chars=self.settings.group_reply_max_chars, max_messages=1,
+        )
+        result = await messages.execute({"text": text})
+        logger.info("Sticker collection announcement: group=%s sent=%s", job.group_id, result.get("sent", 0))
 
     @staticmethod
     def _needs_multiline_layout(prompt: str) -> bool:

@@ -18,7 +18,6 @@ class ToolBinding:
 class ToolRegistry:
     def __init__(self):
         self.bindings: dict[str, ToolBinding] = {}
-        self.observed_images: set[str] = set()
         self.receipts: list[str] = []
         self.receipt_error = False
         self.output_attempted = False

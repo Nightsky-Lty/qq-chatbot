@@ -107,7 +107,7 @@ class StickerIndexer:
             except (OSError, ValueError) as exc:
                 # 文件上传尚未完成、权限不足或无效格式只影响这一张。
                 logger.warning("Sticker file skipped: error=%s", type(exc).__name__)
-        # 扫描期间收藏工具可能新增文件，不能用旧扫描快照抹掉它的已审核索引。
+        # 扫描期间随机收图任务可能新增文件，不能用旧扫描快照抹掉已审核索引。
         added = {name: value for name, value in self.stickers.annotations.items()
                  if name not in active and name.startswith("collected:") and self.stickers.path_for_id(name).is_file()}
         self.stickers.annotations = {**added, **known}

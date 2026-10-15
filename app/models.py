@@ -6,7 +6,7 @@ from typing import Any
 
 @dataclass(slots=True)
 class MessageView:
-    """消息简化视图：文本、被 @ 用户，以及按顺序截取的前三张图片引用。"""
+    """消息简化视图：文本、被 @ 用户，以及当前图片引用。"""
 
     text: str = ""
     mentions: list[int] = field(default_factory=list)
@@ -15,7 +15,7 @@ class MessageView:
     reply_to: str = ""
 
 
-def parse_message(message: object) -> MessageView:
+def parse_message(message: object, *, image_limit: int | None = 3) -> MessageView:
     """解析数组消息中的文本、@ 和图片；纯字符串仅作文本，不解析 CQ 码。"""
     if isinstance(message, str):
         return MessageView(text=message.strip())
@@ -41,7 +41,7 @@ def parse_message(message: object) -> MessageView:
             if qq.isdigit():
                 mentions.append(int(qq))
                 text_parts.append(f"@{qq}")
-        elif kind == "image" and len(images) < 3:
+        elif kind == "image" and (image_limit is None or len(images) < image_limit):
             # 不将带签名的下载地址、文件路径或不可信 summary 暴露给模型。
             images.append({
                 "url": data.get("url", "")[:8193] if isinstance(data.get("url"), str) else "",
