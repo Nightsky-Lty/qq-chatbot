@@ -2,7 +2,11 @@ name: qq-chatbot
 
 services:
   bot:
-    build: .
+    build:
+      context: .
+      args:
+        # 国内服务器默认使用PyPI镜像；可在.env中覆盖或改回https://pypi.org/simple。
+        UV_DEFAULT_INDEX: ${UV_DEFAULT_INDEX:-https://mirrors.aliyun.com/pypi/simple}
     restart: unless-stopped
     init: true
     # 普通配置随 Git 更新；密钥和部署身份只从本地 .env 注入。

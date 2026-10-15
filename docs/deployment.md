@@ -114,7 +114,7 @@ sudo docker compose ps
 curl http://127.0.0.1:8080/health
 ```
 
-第一次构建需要下载 Python、uv、NapCat 镜像和 Python 依赖。机器人容器健康检查通过后，NapCat 才会启动。健康检查返回 `{"status":"ok"}` 仅代表 Python 服务已启动，不代表 QQ 已登录。
+第一次构建需要下载 Python、uv、NapCat 镜像和 Python 依赖。Compose 默认通过 `https://mirrors.aliyun.com/pypi/simple` 下载Python包；可在 `.env` 用 `UV_DEFAULT_INDEX` 覆盖，或设为 `https://pypi.org/simple` 使用官方源。机器人容器健康检查通过后，NapCat 才会启动。健康检查返回 `{"status":"ok"}` 仅代表 Python 服务已启动，不代表 QQ 已登录。
 
 镜像拉取失败时，先查看错误涉及 Docker Hub、GHCR 还是 PyPI，再处理对应网络问题；Docker 镜像下载由 Docker daemon 负责，不会自动使用终端的代理设置。NapCat 镜像版本在 `compose.yaml` 中维护。
 
