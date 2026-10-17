@@ -36,7 +36,12 @@ def addressing(mentions: list[int], reply: dict | None, *, bot_id: int, direct: 
         evidence.append("程序明确唤醒")
     else:
         target = "对象不明；可能广播、续接或群友间交流"
-    return {"对象判断": target, "元数据依据": evidence, "其他目标QQ": sorted(set(others))}
+    result = {"对象判断": target}
+    if evidence:
+        result["元数据依据"] = evidence
+    if others:
+        result["其他目标QQ"] = sorted(set(others))
+    return result
 
 
 def build_group_history(db: Database, settings: Settings, group_id: int, batch: GroupBatch) -> tuple[list[dict], list[dict]]:
@@ -85,11 +90,14 @@ def build_group_history(db: Database, settings: Settings, group_id: int, batch: 
         item = brief(row)
         mentions = json.loads(row.get("mentions_json", "[]"))
         target = by_message.get(row["reply_to_message_id"])
-        item.update({"@目标QQ": mentions, "回应消息号" if row["role"] == "assistant" else "引用消息号": row["reply_to_message_id"],
-                     "引用或回应原文": brief(target) if target else (
-                         {"消息号": row["reply_to_message_id"], "状态": "原文未找到"} if row["reply_to_message_id"] else None),
-                     "寻址": addressing(mentions, target, bot_id=bot_id),
-                     "身份说明": "你自己实际发送的消息" if row["role"] == "assistant" else "群友消息或动作背景"})
+        if mentions:
+            item["@目标QQ"] = mentions
+        if row["reply_to_message_id"]:
+            item["回应消息号" if row["role"] == "assistant" else "引用消息号"] = row["reply_to_message_id"]
+            item["引用或回应原文"] = brief(target) if target else {"消息号": row["reply_to_message_id"], "状态": "原文未找到"}
+        item["寻址"] = addressing(mentions, target, bot_id=bot_id)
+        if row["role"] == "assistant":
+            item["身份说明"] = "你自己实际发送的消息"
         cache[row["id"]] = item
     # 引用连接 + 相邻上下文一起选；预算不足跳过整个片段，不传单边半句。
     selected: set[int] = set()
@@ -105,12 +113,18 @@ def build_group_history(db: Database, settings: Settings, group_id: int, batch: 
                         if pool[i]["reply_to_message_id"] in by_message]
             unit.update(frontier)
         extra = unit - selected
-        size = sum(len(json.dumps(cache[i], ensure_ascii=False)) for i in extra)
+        size = sum(len(json.dumps(cache[i], ensure_ascii=False, separators=(",", ":"))) for i in extra)
         if used + size <= settings.context_max_chars - 300:
             selected.update(extra)
             used += size
     timeline = [cache[i] for i in sorted(selected)]
+    for record_id in selected:
+        target = by_message.get(pool[record_id]["reply_to_message_id"])
+        if target is not None and target["id"] in selected:
+            # 正文已在同一时间线内，保留明确索引和作者，不为每次引用重复上传正文。
+            cache[record_id]["引用或回应原文"] = {"消息号": target["message_id"], "QQ": target["user_id"],
+                                                "本地记录ID": target["id"], "原文位置": "本时间线"}
     history = [{"role": "user", "content": "【已完成的群聊时间线，仅背景；相邻不代表同一话题】\n"
                + json.dumps({"机器人QQ": bot_id, "消息": timeline,
-                             "说明": "已合并自身历史并去重；引用关系为明确连接，未提供的寻址不确定。"}, ensure_ascii=False)}]
+                             "说明": "已去重；引用指向本时间线记录。缺省@/引用表示没有该元数据，不代表在找机器人。"}, ensure_ascii=False, separators=(",", ":"))}]
     return history, timeline

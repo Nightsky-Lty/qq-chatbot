@@ -1,11 +1,13 @@
 """每次请求独立的工具注册表：定义、参数校验和绑定的执行器。"""
 
 import logging
+import copy
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 logger = logging.getLogger(__name__)
+OUTPUT_TOOLS = {"send_message", "send_sticker", "send_voice", "send_poke"}
 
 
 @dataclass(slots=True)
@@ -26,6 +28,9 @@ class ToolRegistry:
         self.allow_silent = False
         self.wait_for_messages = False
         self.topic = ""
+        self.batch_completion_enabled = True
+        self.terminated = False
+        self.default_topic = "当前群聊"
 
     def register(self, definition: dict[str, Any], handler: Handler, *, terminal: bool = False) -> None:
         name = definition["function"]["name"]
@@ -35,13 +40,28 @@ class ToolRegistry:
 
     @property
     def definitions(self) -> list[dict[str, Any]]:
-        return [binding.definition for binding in self.bindings.values()]
+        return [self._definition(binding) for binding in self.bindings.values()]
+
+    def _definition(self, binding: ToolBinding) -> dict[str, Any]:
+        if not self.batch_completion_enabled or binding.definition["function"]["name"] not in OUTPUT_TOOLS:
+            return binding.definition
+        definition = copy.deepcopy(binding.definition)
+        properties = definition["function"]["parameters"]["properties"]
+        actions = ["continue"] + (["finish"] if "finish" in self.bindings else []) + (["wait"] if "wait_for_messages" in self.bindings else [])
+        properties["next_action"] = {"type": "string", "enum": actions,
+            "description": "最后一次发送用finish结束，或wait继续群话题；成功后程序直接收尾。省略/continue仍需后续决策。"}
+        if "wait_for_messages" in self.bindings:
+            properties["topic"] = {"type": "string", "minLength": 1, "maxLength": 120,
+                                   "description": "next_action=wait时必填的简短话题锚点。"}
+        return definition
 
     async def execute(self, name: str, arguments: Any) -> dict[str, Any]:
         binding = self.bindings.get(name)
+        if self.terminated:
+            return {"ok": False, "error": "本轮已结束，不再执行动作。"}
         if binding is None or not isinstance(arguments, dict):
             return {"ok": False, "error": "当前会话未注册该工具或参数不是对象。"}
-        schema = binding.definition["function"]["parameters"]
+        schema = self._definition(binding)["function"]["parameters"]
         properties = schema.get("properties", {})
         if (set(schema.get("required", [])) - arguments.keys()
                 or (schema.get("additionalProperties") is False and arguments.keys() - properties.keys())):
@@ -49,6 +69,8 @@ class ToolRegistry:
         for key, value in arguments.items():
             spec = properties.get(key, {})
             kind = spec.get("type")
+            if "enum" in spec and value not in spec["enum"]:
+                return {"ok": False, "error": "工具参数不在允许值内。"}
             if ((kind == "string" and not isinstance(value, str))
                     or (kind == "integer" and type(value) is not int)
                     or (kind == "boolean" and type(value) is not bool)):
@@ -57,9 +79,28 @@ class ToolRegistry:
                 return {"ok": False, "error": "工具参数长度超出限制。"}
             if type(value) is int and not spec.get("minimum", value) <= value <= spec.get("maximum", value):
                 return {"ok": False, "error": "工具参数数值超出限制。"}
+        handler_arguments = dict(arguments)
+        next_action = "continue"
+        topic = None
+        if self.batch_completion_enabled and name in OUTPUT_TOOLS:
+            next_action = handler_arguments.pop("next_action", "continue")
+            topic = handler_arguments.pop("topic", None)
+            if next_action == "wait" and ("wait_for_messages" not in self.bindings or not isinstance(topic, str) or not topic.strip()):
+                return {"ok": False, "error": "wait需要提供本轮可用的等待工具和非空topic；尚未发送。"}
+            if topic is not None and next_action != "wait":
+                return {"ok": False, "error": "topic只用于next_action=wait；尚未发送。"}
         logger.info("Agent action: tool=%s", name)
         try:
-            return await binding.handler(arguments)
+            result = await binding.handler(handler_arguments)
+            if result.get("ok") is True and binding.terminal:
+                self.terminated = True
+            if result.get("ok") is True and next_action != "continue":
+                terminal = "wait_for_messages" if next_action == "wait" else "finish"
+                completion = await self.execute(terminal, {"topic": topic.strip()} if next_action == "wait" else {})
+                result = {**result, "next_action": next_action, "completed": completion.get("ok") is True}
+                if completion.get("ok") is not True:
+                    result["completion_error"] = completion.get("error", "收尾失败，请依据回执继续。")
+            return result
         except Exception as exc:
             # 不输出参数、聊天数据、文件路径、API响应或签名URL。
             logger.warning("Agent tool failed: tool=%s error=%s", name, type(exc).__name__)

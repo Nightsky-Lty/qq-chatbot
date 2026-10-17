@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     agent_max_steps: int = Field(default=8, ge=2, le=16)
     agent_max_tool_calls: int = Field(default=16, ge=4, le=32)
     agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
+    agent_batch_completion_enabled: bool = True
     # 无Key的Bing网页搜索；公网只读抓取，共用全局并发上限2。
     web_search_enabled: bool = True
     web_search_max_results: int = Field(default=5, ge=1, le=8)

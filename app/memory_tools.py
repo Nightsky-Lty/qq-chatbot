@@ -21,11 +21,15 @@ def register_memory_tools(registry: ToolRegistry, capture: MemoryCapture, namesp
                           "parameters": {"type": "object", "properties": properties,
                                          "required": required, "additionalProperties": False}}}, handler)
 
+    def compact_memories(rows):
+        # 自动上下文已经提供必要背景；按需查询只保留可用来源，不重复返回空字段。
+        return [{k: v for k, v in row.items() if v is not None and v != "" and v != []} for row in rows]
+
     async def search(arguments):
         query = arguments["query"].strip()
         if not query:
             return {"ok": False, "error": "查询词不能为空"}
-        return {"ok": True, "memories": await capture.memory.retrieve(namespace, query, user_ids={user_id})}
+        return {"ok": True, "memories": compact_memories(await capture.memory.retrieve(namespace, query, user_ids={user_id}))}
 
     own_text = "\n".join(r["content"] for r in sources if r["role"] == "user"
                          and capture._subject(namespace, r) == user_id)

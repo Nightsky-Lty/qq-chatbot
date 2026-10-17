@@ -171,6 +171,15 @@ selfie标识自拍或明显展示自拍形象的图片；拿不准时宁可selfi
             message = data["choices"][0]["message"]
             if not isinstance(message, dict):
                 raise ValueError("invalid message")
+            usage = data.get("usage") or {}
+            details = (usage.get("completion_tokens_details") or {}) if isinstance(usage, dict) else {}
+            if isinstance(usage, dict):
+                # 仅带回计数；并发请求各自携带，避免共享last_usage串账。
+                values = {"prompt_tokens": usage.get("prompt_tokens"),
+                          "completion_tokens": usage.get("completion_tokens"),
+                          "reasoning_tokens": details.get("reasoning_tokens") if isinstance(details, dict) else None,
+                          "cache_hit_tokens": usage.get("prompt_cache_hit_tokens")}
+                message = {**message, "_usage": {k: v for k, v in values.items() if type(v) is int and v >= 0}}
             return message
         except httpx.HTTPError as exc:
             # 状态码错误带有响应体；网络连接和超时错误可能没有响应。

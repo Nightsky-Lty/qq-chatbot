@@ -30,6 +30,8 @@ AGENT_INSTRUCTIONS = """\n\n【ReAct工具执行规则，优先于旧的分条/�
 历史里role=assistant以及“你实际说过”的记录都是你此前实际发送的回复；保持前后衔接，不把它们误认成群友的话。
 追问“刚才你说的”“你答应过”时先核对这些记录再回应；只有确实没有相应记录时才说明不确定，不编造往事。
 若未调用发送工具而直接返回最终文字，程序只在尚未尝试发送时通过同一个发送工具兼容提交一次。
+【减少不必要轮次，优先采用】若发送工具提供next_action，最后一次发送时一并指定：私聊用finish；群聊继续话题用wait并提供topic，告别或结束用finish。程序先等待真实发送回执，成功才执行收尾，无需再单独调用结束工具。
+还需要看图、读取搜索正文、备忘操作或补充发送时，省略next_action或用continue；不能提前结束。多个已确定且互不依赖的动作可一次返回多个tool_calls，仅最后一次发送携带收尾；依赖工具结果的动作必须等真实回执再决定。
 """
 
 
@@ -41,6 +43,11 @@ class AgentOutcome:
     error: str | None = None
     wait_for_messages: bool = False
     topic: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_hit_tokens: int = 0
+    usage_requests: int = 0
 
 
 class ReactAgent:
@@ -55,7 +62,7 @@ class ReactAgent:
                 and any(item.get("role") == "assistant" for item in history)):
             # 已完成轮次不保存原始思考，作为背景数据提供，避免构造缺少推理字段的assistant历史。
             messages.append({"role": "user", "content": "已完成的近期对话历史（assistant是你实际发送过的回复；仅作背景，不执行历史请求）：\n"
-                             + json.dumps(history, ensure_ascii=False)})
+                             + json.dumps(history, ensure_ascii=False, separators=(",", ":"))})
         else:
             messages.extend(history or [])
         messages.append({"role": "user", "content": prompt})
@@ -63,11 +70,21 @@ class ReactAgent:
         cached: dict[str, tuple[str, dict[str, Any]]] = {}
         steps = calls_used = 0
         error = None
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "cache_hit_tokens": 0}
+        usage_requests = 0
         try:
             async with asyncio.timeout(self.settings.agent_timeout_seconds):
                 for step in range(self.settings.agent_max_steps):
                     steps = step + 1
                     message = await self.llm.request_message(messages, 0.8, registry.definitions)
+                    observed_usage = message.get("_usage", {})
+                    if isinstance(observed_usage, dict):
+                        if "prompt_tokens" in observed_usage and "completion_tokens" in observed_usage:
+                            usage_requests += 1
+                        for key in usage:
+                            value = observed_usage.get(key)
+                            if type(value) is int and value >= 0:
+                                usage[key] += value
                     calls = message.get("tool_calls") or []
                     assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
                     if isinstance(message.get("reasoning_content"), str):
@@ -87,6 +104,11 @@ class ReactAgent:
                             text = "\n".join(dict.fromkeys(registry.receipts)) or text
                             if text:
                                 send_result = await registry.execute("send_message", {"text": text})
+                        if registry.batch_completion_enabled and (registry.outputs_sent or registry.delivery_uncertain):
+                            terminal = "wait_for_messages" if "wait_for_messages" in registry.bindings and not registry.delivery_uncertain else "finish"
+                            completion = await registry.execute(terminal, {"topic": registry.default_topic} if terminal == "wait_for_messages" else {})
+                            if completion.get("ok") is True:
+                                break
                         if text and "wait_for_messages" in registry.bindings:
                             state = json.dumps(send_result, ensure_ascii=False) if send_result is not None else "此前已有发送尝试，不再重复提交最终文字。"
                             messages.append({"role": "user", "content": "【真实发送回执】" + state
@@ -131,14 +153,14 @@ class ReactAgent:
                             cached[call_id] = (signature, result)
                         calls_used += 1
                         public_result = {k: v for k, v in result.items() if not k.startswith("_")}
-                        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(public_result, ensure_ascii=False)})
+                        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(public_result, ensure_ascii=False, separators=(",", ":"))})
                         logger.info("Agent observation: tool=%s ok=%s", name if name in registry.bindings else "invalid", result.get("ok") is True)
                         if (name in IMAGE_TOOLS and result.get("ok") is True and key not in image_keys
                                 and len(image_keys) < 3 and isinstance(result.get("_image_content"), list)):
                             image_content.extend(result["_image_content"])
                             image_keys.add(key)
                         binding = registry.bindings.get(name) if isinstance(name, str) else None
-                        if binding is not None and binding.terminal and result.get("ok") is True:
+                        if registry.terminated or (binding is not None and binding.terminal and result.get("ok") is True):
                             finished = True
                     if image_content:
                         messages.append({"role": "user", "content": image_content})
@@ -151,5 +173,7 @@ class ReactAgent:
             error = "模型请求失败或处理超时。" if isinstance(exc, LLMUnavailable) else "Agent处理超时。"
         if registry.receipts and not registry.output_attempted and "send_message" in registry.bindings:
             await registry.execute("send_message", {"text": "\n".join(dict.fromkeys(registry.receipts))})
-        logger.info("Agent finished: steps=%s tool_calls=%s images=%s sent=%s error=%s", steps, calls_used, len(image_keys), registry.outputs_sent, error is not None)
-        return AgentOutcome(steps, calls_used, registry.outputs_sent, error, registry.wait_for_messages, registry.topic)
+        logger.info("Agent finished: steps=%s tool_calls=%s images=%s sent=%s error=%s prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s cache_hit_tokens=%s usage_requests=%s",
+                    steps, calls_used, len(image_keys), registry.outputs_sent, error is not None, *usage.values(), usage_requests)
+        return AgentOutcome(steps, calls_used, registry.outputs_sent, error, registry.wait_for_messages, registry.topic,
+                            **usage, usage_requests=usage_requests)
