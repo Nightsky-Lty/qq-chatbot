@@ -302,8 +302,9 @@ class Database:
                 )
             if cursor_id is not None:
                 self.connection.execute(
-                    "UPDATE memory_capture_state SET cursor_id=?,attempts=0,due_at=? WHERE namespace=?",
-                    (through_id, now + self.capture_delay, namespace),
+                    """UPDATE memory_capture_state SET cursor_id=?,attempts=0,
+                       due_at=CASE WHEN requested_id>? THEN ? ELSE ? END WHERE namespace=?""",
+                    (through_id, through_id, now, now + self.capture_delay, namespace),
                 )
 
     def forget_memory(self, namespace: int, subject: int, memory_id: int) -> bool:
