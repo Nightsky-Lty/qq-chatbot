@@ -1,13 +1,17 @@
 import copy
 import json
 import unittest
+import asyncio
+import tempfile
+from pathlib import Path
 
 import httpx
 
 from app.agent import ReactAgent
 from app.config import Settings
 from app.llm import DeepSeekClient
-from app.messaging import SEND_MESSAGE_TOOL
+from app.messaging import SEND_MESSAGE_TOOL, MessageSession
+from app.database import Database
 from app.tools import FINISH_TOOL, WAIT_FOR_MESSAGES_TOOL, ToolRegistry
 
 
@@ -105,6 +109,30 @@ class EfficiencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.steps, 2)
         self.assertEqual(delivered, ["rejected", "修正"])
         self.assertTrue(outcome.wait_for_messages)
+
+    async def test_uncertain_real_transport_never_retries_or_waits_as_success(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "db.sqlite")
+            tools = ToolRegistry()
+            attempts = []
+            async def sender(target, segments):
+                attempts.append(target)
+                raise TimeoutError("unconfirmed")
+            session = MessageSession(tools, db, sender, 11, private=True, automatic=False,
+                                     preserve_layout=False, lock=asyncio.Lock())
+            tools.register(SEND_MESSAGE_TOOL, session.execute)
+            async def finish(arguments):
+                return {"ok": tools.output_attempted}
+            tools.register(FINISH_TOOL, finish, terminal=True)
+            llm = ScriptedLLM([
+                calls(("send_message", {"text": "你好", "next_action": "finish"})),
+                calls(("send_message", {"text": "不能补发", "next_action": "finish"}), ("finish", {})),
+            ])
+            outcome = await ReactAgent(Settings(_env_file=None), llm).run("你好", tools, system="私聊")
+            self.assertEqual(attempts, [11])
+            self.assertEqual(outcome.sent, 0)
+            self.assertFalse(outcome.wait_for_messages)
+            db.close()
 
     async def test_no_actions_after_successful_fused_completion(self):
         tools, delivered = registry()
