@@ -950,7 +950,9 @@ class BotService:
                     registry.register(definition, web_handler)
                 effective_system += WEB_INSTRUCTIONS + (
                     f"\n本轮最多搜索{self.settings.web_search_max_calls}次，每次最多"
-                    f"{self.settings.web_search_max_results}条结果；读取{self.settings.web_fetch_max_calls}页，"
+                    f"{self.settings.web_search_max_results}条结果；每次搜索自动读取前最多"
+                    f"{self.settings.web_search_auto_fetch_pages}页，自动与手动共用本轮"
+                    f"{self.settings.web_fetch_max_calls}页总额度（失败也计），"
                     f"每页正文最多{self.settings.web_fetch_max_chars}字。重复请求复用本轮结果。"
                 )
 

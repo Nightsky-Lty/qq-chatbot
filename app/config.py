@@ -55,7 +55,9 @@ class Settings(BaseSettings):
     web_search_enabled: bool = True
     web_search_max_results: int = Field(default=5, ge=1, le=8)
     web_search_max_calls: int = Field(default=2, ge=1, le=4)
-    web_fetch_max_calls: int = Field(default=2, ge=1, le=4)
+    web_search_auto_fetch_pages: int = Field(default=2, ge=0, le=2)
+    # 自动读取与手动补读共用本轮总额度；默认首次自动读2页后还能补读2页。
+    web_fetch_max_calls: int = Field(default=4, ge=1, le=4)
     web_timeout_seconds: int = Field(default=15, ge=3, le=30)
     web_max_response_bytes: int = Field(default=1024 * 1024, ge=65536, le=5 * 1024 * 1024)
     web_fetch_max_chars: int = Field(default=6000, ge=1000, le=12000)
