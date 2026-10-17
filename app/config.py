@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     deepseek_reasoning_effort: Literal["low", "high", "max"] = "high"
     # 开启思考时包括推理与最终输出，避免旧500/1500上限截断工具调用。
     deepseek_thinking_max_tokens: int = Field(default=4096, ge=512, le=16384)
+    # 后台职责使用独立客户端；留空继承聊天连接，模型/思考可分别调整。
+    sticker_llm_model: str = ""
+    sticker_llm_base_url: str = ""
+    sticker_llm_api_key: str = ""
+    sticker_llm_thinking_enabled: bool = False
+    memory_llm_model: str = ""
+    memory_llm_base_url: str = ""
+    memory_llm_api_key: str = ""
+    memory_llm_thinking_enabled: bool = False
     # OneBot 连接认证与额外管理员；群主、群管理员的权限在业务层判断。
     onebot_access_token: str = ""
     # 跳过环境变量来源的自动 JSON 解码，由下面的校验器兼容两种输入格式。
@@ -61,6 +70,9 @@ class Settings(BaseSettings):
     memory_max_per_user: int = Field(default=200, ge=10, le=2000)
     memory_max_chars: int = Field(default=200, ge=20, le=500)
     memory_min_confidence: float = Field(default=0.8, ge=0.5, le=1.0)
+    memory_capture_delay_seconds: int = Field(default=30, ge=5, le=300)
+    memory_capture_batch_size: int = Field(default=40, ge=5, le=80)
+    memory_capture_retry_seconds: int = Field(default=60, ge=10, le=3600)
     # bge_onnx 使用只读挂载的本地 INT8 模型；加载或推理失败时自动退回哈希向量。
     embedding_provider: Literal["hash", "bge_onnx"] = "hash"
     embedding_model_path: Path = Path("/app/models/bge-small-zh-v1.5")

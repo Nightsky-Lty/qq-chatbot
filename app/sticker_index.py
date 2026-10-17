@@ -78,7 +78,7 @@ class StickerIndexer:
                     continue
                 if not self.stickers.auto_index_enabled:
                     continue
-                if not self.settings.deepseek_api_key or calls_used >= self.settings.sticker_index_batch_size:
+                if not self.llm.settings.deepseek_api_key or calls_used >= self.settings.sticker_index_batch_size:
                     continue
                 if not encoded:
                     actual_hash, mime, encoded = await asyncio.to_thread(self._read_snapshot, filename, signature)

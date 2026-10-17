@@ -105,6 +105,10 @@ rsync -av models/bge-small-zh-v1.5-int8/ 用户名@服务器IP:~/qq-chatbot/mode
 
 模型目录缺失或推理失败不会阻止启动，程序会自动退回特征哈希；模型就绪并重启机器人后会后台升级旧记忆向量。
 
+聊天、表情包入库标记与长期记忆提取使用独立LLM客户端。后台默认关闭思考，模型和地址留空继承聊天设置；可在 `config.env` 设置 `STICKER_LLM_MODEL` / `STICKER_LLM_BASE_URL`、`MEMORY_LLM_MODEL` / `MEMORY_LLM_BASE_URL`，独立凭证填服务器 `.env` 的 `STICKER_LLM_API_KEY`、`MEMORY_LLM_API_KEY`（留空继承聊天Key）。表情服务需支持视觉输入，记忆服务需支持JSON输出。群聊理解继续由聊天模型完成，没有额外前置理解调用。
+
+后台记忆默认合并30秒、每批最多40条新消息，也会处理未唤醒Agent的普通群文字及私聊，产生独立API费用。可用 `MEMORY_AUTO_CAPTURE_ENABLED=false` 关闭后台提取，仍可显式记住/忘掉；`MEMORY_ENABLED=false` 同时关闭相关工具和召回。SQLite自动迁移并保留旧记忆，首次启用只从新消息开始，不回扫全部旧聊天。升级前建议备份SQLite；失败任务及游标持久保存，重启后续跑。
+
 ## 5. 启动
 
 ```bash

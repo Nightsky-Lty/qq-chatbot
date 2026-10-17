@@ -134,7 +134,8 @@ class MessageSession:
                     else:
                         recorded = "".join(f"@{target} " for target in part_mentions) + part
                         self.db.log_message(self.target, self.bot_id, "机器人", recorded, role="assistant",
-                                            message_id=normalize_message_id(sent_id), reply_to_message_id=reply_to)
+                                            message_id=normalize_message_id(sent_id), reply_to_message_id=reply_to,
+                                            mentions=part_mentions)
             except Exception:
                 return {"ok": False, "error": "QQ发送未确认，本轮不自动重试。请结束，不能声称用户已收到。"}
             self.registry.delivery_uncertain = False

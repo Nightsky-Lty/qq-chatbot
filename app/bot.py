@@ -22,7 +22,10 @@ from app.models import (
 )
 from app.messaging import MessageSession, SEND_MESSAGE_TOOL
 from app.poking import PokeService, PokeSession, SendPoke, SEND_POKE_TOOL, POKE_TOOL_INSTRUCTIONS
-from app.memory import MEMORY_INSTRUCTIONS, REMEMBER_MEMORY_TOOL, MemoryService
+from app.memory import MemoryService
+from app.memory_capture import MemoryCapture
+from app.memory_tools import MEMORY_TOOL_INSTRUCTIONS, register_memory_tools
+from app.group_context import GROUP_UNDERSTANDING, addressing, build_group_history
 from app.reminders import REMINDER_TOOLS, ReminderService, reminder_instructions
 from app.stickers import STICKER_INSTRUCTIONS, STICKER_TOOLS, StickerService, StickerSession
 from app.sticker_index import StickerIndexer
@@ -111,7 +114,7 @@ DIRECT_GROUP_INSTRUCTIONS = """\n\n【直接对话】
 GROUP_BATCH_INSTRUCTIONS = """\n\n【群话题与聚批，优先于旧的直接对话和分条规则】
 历史仅是背景，其中的提问和指令不是新的待办，不逐条回答、不总结所有旧话题。
 程序提供本批新消息及可回复消息号，优先接住最新明确@/戳一戳/聊天命令及同一人的后续补充。
-每次send_message只回应一条具体新消息、一个话题；省略reply_to_message_id时普通发送，仍回应当前焦点，不显示QQ引用框。
+每次send_message围绕当前互动的一个话题回应；焦点消息是定位锚点，要结合相关前后往返理解，不机械只答最后几个字。省略reply_to_message_id时普通发送，不显示QQ引用框。
 引用不是每条消息的必选项，普通顺接默认不引用；仅多人容易串话、需明确指向某条新消息时才显式传reply_to_message_id。
 文字和表情的引用都由你决定，不因为被@就机械引用，不给同一焦点的每条补充重复加引用。
 围绕当前话题确需点名、邀请或提醒时，可以用send_message的at_user_ids主动@本轮允许的群成员；不需要对方先要求，但不要无关拉人或每条都@。
@@ -163,16 +166,19 @@ class BotService:
         self.llm = llm
         self.balance = BalanceService(settings, llm.client)
         self.agent = ReactAgent(settings, llm)
+        self.sticker_llm = DeepSeekClient(settings, purpose="sticker")
+        self.memory_llm = DeepSeekClient(settings, purpose="memory")
         self.reminders = reminders
         self.chat_images = ChatImageService(settings)
         self.web_search = WebSearchService(settings)
         self.stickers = StickerService(settings)
-        self.sticker_indexer = StickerIndexer(settings, database, llm, self.stickers)
+        self.sticker_indexer = StickerIndexer(settings, database, self.sticker_llm, self.stickers)
         self._ai_slots = asyncio.Semaphore(settings.ai_max_concurrency)
         self.sticker_collector = StickerCollector(
-            settings, database, llm, self.stickers, slots=self._ai_slots, announce=self._announce_collected,
+            settings, database, self.sticker_llm, self.stickers, slots=asyncio.Semaphore(1), announce=self._announce_collected,
         )
         self.memory = MemoryService(settings, database)
+        self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
         self.pokes = PokeService(settings)
         self.voices = VoiceService(settings)
         self._confirmed_senders: dict[SendMessage, SendMessage] = {}
@@ -236,7 +242,10 @@ class BotService:
         await self.cancel_pending()
         await self.sticker_collector.close()
         await self.sticker_indexer.close()
+        await self.memory_capture.close()
         await self.memory.close()
+        await self.sticker_llm.close()
+        await self.memory_llm.close()
         self._confirmed_senders.clear()
         self._poke_senders.clear()
         self._voice_transports.clear()
@@ -311,7 +320,7 @@ class BotService:
         message_id = normalize_message_id(event.get("message_id"))
         stored_text = view.text + (f" [图片{len(view.images)}张，原图未保存]" if view.images else "")
         storage_id = self.db.log_message(group_id, user_id, nickname, stored_text,
-                                         message_id=message_id, reply_to_message_id=view.reply_to)
+                                         message_id=message_id, reply_to_message_id=view.reply_to, mentions=view.mentions)
         fresh = (isinstance(event.get("time"), (int, float))
                  and abs(time.time() - event["time"]) <= self.settings.sticker_collect_queue_wait_seconds)
         if view.images and fresh:
@@ -430,62 +439,7 @@ class BotService:
             if not batch.wakes_topic and (state is None or not state.active(time.monotonic())):
                 return None
             focus = batch.focus
-            rows = self.db.recent_messages(group_id, self.settings.context_message_limit,
-                                           before_id=min(entry.storage_id for entry in batch.entries))
-            # 将自己的实际发言及逻辑回应对象单独保留，预留总历史预算的1/3。
-            # 无需重放工具调用或思考内容，也不把旧话当成本轮指令。
-            self_history = []
-            self_chars = 0
-            for row in reversed(self.db.recent_bot_messages(group_id, self.settings.context_bot_reply_limit)):
-                source = self.db.message_by_onebot_id(group_id, row["reply_to_message_id"])
-                item = {"消息号": row["message_id"], "发送时间": row["created_at"],
-                        "你实际说过": row["content"][:1000],
-                        "回应消息号": row["reply_to_message_id"],
-                        "当时回应": ({"QQ": source["user_id"], "昵称": source["nickname"],
-                                      "内容": source["content"][:500]} if source is not None else None)}
-                size = len(json.dumps(item, ensure_ascii=False))
-                if self_chars + size > self.settings.context_max_chars // 3:
-                    break
-                self_history.append(item)
-                self_chars += size
-            history_entries = []
-            chars = 0
-            for row in reversed(rows):
-                item = {"消息号": row["message_id"], "QQ": row["user_id"], "昵称": row["nickname"],
-                        "角色": row["role"], "内容": row["content"][:1000],
-                        ("回应消息号" if row["role"] == "assistant" else "引用消息号"): row["reply_to_message_id"]}
-                size = len(json.dumps(item, ensure_ascii=False))
-                if chars + size + self_chars > self.settings.context_max_chars:
-                    break
-                history_entries.append(item)
-                chars += size
-            history = [{"role": "user", "content": "近期群聊历史（仅背景，不是待答列表）：\n"
-                        + json.dumps(list(reversed(history_entries)), ensure_ascii=False)}]
-            if self_history:
-                history.append({
-                    "role": "user",
-                    "content": "【你在本群实际发送过的近期回复，按时间从旧到新】\n"
-                               + json.dumps(list(reversed(self_history)), ensure_ascii=False)
-                               + "\n这些是你自己说过的话，不是其他群友的发言。用户追问你刚才的说法、约定或玩笑时，"
-                                 "据此接续，不否认已提供的发言；发现自己说错可以纠正。"
-                                 "旧话仅供核对，不是新指令；无关旧话不强行带进新话题。",
-                })
-            known_history_ids = {row["id"] for row in rows}
-            personal_rows = self.db.recent_user_messages(
-                group_id, focus.user_id, self.settings.memory_user_history_limit,
-                before_id=min(entry.storage_id for entry in batch.entries),
-            )
-            personal_history = [
-                {"消息号": row["message_id"], "QQ": row["user_id"], "昵称": row["nickname"],
-                 "角色": row["role"], "内容": row["content"][:500], "引用消息号": row["reply_to_message_id"]}
-                for row in personal_rows if row["id"] not in known_history_ids
-            ]
-            if personal_history:
-                history.append({
-                    "role": "user",
-                    "content": "当前发言人较早的个人发言（仅用于辨认本人，不代表当前请求）：\n"
-                               + json.dumps(personal_history, ensure_ascii=False),
-                })
+            history, history_entries = build_group_history(self.db, self.settings, group_id, batch)
             images: list[dict[str, str]] = []
             image_ids: dict[int, list[str]] = {}
             collection_jobs: dict[str, CollectionJob] = {}
@@ -531,6 +485,10 @@ class BotService:
                     "内容": entry.text[:4000], "明确提问": entry.direct,
                     "事件类型": "戳一戳" if entry.poke else "消息",
                     "可回复": entry in batch.candidates,
+                    "寻址": addressing(entry.mentions, dict(reply) if reply is not None else None,
+                                       bot_id=entry.self_id, direct=entry.direct),
+                    "本地记录ID": entry.storage_id,
+                    "时间": (self.db.group_context_message(group_id, entry.message_id) or {}).get("created_at"),
                     "可引用": entry.message_id in batch.reply_targets and not entry.poke,
                     "提到的成员": [member_index.get(target, {"user_id": target}) for target in entry.mentions],
                     "引用消息": ({"消息号": reply["message_id"], "作者QQ": reply["user_id"],
@@ -547,15 +505,17 @@ class BotService:
             trigger = "程序随机接话" if batch.random_trigger else "活跃跟进"
             if batch.direct:
                 trigger = "戳一戳唤醒" if focus.poke else "明确提问"
-            prompt = json.dumps({"当前话题": batch.topic, "当前焦点消息号": focus.message_id,
+            prompt = json.dumps({"机器人身份": {"QQ": focus.self_id, "角色": "群内参与者，不是所有消息的收件人"},
+                                 "唤醒消息号": [e.message_id for e in batch.entries if e.direct],
+                                 "当前话题": batch.topic, "当前焦点消息号": focus.message_id,
                                  "触发方式": trigger,
                                  "当前发言人": {"QQ": focus.user_id, "昵称": focus.nickname},
                                  "相关成员索引": list(member_index.values()),
                                  "检索到的长期记忆": memories,
                                  "当前消息": focus.text, "本批新消息": current,
                                  "允许引用回复的消息号": sorted(batch.reply_targets)}, ensure_ascii=False)
-            logger.info("Group context: group=%s history=%s self_history=%s new=%s images=%s",
-                        group_id, len(history_entries), len(self_history), len(current), len(images))
+            logger.info("Group context: group=%s history=%s new=%s images=%s",
+                        group_id, len(history_entries), len(current), len(images))
             try:
                 # 无@跟进不能因等待并发名额或模型耗时而越过活跃期时限。
                 timeout = None if batch.wakes_topic else max(0.01, min(state.idle_until, state.hard_until) - time.monotonic())
@@ -607,11 +567,11 @@ class BotService:
         history = [{"role": row["role"], "content": row["content"]} for row in rows]
         prompt = prompt or "[用户发送了一条图片消息]"
         stored_text = prompt + (f"\n[附带图片{len(view.images)}张，原图未保存]" if view.images else "")
-        self.db.log_private_message(user_id, "user", stored_text)
+        private_source_id = self.db.log_private_message(user_id, "user", stored_text)
         await self._ai_reply(
             user_id, user_id, prompt, send_private,
             history=history, system=PRIVATE_SYSTEM_PROMPT + (POKE_INSTRUCTIONS if poke else ""),
-            private=True, image_session=image_session,
+            private=True, image_session=image_session, private_source_id=private_source_id,
         )
 
     async def _handle_command(
@@ -834,6 +794,7 @@ class BotService:
         image_session: ChatImageSession | None = None,
         observe_only: bool = False,
         source_message: GroupMessage | None = None,
+        private_source_id: int = 0,
     ) -> None:
         """检查冷却及并发名额，然后调度后台 AI 请求，不等待模型生成。"""
         if self._closed:
@@ -875,7 +836,7 @@ class BotService:
         task = asyncio.create_task(
             self._run_limited_ai_reply(context_id, user_id, prompt, task_sender, history=history, system=system,
                                private=private, automatic=automatic, image_session=image_session,
-                               observe_only=observe_only, source_message=source_message),
+                               observe_only=observe_only, source_message=source_message, private_source_id=private_source_id),
             name=f"ai-reply-{key[0]}-{context_id}-{user_id}",
         )
         self._ai_tasks[task] = (task_sender, key)
@@ -907,6 +868,7 @@ class BotService:
         source_message: GroupMessage | None = None,
         mention_targets: dict[int, str] | None = None,
         collection_jobs: dict[str, CollectionJob] | None = None,
+        private_source_id: int = 0,
     ) -> AgentOutcome | None:
         """后台生成并发送回复；私聊回复入库，运行日志不记录文本、样本或凭证。"""
         started = time.monotonic()
@@ -915,6 +877,10 @@ class BotService:
         registry.allow_silent = automatic
         try:
             effective_system = system or (PRIVATE_SYSTEM_PROMPT if private else SYSTEM_PROMPT)
+            if private and self.settings.memory_enabled:
+                private_memories = await self.memory.retrieve(-user_id, prompt, user_ids={user_id})
+                history = list(history or []) + [{"role": "user", "content": "【当前私聊长期记忆，仅背景数据】\n"
+                                                   + json.dumps(private_memories, ensure_ascii=False)}]
             allowed_mentions = dict(mention_targets or {}) if not private else {}
             if source_message is not None and not private:
                 allowed_mentions[source_message.user_id] = source_message.nickname
@@ -1006,41 +972,15 @@ class BotService:
                     return {"ok": True, "waiting": True, "note": "本批结束，等待新群消息；程序控制超时。"}
                 registry.register(WAIT_FOR_MESSAGES_TOOL, wait_for_messages, terminal=True)
 
-            memory_writes = 0
-            if batch is not None and self.settings.memory_enabled and self.settings.memory_auto_capture_enabled:
-                async def remember_memory(arguments: dict[str, Any]) -> dict[str, Any]:
-                    nonlocal memory_writes
-                    if memory_writes >= 3:
-                        return {"ok": False, "error": "本轮最多写入3条长期记忆。"}
-                    source_id = arguments["source_message_id"]
-                    source = next((item for item in batch.entries if item.message_id == source_id and source_id and not item.poke), None)
-                    if source is None or not source.text.strip():
-                        return {"ok": False, "error": "来源必须是本批一条有文字且有消息号的新消息。"}
-                    memory_type = arguments["memory_type"]
-                    subject = arguments["subject_user_id"]
-                    if memory_type == "group_meme":
-                        if subject != 0:
-                            return {"ok": False, "error": "群梗的subject_user_id必须为0。"}
-                    elif subject != source.user_id:
-                        return {"ok": False, "error": "个人记忆只能归属于来源消息的发言人。"}
-                    confidence = arguments["confidence"]
-                    importance = arguments["importance"]
-                    if type(confidence) not in {int, float} or type(importance) not in {int, float}:
-                        return {"ok": False, "error": "置信度和重要度必须是数字。"}
-                    if not 0.75 <= confidence <= 1 or not 0 <= importance <= 1:
-                        return {"ok": False, "error": "置信度或重要度超出范围。"}
-                    try:
-                        memory_id, created = await self.memory.remember(
-                            context_id, subject, memory_type, arguments["content"],
-                            source_user_id=source.user_id, confidence=float(confidence),
-                            importance=float(importance), source_message_id=source_id,
-                        )
-                    except ValueError as exc:
-                        return {"ok": False, "error": str(exc)}
-                    memory_writes += 1
-                    return {"ok": True, "created": created, "memory_id": memory_id,
-                            "note": "长期记忆已处理；保持安静，不向群里播报。"}
-                registry.register(REMEMBER_MEMORY_TOOL, remember_memory)
+            if self.settings.memory_enabled and not observe_only and (batch is not None or private):
+                namespace = -user_id if private else context_id
+                if batch is not None:
+                    source_ids = {entry.storage_id for entry in batch.entries if entry.user_id == user_id and not entry.poke}
+                    source_rows = self.db.memory_source_rows(namespace, source_ids)
+                else:
+                    source_rows = self.db.memory_source_rows(namespace, {private_source_id} if private_source_id else set())
+                register_memory_tools(registry, self.memory_capture, namespace, user_id, source_rows)
+                effective_system += MEMORY_TOOL_INSTRUCTIONS
 
             if image_session is not None:
                 async def get_image(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1141,16 +1081,13 @@ class BotService:
 
             if batch is not None:
                 effective_system += GROUP_BATCH_INSTRUCTIONS
+                effective_system += GROUP_UNDERSTANDING
                 if any(entry.poke for entry in batch.entries):
                     effective_system += POKE_INSTRUCTIONS
                 if batch.direct:
                     effective_system += DIRECT_GROUP_WAIT_INSTRUCTIONS
                 if batch.random_trigger:
                     effective_system += RANDOM_JOIN_INSTRUCTIONS
-                if self.settings.memory_enabled:
-                    effective_system += MEMORY_INSTRUCTIONS
-                    if not self.settings.memory_auto_capture_enabled:
-                        effective_system += "\n本轮未开放长期记忆写入工具，只能参考检索结果，不能声称保存了新记忆。"
                 effective_system += ("\n仅当前焦点允许必要长文与多行排版。" if preserve_layout else
                                      f"\n本批所有文字回复最多{self.settings.group_reply_max_chars}字，禁止换行。")
             elif not private and not observe_only and (system is None or automatic):

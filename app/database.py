@@ -127,6 +127,13 @@ CREATE TABLE IF NOT EXISTS sticker_annotations (
     next_attempt_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS memory_capture_state (
+    namespace INTEGER PRIMARY KEY,
+    cursor_id INTEGER NOT NULL,
+    requested_id INTEGER NOT NULL,
+    due_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -140,6 +147,8 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         # 绑定关键词时会嵌套调用持锁的名单查询，因此使用可重入锁。
         self._lock = threading.RLock()
+        self.capture_enabled = False
+        self.capture_delay = 30
         with self._lock:
             self.connection.executescript(SCHEMA)
         with self._lock, self.connection:
@@ -147,6 +156,8 @@ class Database:
             for name, default in (("message_id", ""), ("role", "user"), ("reply_to_message_id", "")):
                 if name not in columns:
                     self.connection.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
+            if "mentions_json" not in columns:
+                self.connection.execute("ALTER TABLE messages ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]'")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_onebot ON messages(group_id,message_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_group_role_id ON messages(group_id,role,id DESC)")
             memory_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(memories)")}
@@ -154,6 +165,10 @@ class Database:
                 ("hash_vector", "TEXT NOT NULL DEFAULT '{}'"),
                 ("embedding_model", "TEXT NOT NULL DEFAULT 'hash-blake2b-512-v1'"),
                 ("embedding_dimensions", "INTEGER NOT NULL DEFAULT 512"),
+                ("status", "TEXT NOT NULL DEFAULT 'active'"),
+                ("fact_key", "TEXT NOT NULL DEFAULT ''"),
+                ("sources_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("expires_at", "INTEGER NOT NULL DEFAULT 0"),
             )
             for name, definition in memory_migrations:
                 if name not in memory_columns:
@@ -198,6 +213,134 @@ class Database:
         """关闭数据库连接。"""
         with self._lock:
             self.connection.close()
+
+    def _queue_memory_capture(self, namespace: int, record_id: int) -> None:
+        """与消息入库同一事务排队；正群号、负私聊QQ构成互斥命名空间。"""
+        if not self.capture_enabled:
+            return
+        due = int(time.time()) + self.capture_delay
+        self.connection.execute(
+            """INSERT INTO memory_capture_state(namespace,cursor_id,requested_id,due_at)
+               VALUES(?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET
+               requested_id=max(requested_id,excluded.requested_id),
+               due_at=CASE WHEN cursor_id>=requested_id THEN excluded.due_at ELSE due_at END""",
+            (namespace, record_id - 1, record_id, due),
+        )
+
+    def capture_job(self) -> sqlite3.Row | None:
+        with self._lock:
+            return self.connection.execute(
+                """SELECT * FROM memory_capture_state WHERE cursor_id<requested_id AND due_at<=?
+                   ORDER BY due_at,namespace LIMIT 1""", (int(time.time()),),
+            ).fetchone()
+
+    def capture_messages(self, namespace: int, after_id: int, through_id: int, limit: int) -> list[dict]:
+        table, key, target = ("messages", "group_id", namespace) if namespace > 0 else ("private_messages", "user_id", -namespace)
+        with self._lock:
+            rows = self.connection.execute(
+                f"SELECT * FROM {table} WHERE {key}=? AND id>? AND id<=? ORDER BY id LIMIT ?",
+                (target, after_id, through_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def capture_retry(self, namespace: int, delay: int) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                "UPDATE memory_capture_state SET attempts=attempts+1,due_at=? WHERE namespace=?",
+                (int(time.time()) + delay, namespace),
+            )
+
+    def apply_memory_capture(self, namespace: int, cursor_id: int | None, through_id: int, actions: list[dict]) -> None:
+        """一次提交已校验候选与游标；失败重跑不产生部分提交或丢失新排队消息。"""
+        now = int(time.time())
+        table, key, target = ("messages", "group_id", namespace) if namespace > 0 else ("private_messages", "user_id", -namespace)
+        with self._lock, self.connection:
+            state = self.connection.execute("SELECT cursor_id FROM memory_capture_state WHERE namespace=?", (namespace,)).fetchone()
+            if cursor_id is not None and (state is None or state[0] != cursor_id):
+                raise ValueError("记忆任务状态已变化")
+            for action in actions:
+                # 删除/清理原始记录期间的在途任务不得重建已删除资料。
+                for source_id in action["source_ids"]:
+                    if self.connection.execute(f"SELECT 1 FROM {table} WHERE {key}=? AND id=?", (target, source_id)).fetchone() is None:
+                        raise ValueError("记忆来源已删除")
+                for old_id in action["replaces_ids"]:
+                    self.connection.execute(
+                        "UPDATE memories SET status=?,updated_at=? WHERE id=? AND group_id=? AND user_id=? AND status='active'",
+                        ("forgotten" if action["action"] == "forget" else "superseded", now,
+                         old_id, namespace, action["subject_user_id"]),
+                    )
+                if action["action"] == "forget":
+                    continue
+                self.connection.execute(
+                    "UPDATE memories SET status='superseded',updated_at=? WHERE group_id=? AND user_id=? AND fact_key=? AND status='active'",
+                    (now, namespace, action["subject_user_id"], action["fact_key"]),
+                )
+                self.connection.execute(
+                    """INSERT INTO memories(group_id,user_id,source_user_id,memory_type,content,vector,hash_vector,
+                       embedding_model,embedding_dimensions,importance,confidence,source_message_id,
+                       created_at,updated_at,status,fact_key,sources_json,expires_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?)
+                       ON CONFLICT(group_id,user_id,memory_type,content) DO UPDATE SET
+                       vector=excluded.vector,hash_vector=excluded.hash_vector,embedding_model=excluded.embedding_model,
+                       embedding_dimensions=excluded.embedding_dimensions,importance=excluded.importance,
+                       confidence=excluded.confidence,source_message_id=excluded.source_message_id,
+                       updated_at=excluded.updated_at,status='active',fact_key=excluded.fact_key,
+                       sources_json=excluded.sources_json,expires_at=excluded.expires_at""",
+                    (namespace, action["subject_user_id"], action["subject_user_id"], action["memory_type"],
+                     action["content"], action["vector"], action["hash_vector"], action["embedding_model"],
+                     action["embedding_dimensions"], action["importance"], action["confidence"],
+                     str(action["source_ids"][0]), now, now, action["fact_key"],
+                     json.dumps(action["sources"], ensure_ascii=False), action["expires_at"]),
+                )
+            # 保留旧版本作为审计；只对有效版本执行容量淘汰。
+            for subject in {action["subject_user_id"] for action in actions}:
+                self.connection.execute(
+                    """UPDATE memories SET status='archived' WHERE id IN (
+                       SELECT id FROM memories WHERE group_id=? AND user_id=? AND status='active'
+                       ORDER BY importance DESC,updated_at DESC,id DESC LIMIT -1 OFFSET ?)""",
+                    (namespace, subject, getattr(self, "memory_max_per_user", 200)),
+                )
+            if cursor_id is not None:
+                self.connection.execute(
+                    "UPDATE memory_capture_state SET cursor_id=?,attempts=0,due_at=? WHERE namespace=?",
+                    (through_id, now + self.capture_delay, namespace),
+                )
+
+    def forget_memory(self, namespace: int, subject: int, memory_id: int) -> bool:
+        with self._lock, self.connection:
+            result = self.connection.execute(
+                "UPDATE memories SET status='forgotten',updated_at=? WHERE id=? AND group_id=? AND user_id=? AND status='active'",
+                (int(time.time()), memory_id, namespace, subject),
+            )
+            return result.rowcount > 0
+
+    def group_context_rows(self, group_id: int, limit: int, before_id: int | None = None) -> list[dict]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM messages WHERE group_id=? AND (? IS NULL OR id<? OR role='assistant') ORDER BY id DESC LIMIT ?",
+                (group_id, before_id, before_id, limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def group_context_around(self, group_id: int, storage_id: int, before_id: int) -> list[dict]:
+        """个人旧发言补上前后相邻消息，避免只传一方的半段对话。"""
+        with self._lock:
+            left = self.connection.execute(
+                "SELECT * FROM messages WHERE group_id=? AND id<=? ORDER BY id DESC LIMIT 2", (group_id, storage_id),
+            ).fetchall()
+            right = self.connection.execute(
+                "SELECT * FROM messages WHERE group_id=? AND id>? AND id<? ORDER BY id LIMIT 2", (group_id, storage_id, before_id),
+            ).fetchall()
+        return [dict(row) for row in reversed(left)] + [dict(row) for row in right]
+
+    def group_context_message(self, group_id: int, message_id: str) -> dict | None:
+        if not message_id:
+            return None
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM messages WHERE group_id=? AND message_id=? ORDER BY id DESC LIMIT 1", (group_id, message_id),
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_sticker_annotation(self, content_hash: str) -> dict | None:
         """按内容哈希复用识别结果；不保存图片字节或私聊数据。"""
@@ -358,18 +501,22 @@ class Database:
 
     def log_message(
         self, group_id: int, user_id: int, nickname: str, content: str, *, message_id: str = "",
-        role: str = "user", reply_to_message_id: str = "",
+        role: str = "user", reply_to_message_id: str = "", mentions: list[int] | None = None,
     ) -> int:
         """保存群文本；assistant的reply_to字段记录逻辑回应对象，不代表实际显示QQ引用。"""
         if not content:
             return 0
         with self._lock, self.connection:
             cursor = self.connection.execute(
-                """INSERT INTO messages(group_id,user_id,nickname,content,created_at,message_id,role,reply_to_message_id)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (group_id, user_id, nickname, content[:4000], int(time.time()), message_id, role, reply_to_message_id),
+                """INSERT INTO messages(group_id,user_id,nickname,content,created_at,message_id,role,reply_to_message_id,mentions_json)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (group_id, user_id, nickname, content[:4000], int(time.time()), message_id, role, reply_to_message_id,
+                 json.dumps(mentions or [])),
             )
-            return int(cursor.lastrowid)
+            record_id = int(cursor.lastrowid)
+            if role in {"user", "assistant"} and not content.lstrip().startswith(("/", "[戳一戳", "[表情包")):
+                self._queue_memory_capture(group_id, record_id)
+            return record_id
 
     def upsert_group_member(self, group_id: int, user_id: int, display_name: str, role: str = "member") -> None:
         """以群号和 QQ 号维护稳定成员身份，并保留最近使用过的昵称。"""
@@ -514,6 +661,7 @@ class Database:
         with self._lock:
             return list(self.connection.execute(
                 f"""SELECT * FROM memories WHERE group_id=? AND user_id IN ({placeholders})
+                    AND status='active' AND (expires_at=0 OR expires_at>strftime('%s','now'))
                     ORDER BY updated_at DESC LIMIT ?""",
                 (group_id, *targets, limit),
             ))
@@ -597,15 +745,18 @@ class Database:
                 (group_id, message_id),
             ).fetchone() is not None
 
-    def log_private_message(self, user_id: int, role: str, content: str) -> None:
+    def log_private_message(self, user_id: int, role: str, content: str) -> int:
         """保存私聊用户文本或已提交发送的机器人回复，每条最多 4000 字。"""
         if not content:
-            return
+            return 0
         with self._lock, self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 "INSERT INTO private_messages(user_id,role,content,created_at) VALUES(?,?,?,?)",
                 (user_id, role, content[:4000], int(time.time())),
             )
+            if not content.lstrip().startswith(("/", "[戳一戳", "[表情包")):
+                self._queue_memory_capture(-user_id, int(cursor.lastrowid))
+            return int(cursor.lastrowid)
 
     def recent_private_messages(self, user_id: int, limit: int) -> list[sqlite3.Row]:
         """只读取该用户与机器人的私聊，按时间顺序返回角色和文本。"""
@@ -631,7 +782,20 @@ class Database:
         with self._lock, self.connection:
             messages = self.connection.execute("DELETE FROM private_messages WHERE user_id=?", (user_id,))
             reminders = self.connection.execute("DELETE FROM reminders WHERE user_id=?", (user_id,))
+            self.connection.execute("DELETE FROM memories WHERE group_id=?", (-user_id,))
+            self.connection.execute("DELETE FROM memory_capture_state WHERE namespace=?", (-user_id,))
             return messages.rowcount, reminders.rowcount
+
+    def memory_source_rows(self, namespace: int, ids: set[int]) -> list[dict]:
+        if not ids:
+            return []
+        table, key, target = ("messages", "group_id", namespace) if namespace > 0 else ("private_messages", "user_id", -namespace)
+        with self._lock:
+            rows = self.connection.execute(
+                f"SELECT * FROM {table} WHERE {key}=? AND id IN ({','.join('?' for _ in ids)}) ORDER BY id",
+                (target, *sorted(ids)),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def create_reminder(self, user_id: int, content: str, due_at: int, max_pending: int) -> tuple[sqlite3.Row, bool]:
         """创建持久提醒；同人同内容同时间的未完成提醒复用，防止工具重复调用。"""

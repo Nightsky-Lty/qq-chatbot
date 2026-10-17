@@ -20,10 +20,41 @@ class LLMUnavailable(RuntimeError):
 class DeepSeekClient:
     """复用异步 HTTP 客户端，发送非流式聊天请求并返回生成的文本。"""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, purpose: str = "chat"):
         """保存配置并创建请求超时为 45 秒的 HTTP 客户端。"""
+        if purpose not in {"chat", "sticker", "memory"}:
+            raise ValueError("unknown LLM purpose")
+        if purpose != "chat":
+            settings = settings.model_copy(update={
+                "deepseek_model": getattr(settings, f"{purpose}_llm_model") or settings.deepseek_model,
+                "deepseek_base_url": getattr(settings, f"{purpose}_llm_base_url") or settings.deepseek_base_url,
+                "deepseek_api_key": getattr(settings, f"{purpose}_llm_api_key") or settings.deepseek_api_key,
+                "deepseek_thinking_enabled": getattr(settings, f"{purpose}_llm_thinking_enabled"),
+            })
         self.settings = settings
         self.client = httpx.AsyncClient(timeout=45)
+
+    async def extract_memories(self, instructions: str, data: dict[str, Any]) -> dict[str, Any]:
+        """独立、无工具、JSON约束的记忆提取；不使用聊天人设。"""
+        if not self.settings.deepseek_api_key:
+            raise LLMUnavailable("记忆提取未配置API Key")
+        try:
+            response = await self.client.post(
+                f"{self.settings.deepseek_base_url.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
+                json={"model": self.settings.deepseek_model, "stream": False,
+                      **self._generation_options(0, 2500),
+                      "response_format": {"type": "json_object"},
+                      "messages": [{"role": "system", "content": instructions},
+                                   {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]},
+            )
+            response.raise_for_status()
+            value = json.loads(response.json()["choices"][0]["message"]["content"])
+            if not isinstance(value, dict):
+                raise ValueError("expected object")
+            return value
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMUnavailable("记忆提取请求失败或输出无效") from exc
 
     async def close(self) -> None:
         """服务退出时关闭客户端，释放连接资源。"""

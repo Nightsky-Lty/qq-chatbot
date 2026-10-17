@@ -16,6 +16,8 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?请先在 .env 中填写 DeepSeek API Key}
       ONEBOT_ACCESS_TOKEN: ${ONEBOT_ACCESS_TOKEN:?请先在 .env 中填写 OneBot Token}
       ADMIN_QQ_IDS: ${ADMIN_QQ_IDS:-}
+      STICKER_LLM_API_KEY: ${STICKER_LLM_API_KEY:-}
+      MEMORY_LLM_API_KEY: ${MEMORY_LLM_API_KEY:-}
       # 固定写入挂载目录，避免 .env 中的相对路径将数据库写进临时文件系统。
       DATABASE_PATH: /app/data/bot.db
       STICKER_DIRECTORY: /app/app/sticker_images

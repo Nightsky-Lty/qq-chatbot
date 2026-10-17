@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -24,7 +25,7 @@ from app.embeddings import (
 logger = logging.getLogger(__name__)
 
 
-MEMORY_TYPES = {"profile", "preference", "event", "relationship", "group_meme", "explicit"}
+MEMORY_TYPES = {"profile", "preference", "event", "relationship", "group_meme", "explicit", "episode", "commitment"}
 MEMORY_TYPE_LABELS = {
     "profile": "个人资料",
     "preference": "偏好",
@@ -32,6 +33,8 @@ MEMORY_TYPE_LABELS = {
     "relationship": "关系/称呼",
     "group_meme": "群梗",
     "explicit": "本人要求记住",
+    "episode": "共同经历",
+    "commitment": "双方约定（不代表已安排工具执行）",
 }
 
 # 自动写入不接受高风险隐私。用户也不应通过手动命令把这些内容变成长久提示词。
@@ -167,6 +170,7 @@ class MemoryService:
         now = int(time.time())
         ranked: list[tuple[float, Any]] = []
         normalized_query = "".join(query.casefold().split())
+        recall_interaction = bool(re.search(r"上次|之前|以前|约定|答应|说好|记得|回忆", query))
         for row in rows:
             use_dense = dense_query_vector is not None and row["embedding_model"] == self.provider.model_id
             similarity = vector_similarity(
@@ -186,16 +190,20 @@ class MemoryService:
                 row["memory_type"] in {"profile", "preference", "relationship", "explicit"}
                 and row["user_id"] in targets
             )
+            joint_recall = (recall_interaction and row["memory_type"] in {"episode", "commitment"}
+                            and row["user_id"] in targets)
             # 稳定档案始终可作为辨人背景；事件和群梗还需字面或语义相关，避免把
             # 某人的全部往事塞进每一轮上下文。
             semantically_related = use_dense and similarity >= self.settings.embedding_min_similarity
-            if not stable_for_person and not lexical_overlap and not exact and not semantically_related:
+            if not stable_for_person and not joint_recall and not lexical_overlap and not exact and not semantically_related:
                 continue
             score = similarity * 0.62 + row["importance"] * 0.13 + row["confidence"] * 0.08
             score += freshness * 0.05 + same_person + exact
             # 稳定档案即使和代词查询没有字面重合，也应进入当前成员上下文。
             if stable_for_person:
                 score += 0.12
+            if joint_recall:
+                score += 0.18
             ranked.append((score, row))
         selected = sorted(ranked, key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
         selected = selected[: limit or self.settings.memory_retrieval_limit]
@@ -209,6 +217,10 @@ class MemoryService:
                 "内容": row["content"],
                 "置信度": round(row["confidence"], 2),
                 "来源消息号": row["source_message_id"],
+                "记录时间": row["updated_at"],
+                "有效期": row["expires_at"] or None,
+                "来源摘录": [{"角色": source.get("role"), "内容": source.get("content", "")[:300],
+                              "时间": source.get("time")} for source in json.loads(row["sources_json"])],
             }
             for _, row in selected
         ]
