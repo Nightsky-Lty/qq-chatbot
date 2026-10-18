@@ -2,192 +2,286 @@ import asyncio
 import copy
 import json
 import unittest
-from unittest.mock import patch
 
 import httpx
 
 from app.agent import ReactAgent
 from app.config import Settings
-from app.safe_web import SafeWebClient, WebPage, WebUnavailable
 from app.tools import FINISH_TOOL, ToolRegistry
-from app.web_search import BING_SEARCH_URL, WEB_TOOLS, WEB_INSTRUCTIONS, WebSearchService, WebSession
+from app.web_search import DEEPSEEK_TOOLS_URL, WEB_TOOLS, WEB_INSTRUCTIONS, WebSearchService, WebSession, user_urls
 
 
 URLS = [f"https://example.com/article-{i}" for i in range(5)]
 
 
-def search_html(urls=URLS):
-    return "".join(f'<li class="b_algo"><h2><a href="{url}">标题{i}</a></h2>'
-                   f'<p>搜索摘要{i}</p></li>' for i, url in enumerate(urls))
+def rows(count=5, *, content=True):
+    return [{"title": f"标题{i}", "url": URLS[i], "snippet": "短摘要", "summary": "相关长摘要",
+             "content": "# 正文\n\n正文证据，不同于搜索摘要。" if content else "",
+             "site_name": "Example", "date": "2026-10-18T00:00:00Z", "authority": 3,
+             "rerank_score": 2.5} for i in range(count)]
 
 
-class FakeWeb:
-    def __init__(self, urls=URLS, failures=()):
-        self.urls, self.failures, self.calls = urls, failures, []
-        self.inflight = self.peak = 0
+class StubAPI:
+    def __init__(self):
+        self.search_rows = rows()
+        self.fetch_value = {"title": "页面标题", "content": "# Fetch正文\n\n补读证据。"}
+        self.requests = []
+        self.statuses = {}
+        self.override = {}
 
-    async def get(self, url):
-        self.calls.append(url)
-        if url.startswith(BING_SEARCH_URL + "?"):
-            return WebPage(url, search_html(self.urls), "text/html")
-        self.inflight += 1
-        self.peak = max(self.peak, self.inflight)
-        try:
-            # 让两个读取协程实际重叠，而非仅检查gather调用次数。
-            await asyncio.sleep(0)
-            if url in self.failures:
-                raise WebUnavailable("网页返回HTTP 403，可能受限。")
-            return WebPage(url, '<head><title>正文标题</title></head><nav>导航噪音</nav>'
-                           '<article><p>正文证据，不同于搜索摘要。</p></article>', "text/html")
-        finally:
-            self.inflight -= 1
+    async def __call__(self, request):
+        self.requests.append(request)
+        name = request.url.path.rsplit("/", 1)[-1]
+        value = self.override.get(name, {"results": self.search_rows} if name == "search" else self.fetch_value)
+        data = value if isinstance(value, bytes) else json.dumps(value, ensure_ascii=False).encode()
+        return httpx.Response(self.statuses.get(name, 200), headers={"content-type": "application/json"},
+                              stream=httpx.ByteStream(data))
 
 
 class WebSearchTests(unittest.IsolatedAsyncioTestCase):
     def setup_service(self, **settings):
-        service = WebSearchService(Settings(_env_file=None, **settings))
-        service.http = FakeWeb()
-        return service, WebSession()
+        api = StubAPI()
+        cfg = Settings(_env_file=None, deepseek_api_key="fake-test-key", **settings)
+        service = WebSearchService(cfg, transport=httpx.MockTransport(api))
+        service._request_interval = 0  # 除节流专项测试外，离线测试无需等待。
+        self.addAsyncCleanup(service.close)
+        return service, WebSession(), api
 
-    async def test_search_automatically_reads_two_pages_in_parallel(self):
-        service, session = self.setup_service()
-        result = await service.execute_tool(session, "web_search", {"query": "测试"})
+    async def search(self, service, session, query="测试"):
+        return await service.execute_tool(session, "web_search", {"query": query})
+
+    async def fetch(self, service, session, url=URLS[0]):
+        return await service.execute_tool(session, "web_fetch", {"url": url})
+
+    async def test_search_requests_official_api_with_reused_key_and_content(self):
+        service, session, api = self.setup_service(deepseek_base_url="https://chat-proxy.example.com/beta")
+        result = await self.search(service, session, "文档 site:python.org after:2025")
         self.assertTrue(result["ok"])
-        self.assertEqual(result["pages_read"], 2)
-        self.assertEqual([r["page_status"] for r in result["results"]],
-                         ["read", "read", "not_read", "not_read", "not_read"])
-        self.assertEqual(service.http.peak, 2)
-        self.assertEqual(session.fetch_calls, 2)
+        self.assertEqual(result["provider"], "deepseek")
+        self.assertEqual(result["pages_read"], 5)
+        self.assertEqual(session.fetch_calls, 0)
+        self.assertEqual(len(api.requests), 1)
+        request = api.requests[0]
+        self.assertEqual(str(request.url), DEEPSEEK_TOOLS_URL + "/search")
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.headers["authorization"], "Bearer fake-test-key")
+        self.assertEqual(json.loads(request.content), {
+            "query": "文档 site:python.org after:2025", "count": 5, "need_content": True})
         self.assertIn("正文证据", result["results"][0]["page"]["content"])
-        self.assertNotIn("导航噪音", result["results"][0]["page"]["content"])
-        self.assertIn("搜索摘要", result["results"][0]["snippet"])
+        self.assertIn("\n\n", result["results"][0]["page"]["content"])
+        self.assertEqual(result["results"][0]["date"], "2026-10-18T00:00:00Z")
+        self.assertEqual(result["results"][0]["authority"], 3)
 
-    async def test_search_and_manual_reads_reuse_success_and_failure_cache(self):
-        service, session = self.setup_service()
-        service.http.failures = {URLS[1]}
-        result = await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertEqual(result["pages_read"], 1)
-        self.assertEqual(result["results"][1]["page_status"], "failed")
-        self.assertNotIn("content", result["results"][1]["page"])
-        self.assertEqual(result, await service.execute_tool(session, "web_search", {"query": "测试"}))
-        for item in result["results"][:2]:
-            self.assertEqual(item["page"], await service.execute_tool(session, "web_fetch", {"url": item["url"]}))
-        self.assertEqual(len(service.http.calls), 3)
-        # 换关键词搜到相同页面，同样复用读取缓存。
-        again = await service.execute_tool(session, "web_search", {"query": "其他关键词"})
-        self.assertEqual(again["pages_read"], 1)
-        self.assertEqual(session.fetch_calls, 2)
-        self.assertEqual(len(service.http.calls), 4)
+    async def test_search_content_is_cached_and_never_triggers_extra_fetch(self):
+        service, session, api = self.setup_service()
+        result = await self.search(service, session)
+        for item in result["results"]:
+            self.assertEqual(await self.fetch(service, session, item["url"]), item["page"])
+        self.assertEqual(await self.search(service, session), result)
+        await self.search(service, session, "换关键词")
+        self.assertEqual(len(api.requests), 2)  # 两个Search，零Fetch。
+        self.assertEqual(session.fetch_calls, 0)
 
-    async def test_all_page_failures_preserve_search_and_disclose_snippets_only(self):
-        service, session = self.setup_service()
-        service.http.failures = set(URLS)
-        result = await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertTrue(result["ok"])
+    async def test_missing_content_is_only_fetched_when_model_requests_it(self):
+        service, session, api = self.setup_service()
+        api.search_rows = rows(content=False)
+        result = await self.search(service, session)
         self.assertEqual(result["pages_read"], 0)
+        self.assertTrue(all(item["page_status"] == "not_read" for item in result["results"]))
         self.assertIn("只有搜索摘要", result["note"])
-        self.assertEqual(session.fetch_calls, 2)
-        self.assertTrue(all(r["page_status"] == "failed" for r in result["results"][:2]))
-        # 初次自动读失败不耗尽默认总额度，允许手动补读其他来源。
-        service.http.failures = ()
-        self.assertTrue((await service.execute_tool(session, "web_fetch", {"url": URLS[2]}))["ok"])
-
-    async def test_automatic_and_manual_reads_share_budget_without_overrun(self):
-        service, session = self.setup_service(web_fetch_max_calls=3)
-        await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertTrue((await service.execute_tool(session, "web_fetch", {"url": URLS[2]}))["ok"])
-        self.assertFalse((await service.execute_tool(session, "web_fetch", {"url": URLS[3]}))["ok"])
-        service.http.urls = [URLS[3], URLS[4]]
-        result = await service.execute_tool(session, "web_search", {"query": "新问题"})
-        self.assertEqual(result["pages_read"], 0)
-        self.assertTrue(all(r["page_status"] == "not_read" for r in result["results"]))
-        self.assertTrue(all("额度" in r["page_note"] for r in result["results"]))
-        self.assertEqual(session.fetch_calls, 3)
-        self.assertNotIn(URLS[3], service.http.calls)
-
-    async def test_remaining_single_slot_and_disable_switch(self):
-        service, session = self.setup_service(web_fetch_max_calls=1)
-        result = await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertEqual(result["pages_read"], 1)
+        self.assertEqual(len(api.requests), 1)
+        page = await self.fetch(service, session)
+        self.assertTrue(page["ok"])
+        self.assertEqual(page["source"], "deepseek_fetch")
+        self.assertEqual(str(api.requests[-1].url), DEEPSEEK_TOOLS_URL + "/fetch")
+        self.assertEqual(json.loads(api.requests[-1].content), {"url": URLS[0]})
         self.assertEqual(session.fetch_calls, 1)
-        service, session = self.setup_service(web_search_auto_fetch_pages=0)
-        result = await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertEqual(result["pages_read"], 0)
-        self.assertEqual(session.fetch_calls, 0)
-        self.assertEqual(len(service.http.calls), 1)
-        self.assertTrue((await service.execute_tool(session, "web_fetch", {"url": URLS[0]}))["ok"])
+        self.assertEqual(page, await self.fetch(service, session))
+        self.assertEqual(len(api.requests), 2)
 
-    async def test_result_scope_and_response_length_preserved(self):
-        service, session = self.setup_service(web_fetch_max_chars=1000)
-        original = service.http.get
-        async def long_page(url):
-            if url.startswith(BING_SEARCH_URL + "?"):
-                return await original(url)
-            return WebPage(url, "正文" * 1000, "text/plain")
-        service.http.get = long_page
-        result = await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertEqual(len(result["results"][0]["page"]["content"]), 1000)
-        self.assertTrue(result["results"][0]["page"]["truncated"])
-        denied = await service.execute_tool(session, "web_fetch", {"url": "https://other.example.com/"})
-        self.assertFalse(denied["ok"])
-        self.assertEqual(session.fetch_calls, 2)
+    async def test_direct_user_link_does_not_search(self):
+        service, session, api = self.setup_service()
+        session.allowed_urls = user_urls([f"帮我读一下 {URLS[0]}。"])
+        self.assertTrue((await self.fetch(service, session))["ok"])
+        self.assertEqual(session.search_calls, 0)
+        self.assertEqual(len(api.requests), 1)
+        self.assertTrue(str(api.requests[0].url).endswith("/fetch"))
 
-    async def test_search_failure_does_not_fetch_and_is_cached(self):
-        service, session = self.setup_service()
-        async def captcha(url):
-            service.http.calls.append(url)
-            return WebPage(url, '<div id="b_captcha">验证码</div>', "text/html")
-        service.http.get = captcha
-        result = await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertFalse(result["ok"])
-        self.assertEqual(result, await service.execute_tool(session, "web_search", {"query": "测试"}))
-        self.assertEqual(session.fetch_calls, 0)
-        self.assertEqual(len(service.http.calls), 1)
-
-    async def test_single_result_empty_body_and_concurrent_duplicate_search(self):
-        service, session = self.setup_service()
-        service.http.urls = [URLS[0]]
-        left, right = await asyncio.gather(*(
-            service.execute_tool(session, "web_search", {"query": "同一问题"}) for _ in range(2)))
-        self.assertEqual(left, right)
-        self.assertEqual(left["pages_read"], 1)
+    async def test_search_and_fetch_budgets_are_independent(self):
+        service, session, api = self.setup_service(web_fetch_max_calls=1, web_search_max_calls=1)
+        api.search_rows = rows(content=False)
+        await self.search(service, session)
+        self.assertFalse((await self.search(service, session, "其他问题"))["ok"])
+        self.assertTrue((await self.fetch(service, session))["ok"])
+        self.assertFalse((await self.fetch(service, session, URLS[1]))["ok"])
+        self.assertTrue((await self.fetch(service, session))["ok"])  # 缓存不受已用完额度限制。
         self.assertEqual(session.search_calls, 1)
         self.assertEqual(session.fetch_calls, 1)
-        service, session = self.setup_service()
-        original = service.http.get
-        async def empty_page(url):
-            if url.startswith(BING_SEARCH_URL + "?"):
-                return await original(url)
-            return WebPage(url, '<script>js_only()</script>', "text/html")
-        service.http.get = empty_page
-        result = await service.execute_tool(session, "web_search", {"query": "空页面"})
-        self.assertEqual(result["pages_read"], 0)
-        self.assertTrue(all(r["page_status"] == "failed" for r in result["results"][:2]))
+        self.assertEqual(len(api.requests), 2)
 
-    async def test_auto_read_keeps_real_safe_client_dns_and_redirect_guards(self):
-        service, session = self.setup_service()
-        requests = []
-        async def transport(request):
-            requests.append(request)
-            if request.url.path == "/search":
-                return httpx.Response(200, stream=httpx.ByteStream(search_html([
-                    "https://blocked.example.com/page", "https://redirect.example.com/page"]).encode()),
-                    headers={"content-type": "text/html"})
-            return httpx.Response(302, headers={"location": "http://127.0.0.1/private"})
-        async def dns(host, port, **kwargs):
-            address = "127.0.0.1" if host == "blocked.example.com" else "93.184.216.34"
-            return [(2, 1, 6, "", (address, port))]
-        service.http = SafeWebClient(service.settings, transport=httpx.MockTransport(transport))
-        # 只替换真实事件循环的DNS方法，网络始终由MockTransport截获。
-        with patch.object(asyncio.get_running_loop(), "getaddrinfo", side_effect=dns):
-            result = await service.execute_tool(session, "web_search", {"query": "测试"})
-        self.assertTrue(result["ok"])
+    async def test_body_caps_cache_overflow_without_marking_it_read(self):
+        service, session, api = self.setup_service(web_fetch_max_chars=1000, web_search_content_max_chars=1500)
+        for item in api.search_rows:
+            item["content"] = "正文" * 1000
+        result = await self.search(service, session)
+        self.assertEqual([item["page_status"] for item in result["results"]],
+                         ["read", "read", "cached", "cached", "cached"])
+        self.assertEqual(sum(len(item.get("page", {}).get("content", "")) for item in result["results"]), 1500)
+        self.assertTrue(result["results"][0]["page"]["truncated"])
+        self.assertTrue(result["results"][1]["page"]["truncated"])
+        page = await self.fetch(service, session, URLS[2])
+        self.assertEqual(len(page["content"]), 1000)
+        self.assertEqual(session.fetch_calls, 0)
+        self.assertEqual(len(api.requests), 1)
+
+    async def test_need_content_off_and_session_isolation(self):
+        service, session, api = self.setup_service(web_search_need_content=False)
+        api.search_rows = rows(content=False)
+        result = await self.search(service, session)
+        self.assertFalse(json.loads(api.requests[0].content)["need_content"])
         self.assertEqual(result["pages_read"], 0)
-        self.assertTrue(all(r["page_status"] == "failed" for r in result["results"]))
-        self.assertEqual(len(requests), 2)  # 搜索页、重定向入口；私网从未请求。
+        self.assertFalse((await self.fetch(service, WebSession()))["ok"])
+        self.assertEqual(len(api.requests), 1)
+        self.assertTrue((await self.fetch(service, session))["ok"])
+
+    async def test_fetch_error_and_empty_body_are_cached_not_faked_as_read(self):
+        for status, content in [(404, "error-body-with-secret"), (200, "")]:
+            service, session, api = self.setup_service()
+            session.allowed_urls.add(URLS[0])
+            api.statuses["fetch"] = status
+            api.fetch_value["content"] = content
+            result = await self.fetch(service, session)
+            self.assertFalse(result["ok"])
+            self.assertNotIn("content", result)
+            self.assertNotIn("secret", json.dumps(result))
+            self.assertEqual(await self.fetch(service, session), result)
+            self.assertEqual(session.fetch_calls, 1)
+            self.assertEqual(len(api.requests), 1)
+
+    async def test_auth_rate_limit_and_server_errors_do_not_leak_or_retry(self):
+        for status in (400, 401, 402, 403, 429, 500, 504):
+            service, session, api = self.setup_service()
+            api.statuses["search"] = status
+            api.override["search"] = {"error": {"message": "secret-and-private-url"}}
+            result = await self.search(service, session)
+            self.assertFalse(result["ok"])
+            self.assertIn(str(status), result["error"])
+            self.assertNotIn("secret", result["error"])
+            self.assertEqual(result, await self.search(service, session))
+            self.assertEqual(len(api.requests), 1)
+
+    async def test_rejects_unsafe_and_out_of_scope_urls_without_api_request(self):
+        service, session, api = self.setup_service()
+        unsafe = ["http://127.0.0.1/", "http://169.254.169.254/", "http://10.0.0.1/",
+                  "http://localhost/", "http://foo.local/", "file:///etc/passwd",
+                  "https://user:password@example.com/", "https://example.com:8443/", "http://2130706433/"]
+        for url in unsafe:
+            session.allowed_urls.add(url)  # 即使误授权，仍有语法和字面地址校验。
+            self.assertFalse((await self.fetch(service, session, url))["ok"])
+        self.assertFalse((await self.fetch(service, session, "https://other.example.com/"))["ok"])
+        self.assertEqual(session.fetch_calls, 0)
+        self.assertEqual(api.requests, [])
+
+    async def test_result_validation_dedupe_caps_and_unsafe_links_filtered(self):
+        service, session, api = self.setup_service(web_search_max_results=2)
+        api.search_rows = [None, {"title": "bad", "url": "http://127.0.0.1/"},
+                           {"title": "missing url"}, rows()[0], rows()[0], rows()[1], rows()[2]]
+        api.search_rows[-1]["content"] = {"unexpected": "object"}
+        result = await self.search(service, session)
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(session.allowed_urls, {URLS[0], URLS[1]})
+        self.assertNotIn(URLS[2], session.pages)
+
+    async def test_invalid_json_shapes_and_empty_search(self):
+        for value in (b"not-json-secret", [], {}, {"results": {}}):
+            service, session, api = self.setup_service()
+            api.override["search"] = value
+            result = await self.search(service, session)
+            self.assertFalse(result["ok"])
+            self.assertNotIn("secret", json.dumps(result))
+        service, session, api = self.setup_service()
+        api.search_rows = []
+        result = await self.search(service, session)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["results"], [])
+        self.assertEqual(session.fetch_calls, 0)
+
+    async def test_response_byte_limit_before_and_during_stream(self):
+        for advertised in (False, True):
+            service, session, _ = self.setup_service(web_max_response_bytes=65536)
+            await service.client.aclose()
+            async def oversized(request):
+                headers = {"content-type": "application/json"}
+                if advertised:
+                    headers["content-length"] = "70000"
+                return httpx.Response(200, headers=headers, stream=httpx.ByteStream(b"x" * 70000))
+            service.client = httpx.AsyncClient(transport=httpx.MockTransport(oversized))
+            result = await self.search(service, session)
+            self.assertFalse(result["ok"])
+            self.assertIn("大小限制", result["error"])
+
+    async def test_api_redirect_never_forwards_authorization(self):
+        service, session, api = self.setup_service()
+        await service.client.aclose()
+        async def redirect(request):
+            api.requests.append(request)
+            return httpx.Response(302, headers={"location": "https://evil.example.com/steal"})
+        service.client = httpx.AsyncClient(transport=httpx.MockTransport(redirect), follow_redirects=False)
+        result = await self.search(service, session)
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(api.requests), 1)
+        self.assertEqual(api.requests[0].url.host, "api.deepseek.com")
+
+    async def test_disabled_missing_key_and_query_validation_do_not_request(self):
+        service, session, api = self.setup_service(web_search_enabled=False)
+        self.assertFalse((await self.search(service, session))["ok"])
+        service.settings = service.settings.model_copy(update={"web_search_enabled": True, "deepseek_api_key": ""})
+        self.assertFalse((await self.search(service, session))["ok"])
+        for query in (" ", "字" * 129):
+            self.assertFalse((await self.search(service, session, query))["ok"])
+        self.assertEqual(api.requests, [])
+
+    async def test_concurrent_duplicates_share_cache_and_cancellation_propagates(self):
+        service, session, api = self.setup_service()
+        left, right = await asyncio.gather(self.search(service, session), self.search(service, session))
+        self.assertEqual(left, right)
+        self.assertEqual(len(api.requests), 1)
+        await service.client.aclose()
+        started = asyncio.Event()
+        async def blocked(request):
+            started.set()
+            await asyncio.Event().wait()
+        service.client = httpx.AsyncClient(transport=httpx.MockTransport(blocked))
+        task = asyncio.create_task(self.search(service, WebSession()))
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_timeout_includes_queue_wait(self):
+        service, session, _ = self.setup_service()
+        service.settings = service.settings.model_copy(update={"web_timeout_seconds": 0.02})
+        await service._slots.acquire()
+        await service._slots.acquire()
+        result = await self.search(service, session)
+        self.assertFalse(result["ok"])
+        self.assertIn("超时", result["error"])
+        service._slots.release()
+        service._slots.release()
+
+    async def test_per_endpoint_pacing(self):
+        service, _, _ = self.setup_service()
+        service._request_interval = 0.02
+        times = []
+        async def paced(name):
+            await service._pace(name)
+            times.append((name, asyncio.get_running_loop().time()))
+        await asyncio.gather(paced("search"), paced("search"), paced("fetch"))
+        search_times = [t for name, t in times if name == "search"]
+        self.assertGreaterEqual(search_times[1] - search_times[0], 0.015)
 
     async def test_agent_observes_body_after_single_search_tool_call(self):
-        service, session = self.setup_service()
+        service, session, api = self.setup_service()
         registry = ToolRegistry()
         for definition in WEB_TOOLS:
             name = definition["function"]["name"]
@@ -209,11 +303,11 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
                     name, args = "finish", {}
                 return {"tool_calls": [{"id": str(len(self.requests)), "function": {
                     "name": name, "arguments": json.dumps(args)}}]}
-        model = Model()
-        result = await ReactAgent(service.settings, model).run("测试", registry, system=WEB_INSTRUCTIONS)
+        result = await ReactAgent(service.settings, Model()).run("测试", registry, system=WEB_INSTRUCTIONS)
         self.assertIsNone(result.error)
         self.assertEqual(result.steps, 2)
-        self.assertEqual(session.fetch_calls, 2)
+        self.assertEqual(len(api.requests), 1)
+        self.assertEqual(session.fetch_calls, 0)
 
 
 if __name__ == "__main__":

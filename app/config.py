@@ -51,14 +51,16 @@ class Settings(BaseSettings):
     agent_max_tool_calls: int = Field(default=16, ge=4, le=32)
     agent_timeout_seconds: int = Field(default=120, ge=20, le=300)
     agent_batch_completion_enabled: bool = True
-    # 无Key的Bing网页搜索；公网只读抓取，共用全局并发上限2。
+    # DeepSeek独立Search/Fetch API，复用deepseek_api_key，固定请求官方地址。
     web_search_enabled: bool = True
     web_search_max_results: int = Field(default=5, ge=1, le=8)
     web_search_max_calls: int = Field(default=2, ge=1, le=4)
-    web_search_auto_fetch_pages: int = Field(default=2, ge=0, le=2)
-    # 自动读取与手动补读共用本轮总额度；默认首次自动读2页后还能补读2页。
+    web_search_need_content: bool = True
+    # 单次搜索交给聊天模型的正文总量；超额正文留在本轮缓存，按需取出。
+    web_search_content_max_chars: int = Field(default=12000, ge=1000, le=48000)
+    # 仅统计额外Fetch API请求，Search自带正文及缓存命中不扣此额度。
     web_fetch_max_calls: int = Field(default=4, ge=1, le=4)
-    web_timeout_seconds: int = Field(default=15, ge=3, le=30)
+    web_timeout_seconds: int = Field(default=30, ge=3, le=30)
     web_max_response_bytes: int = Field(default=1024 * 1024, ge=65536, le=5 * 1024 * 1024)
     web_fetch_max_chars: int = Field(default=6000, ge=1000, le=12000)
     context_message_limit: int = Field(default=80, ge=1, le=200)
