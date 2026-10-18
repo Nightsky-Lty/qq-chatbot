@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 
 from app.config import Settings
 from app.balance import BalanceService, BalanceUnavailable
+from app.server_status import ServerStatusService
 from app.agent import AgentOutcome, ReactAgent
 from app.conversation import GroupBatch, GroupConversations, GroupMessage
 from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
@@ -56,6 +57,7 @@ HELP_TEXT = """可用命令：
 /锐评 内容
 /模仿 @某人 主题（无需授权，至少需要 5 条本群普通文字发言）
 /余额（仅机器人管理员）
+/服务器状态 或 /状态（仅机器人管理员）
 /帮助
 可在聊天中要求发表情包，图片需先由部署者放入本地图库。
 群聊也可以要求语音回复，使用QQ提供的AI音色；暂不识别收到的语音。
@@ -69,6 +71,7 @@ PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 /问 内容
 /锐评 内容
 /余额（仅机器人管理员）
+/服务器状态 或 /状态（仅机器人管理员）
 /帮助
 可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
 提醒使用北京时间，目前只支持一次性提醒。
@@ -165,6 +168,7 @@ class BotService:
         self.db = database
         self.llm = llm
         self.balance = BalanceService(settings, llm.client)
+        self.server_status = ServerStatusService(settings)
         self.agent = ReactAgent(settings, llm)
         self.sticker_llm = DeepSeekClient(settings, purpose="sticker")
         self.memory_llm = DeepSeekClient(settings, purpose="memory")
@@ -195,6 +199,8 @@ class BotService:
         self._pending_ai_users: set[AIKey] = set()
         self._balance_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
         self._pending_balance_users: set[AIKey] = set()
+        self._status_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
+        self._pending_status_users: set[AIKey] = set()
         self.conversations = GroupConversations(settings, self._run_group_batch)
         self._closed = False
 
@@ -217,6 +223,12 @@ class BotService:
         ]
         tasks.extend(
             task for task, (sender, task_key) in self._balance_tasks.items()
+            if (send_message is None or sender in {send_message, confirmed})
+            and (key is None or task_key == key
+                 or (key[0] == "group" and task_key[0] == "group" and task_key[1] == key[1]))
+        )
+        tasks.extend(
+            task for task, (sender, task_key) in self._status_tasks.items()
             if (send_message is None or sender in {send_message, confirmed})
             and (key is None or task_key == key
                  or (key[0] == "group" and task_key[0] == "group" and task_key[1] == key[1]))
@@ -307,6 +319,14 @@ class BotService:
                 target = user_id if private else int(event["group_id"])
                 await self._queue_balance(user_id, target, sender, private=private)
             # 在聊天入库、群图收集和聚批之前分流，命令和余额回执均不进模型上下文。
+            return
+        if command in {"/服务器状态", "/状态"}:
+            private = event["message_type"] == "private"
+            sender = send_private if private else send_group
+            if sender is not None:
+                target = user_id if private else int(event["group_id"])
+                await self._queue_status(user_id, target, sender, private=private)
+            # 资源快照不进聊天历史/长期记忆，不请求模型或收集命令附图。
             return
         image_session = ChatImageSession(view.images) if view.images and self.settings.chat_image_enabled else None
         if event["message_type"] == "private":
@@ -412,6 +432,42 @@ class BotService:
             error = task.exception()
             if error is not None:
                 logger.warning("Balance command failed: error=%s", type(error).__name__)
+
+    async def _queue_status(self, user_id: int, target: int, sender: SendMessage, *, private: bool) -> None:
+        if self._closed:
+            return
+        if user_id not in self.settings.admin_qq_ids:
+            await self._send_text(sender, target, "只有机器人管理员可以查询服务器状态。")
+            return
+        key = ("private" if private else "group", target, user_id)
+        if key in self._pending_status_users:
+            await self._send_text(sender, target, "服务器状态正在采集中，请稍等。")
+            return
+        if len(self._status_tasks) >= 16:
+            await self._send_text(sender, target, "状态查询较多，请稍后重试。")
+            return
+        task_sender = self._confirmed_senders.get(sender, sender)
+        self._pending_status_users.add(key)
+        task = asyncio.create_task(self._run_status(target, task_sender), name="server-status")
+        self._status_tasks[task] = (task_sender, key)
+        task.add_done_callback(self._finish_status_task)
+
+    async def _run_status(self, target: int, sender: SendMessage) -> None:
+        try:
+            text = await self.server_status.get_text()
+        except Exception as exc:
+            logger.warning("Server status collection failed: error=%s", type(exc).__name__)
+            text = "服务器状态采集失败，请联系部署者检查。"
+        await self._send_text(sender, target, text)
+
+    def _finish_status_task(self, task: asyncio.Task[None]) -> None:
+        entry = self._status_tasks.pop(task, None)
+        if entry is not None:
+            self._pending_status_users.discard(entry[1])
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.warning("Server status command failed: error=%s", type(error).__name__)
 
     async def _queue_group(self, group_id: int, entry: GroupMessage, sender: SendGroup) -> None:
         status = await self.conversations.submit(group_id, entry, sender)

@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # 跳过环境变量来源的自动 JSON 解码，由下面的校验器兼容两种输入格式。
     admin_qq_ids: Annotated[set[int], NoDecode] = Field(default_factory=set)
     database_path: Path = Path("data/bot.db")
+    # Compose只读挂载宿主机stat/meminfo/loadavg/uptime；缺失时不伪造宿主机指标。
+    server_status_proc_path: Path = Path("/host/proc")
     # bot_name 暂未参与提示词或消息生成；命令前缀由业务层读取。
     bot_name: str = "小群友"
     chat_prefix: str = "/问"

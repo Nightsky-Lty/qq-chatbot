@@ -28,6 +28,31 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - bot-data:/app/data
+      # 只读四个宿主机统计文件；不挂载整个/proc、宿主机根目录或Docker socket。
+      - type: bind
+        source: /proc/stat
+        target: /host/proc/stat
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /proc/meminfo
+        target: /host/proc/meminfo
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /proc/loadavg
+        target: /host/proc/loadavg
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /proc/uptime
+        target: /host/proc/uptime
+        read_only: true
+        bind:
+          create_host_path: false
       - ./app/sticker_images:/app/app/sticker_images:ro
       # 模型文件较大且不进入镜像/Git；在宿主机导出后只读挂载。
       - ${EMBEDDING_MODEL_DIR:-./models/bge-small-zh-v1.5-int8}:/app/models/bge-small-zh-v1.5:ro
