@@ -204,7 +204,7 @@ class HybridRetriever:
     def public(self, row, *, include_sources=False):
         metadata = json.loads(row["metadata_json"])
         value = {"记忆编号": row["id"], "层": row["layer"], "成员QQ": row["user_id"] or None,
-                 "内容": row["content"], "版本": row["version"], "发生时间": row["occurred_at"] or None,
+                 "内容": metadata.get("original_summary", row["content"]), "版本": row["version"], "发生时间": row["occurred_at"] or None,
                  "记录时间": row["created_at"], "依据": row["evidence_kind"], "有效期": row["expires_at"] or None}
         for field in ("conditions", "uncertain", "media_ref_id", "aliases", "participants"):
             if metadata.get(field):

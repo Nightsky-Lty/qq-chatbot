@@ -161,6 +161,18 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         self.db.memories.revoke(7, 11, first["id"])
         self.assertFalse(self.db.memories.blocked(7, 11, "咖啡偏好", "新证据晚上不喝咖啡", conditions="晚上"))
 
+    async def test_identical_event_summary_on_different_days_is_not_merged(self):
+        source, first = await self.save("QQ11修复了水星网站")
+        next_source = self.source("第二天又修复了水星网站")
+        with self.db.connection:
+            self.db.connection.execute("UPDATE messages SET created_at=created_at+86400 WHERE id=?", (next_source,))
+        self.model.actions = [self.action(next_source, first["content"])]
+        result = await self.capture.extract(7, self.db.memory_source_rows(7, {next_source}))
+        self.assertEqual(result["stored"], 1)
+        rows = self.db.memory_candidates(7, {11}, 10)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({r["occurred_at"] for r in rows}), 2)
+
     async def test_forget_blocks_raw_history_reextraction_and_private_context(self):
         self.memory.settings.memory_source_search_enabled = True
         source, row = await self.save("我之前研究过银河报错", ns=-11)

@@ -76,6 +76,7 @@ class MemoryCapture:
         db.capture_enabled = settings.memory_enabled and settings.memory_auto_capture_enabled
         db.capture_delay = settings.memory_capture_delay_seconds
         db.memory_max_per_user = settings.memory_max_per_user
+        db.memory_max_chars = settings.memory_max_chars
 
     def start(self) -> None:
         if self.db.capture_enabled and self.task is None:

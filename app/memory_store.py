@@ -224,13 +224,23 @@ class MemoryStore:
                     # 自动整理不拥有删除/遗忘权限；显式操作走独立绑定工具。
                     raise ValueError("遗忘必须使用本人授权的专用工具")
                 metadata = action.get("metadata", {})
+                duplicate = conn.execute("SELECT * FROM memories WHERE group_id=? AND user_id=? AND memory_type=? AND content=?",
+                                         (namespace, subject, action["memory_type"], action["content"])).fetchone()
+                if duplicate and self.layer(action["memory_type"]) == "event" and duplicate["occurred_at"] != action.get("occurred_at", 0):
+                    # 旧库按正文唯一；相同描述在不同时间发生不能被当成同一事件。
+                    original = action["content"]
+                    suffix = f" [事件时间:{action.get('occurred_at', 0)}]"
+                    action["content"] = original[:max(2, getattr(self.db, "memory_max_chars", 200) - len(suffix))] + suffix
+                    metadata["original_summary"] = original
+                    duplicate = conn.execute("SELECT * FROM memories WHERE group_id=? AND user_id=? AND memory_type=? AND content=?",
+                                             (namespace, subject, action["memory_type"], action["content"])).fetchone()
+                    if self.blocked(namespace, subject, action["fact_key"], action["content"], action["source_ids"], metadata.get("conditions", "")):
+                        raise ValueError("该事件版本已被遗忘")
                 values = (namespace, subject, subject, action["memory_type"], action["content"], action["vector"], action["hash_vector"],
                           action["embedding_model"], action["embedding_dimensions"], action["importance"], action["confidence"],
                           str(action["source_ids"][0]), now, now, action["fact_key"], json.dumps(action["sources"], ensure_ascii=False),
                           action["expires_at"], self.layer(action["memory_type"]), action.get("status", "active"),
                           action.get("occurred_at", 0), action.get("evidence_kind", "reported"), json.dumps(metadata, ensure_ascii=False))
-                duplicate = conn.execute("SELECT * FROM memories WHERE group_id=? AND user_id=? AND memory_type=? AND content=?",
-                                         (namespace, subject, action["memory_type"], action["content"])).fetchone()
                 if duplicate:
                     # 重复证据只合并来源，不用反复检索/提取提高重要性或复活旧记录。
                     if duplicate["status"] not in {"active", "candidate"}:
