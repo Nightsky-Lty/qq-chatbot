@@ -1,10 +1,11 @@
 # 基础镜像和运行时使用同一 Python 版本，依赖版本以 uv.lock 为准。
 FROM python:3.12-slim-bookworm AS builder
-COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /usr/local/bin/uv
 WORKDIR /app
 ARG UV_DEFAULT_INDEX=https://pypi.org/simple
 ENV UV_PYTHON_DOWNLOADS=never \
     UV_DEFAULT_INDEX=${UV_DEFAULT_INDEX}
+# 构建工具也走配置的 PyPI 镜像，避免额外依赖 GHCR 的跨境镜像下载。
+RUN python -m pip install --no-cache-dir --index-url "${UV_DEFAULT_INDEX}" uv==0.13.0
 COPY pyproject.toml uv.lock ./
 RUN uv export --frozen --no-dev --no-emit-project \
         --format requirements-txt --output-file /tmp/requirements.txt \
