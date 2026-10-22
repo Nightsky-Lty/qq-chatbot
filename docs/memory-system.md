@@ -3,11 +3,31 @@
 ## 存储与边界
 
 - Working：`WorkingMemory`按群/私聊持续接收真实对话，跨回复保留原文和有来源的语境摘要，为下一次回复提供短期上下文；默认30分钟、64会话/每会话128条上限。`finish/wait_for_messages`或单次Agent取消不清空语境。任务证据/查询缓存由`TaskEvidence`维护，推理/工具链仍在Agent局部状态，不进入短期对话记忆。详见[对话工作记忆](working-memory.md)。
-- Event：SQLite `memories.layer='event'`，通过`memory_events`视图查看。event/episode/commitment保留参与来源、原话摘录、发生/记录时间、版本、有效期、陈述归属；共同经历/约定需要真实双方发言和群内回应关系，约定不是工具成功证明。
-- Abstract：`memories.layer='abstract'`与`memory_concepts`视图。兼容旧profile/preference/relationship/explicit；group_meme保存条件、别名、含义、支持事件。明确解释或至少三个已提供事件支持可生效，其余为candidate，不自动注入。计数及模型自报置信度均不等于客观正确。
-- Perceptual：`image_cache_blobs/refs`仍是图片资源权威记录，文件在`/app/data/image_cache`按SHA-256去重。概要以`memories.layer='perceptual'`建立可检索引用，不把概要当发图人的发言/经历。只实现图片，未实现音频、视频或视觉embedding。
+- Event：SQLite `memory_records.layer='event'`，通过`memory_events`视图查看。event/episode/commitment保留参与来源、原话摘录、发生/记录时间、版本、有效期、陈述归属；共同经历/约定需要真实双方发言和群内回应关系，约定不是工具成功证明。
+- Abstract：`memory_records.layer='abstract'`与`memory_concepts`视图。兼容旧profile/preference/relationship/explicit；group_meme保存条件、别名、含义、支持事件。明确解释或至少三个已提供事件支持可生效，其余为candidate，不自动注入。计数及模型自报置信度均不等于客观正确。
+- Perceptual：`image_cache_blobs/refs`仍是图片资源权威记录，文件在`/app/data/image_cache`按SHA-256去重。概要以`memory_records.layer='perceptual'`建立可检索引用，不把概要当发图人的发言/经历。只实现图片，未实现音频、视频或视觉embedding。
 
-为了兼容旧数据，没有复制一套新的权威事件/概念表；统一旧`memories`表增加layer/version/occurred_at/evidence_kind/metadata_json，视图分层，`memory_links`表达derived_from/revises，`memory_media_links`连接事件和图片。未部署Neo4j。
+`memory_records`是长期记忆唯一权威表，事件/抽象/感知按layer分层；`memory_events/memory_concepts/memory_percepts`是视图。`memory_type`仅是层内子类型（偏好、约定、群梗等），不是旧系统的独立入口。`memory_links`表达derived_from/revises，`memory_media_links`连接事件和图片。未部署Neo4j。
+
+## 从旧记忆存储迁入
+
+仍使用现有SQLite `bot.db`文件，因为聊天原话、图片引用、整合游标/队列和记忆需要一起校验和提交；“新存储”指正式的分层表结构，不是新建一个丢掉关联的空文件。启动发现旧`memories`时：
+
+1. 用SQLite backup API（包括已提交WAL）生成`data/backups/before-memory-records-*.db`，权限0600，并检查完整性。备份失败就停止，旧表不动。
+2. 在一个事务中导入`memory_records`，保留ID、人物/会话、原文、来源摘录、向量、版本、状态、期限、元数据和自增编号高水位。早期未分层记录按子类型归入event/abstract/perceptual；不调用LLM重写，不重新激活已遗忘/失效/候选记录，不编造来源。
+3. 双向逐字段核对后移除旧表及其触发器/索引，切换视图，重建FTS并排队同步Qdrant。修订、关系、图片、遗忘阻断、整合任务和聊天原文保留；保留编号使原向量引用仍能校验。
+4. 缺少来源摘录的旧记录保留内容并标注来源不足，不能作为本轮新证据或授权。出现新旧表并存、未知字段、非法来源/元数据或校验失败时停止并回滚，不忽略冲突。迁移成功后重启不再导入/备份。
+
+旧`MemoryService.remember`、`Database.save_memory/list_user_memories/delete_user_memory`以及`remember_group_memory`工具定义/提示词已移除。所有正常写入通过现有证据校验与`MemoryStore.apply`；仅保留`app/memory_schema.py`的离线/启动导入器，供尚未升级的数据完成一次迁移，不提供旧系统运行路径。
+
+上线前停止bot（不停止NapCat、不删除卷），确保磁盘可同时容纳备份和迁移副本。新版启动自动迁移。也可先在停止bot后离线执行：
+
+```bash
+python scripts/migrate_memory_storage.py --database /app/data/bot.db
+python scripts/migrate_memory_storage.py --database /app/data/bot.db --apply
+```
+
+默认只读输出结构和数量，不打印聊天/记忆正文；`--apply`才迁移并输出备份位置。需要回退旧程序时，先停止bot，保留当前库供恢复，使用对应的升级前备份恢复整个SQLite（处理当前WAL/SHM，不覆盖运行中数据库），然后启动匹配的旧版本；不能只回退代码。备份含完整敏感数据，不上传Git，按部署者策略保管/清理；移除旧表不是安全擦除SQLite空闲页或历史备份。
 
 事件明确引用的图片默认延长至90天，可由`IMAGE_MEMORY_RETENTION_DAYS`调整；普通图片仍默认7天。仍受全局500文件/256MiB配额约束，FIFO容量淘汰可早于保留期。原始消息自然到期后，只要有有效事件引用，保留图仍可访问；本人数据清除会失效对应引用，不因保留而复活。物理文件去重不授予跨会话权限。
 
@@ -57,7 +77,7 @@ Compose固定`qdrant/qdrant:v1.19.2`，可通过`.env`的`QDRANT_IMAGE`换可信
 
 ```sql
 INSERT OR REPLACE INTO memory_index_jobs(memory_id,revision)
-SELECT id,version FROM memories;
+SELECT id,version FROM memory_records;
 ```
 
 不要执行`docker compose down -v`，它会删除所有持久卷。更新推荐`docker compose up -d qdrant`，构建/测试后`docker compose up -d --no-deps bot`，不重启NapCat。

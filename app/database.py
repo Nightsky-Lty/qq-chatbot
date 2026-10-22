@@ -74,29 +74,6 @@ CREATE TABLE IF NOT EXISTS group_members (
     last_seen_at INTEGER NOT NULL,
     PRIMARY KEY (group_id, user_id)
 );
-CREATE TABLE IF NOT EXISTS memories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    source_user_id INTEGER NOT NULL,
-    memory_type TEXT NOT NULL,
-    content TEXT NOT NULL,
-    vector TEXT NOT NULL DEFAULT '{}',
-    hash_vector TEXT NOT NULL DEFAULT '{}',
-    embedding_model TEXT NOT NULL DEFAULT 'hash-blake2b-512-v1',
-    embedding_dimensions INTEGER NOT NULL DEFAULT 512,
-    importance REAL NOT NULL DEFAULT 0.5,
-    confidence REAL NOT NULL DEFAULT 0.8,
-    source_message_id TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    last_accessed_at INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(group_id, user_id, memory_type, content)
-);
-CREATE INDEX IF NOT EXISTS idx_memories_group_user
-    ON memories(group_id, user_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_source_user
-    ON memories(group_id, source_user_id);
 CREATE TABLE IF NOT EXISTS private_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -151,6 +128,13 @@ class Database:
         self.capture_enabled = False
         self.capture_delay = 30
         self.message_listener = None
+        # 必须先备份/迁移，再建立业务表；不重新创建旧记忆表。
+        from app.memory_schema import initialize_memory_schema
+        try:
+            self.memory_migration_backup = initialize_memory_schema(self.connection, path)
+        except BaseException:
+            self.connection.close()
+            raise
         with self._lock:
             self.connection.executescript(SCHEMA)
         with self._lock, self.connection:
@@ -162,28 +146,9 @@ class Database:
                 self.connection.execute("ALTER TABLE messages ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]'")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_onebot ON messages(group_id,message_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_group_role_id ON messages(group_id,role,id DESC)")
-            memory_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(memories)")}
-            memory_migrations = (
-                ("hash_vector", "TEXT NOT NULL DEFAULT '{}'"),
-                ("embedding_model", "TEXT NOT NULL DEFAULT 'hash-blake2b-512-v1'"),
-                ("embedding_dimensions", "INTEGER NOT NULL DEFAULT 512"),
-                ("status", "TEXT NOT NULL DEFAULT 'active'"),
-                ("fact_key", "TEXT NOT NULL DEFAULT ''"),
-                ("sources_json", "TEXT NOT NULL DEFAULT '[]'"),
-                ("expires_at", "INTEGER NOT NULL DEFAULT 0"),
-            )
-            for name, definition in memory_migrations:
-                if name not in memory_columns:
-                    self.connection.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
-            # 升级前的vector就是哈希向量，复制一份作为所有后端的故障降级索引。
-            self.connection.execute(
-                """UPDATE memories SET hash_vector=vector
-                   WHERE (hash_vector='' OR hash_vector='{}')
-                       AND embedding_model='hash-blake2b-512-v1'"""
-            )
             # 旧库的授权表和样本资格字段不再读写，原样保留，避免为升级重建消息表。
             self._migrate_legacy_lists()
-        # 增量迁移，不重建旧记忆；事件/抽象采用统一权威表和分层视图。
+        # 运行时只访问分层存储，旧表仅由一次性导入器识别。
         from app.memory_store import MemoryStore
         self.memories = MemoryStore(self)
 
@@ -569,72 +534,13 @@ class Database:
         rows.reverse()
         return rows
 
-    def save_memory(
-        self,
-        group_id: int,
-        user_id: int,
-        source_user_id: int,
-        memory_type: str,
-        content: str,
-        vector: str,
-        hash_vector: str,
-        embedding_model: str,
-        embedding_dimensions: int,
-        *,
-        confidence: float,
-        importance: float,
-        source_message_id: str,
-        max_per_user: int,
-    ) -> tuple[int, bool]:
-        """幂等保存记忆，并限制每位成员在每个群的记忆总量。"""
-        now = int(time.time())
-        with self._lock, self.connection:
-            existing = self.connection.execute(
-                """SELECT id FROM memories
-                   WHERE group_id=? AND user_id=? AND memory_type=? AND content=?""",
-                (group_id, user_id, memory_type, content),
-            ).fetchone()
-            if existing is None:
-                cursor = self.connection.execute(
-                    """INSERT INTO memories
-                       (group_id,user_id,source_user_id,memory_type,content,vector,hash_vector,
-                        embedding_model,embedding_dimensions,importance,confidence,source_message_id,
-                        created_at,updated_at,last_accessed_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
-                    (group_id, user_id, source_user_id, memory_type, content, vector, hash_vector,
-                     embedding_model, embedding_dimensions, importance, confidence, source_message_id, now, now),
-                )
-                memory_id, created = int(cursor.lastrowid), True
-            else:
-                memory_id, created = int(existing["id"]), False
-                self.connection.execute(
-                    """UPDATE memories SET source_user_id=?,vector=?,hash_vector=?,
-                       embedding_model=?,embedding_dimensions=?,
-                       importance=max(importance,?),confidence=max(confidence,?),
-                       source_message_id=?,updated_at=? WHERE id=?""",
-                    (source_user_id, vector, hash_vector, embedding_model, embedding_dimensions,
-                     importance, confidence, source_message_id, now, memory_id),
-                )
-            stale = self.connection.execute(
-                """SELECT id FROM memories WHERE group_id=? AND user_id=?
-                   ORDER BY importance DESC,confidence DESC,updated_at DESC LIMIT -1 OFFSET ?""",
-                (group_id, user_id, max_per_user),
-            ).fetchall()
-            if stale:
-                placeholders = ",".join("?" for _ in stale)
-                self.connection.execute(
-                    f"DELETE FROM memories WHERE id IN ({placeholders})",
-                    tuple(row["id"] for row in stale),
-                )
-            return memory_id, created
-
     def memory_candidates(self, group_id: int, user_ids: set[int], limit: int) -> list[sqlite3.Row]:
-        """在向量打分前按群和相关成员过滤；user_id=0 表示全群记忆。"""
+        """给后台提取器提供本会话相关人物的既有事实；不是召回的最近N条截断。"""
         targets = sorted(user_ids | {0})
         placeholders = ",".join("?" for _ in targets)
         with self._lock:
             return list(self.connection.execute(
-                f"""SELECT * FROM memories WHERE group_id=? AND user_id IN ({placeholders})
+                f"""SELECT * FROM memory_records WHERE group_id=? AND user_id IN ({placeholders})
                     AND status='active' AND (expires_at=0 OR expires_at>strftime('%s','now'))
                     ORDER BY updated_at DESC LIMIT ?""",
                 (group_id, *targets, limit),
@@ -644,7 +550,7 @@ class Database:
         """为后台迁移读取尚未使用当前模型的记忆，不改变聊天请求的延迟。"""
         with self._lock:
             return list(self.connection.execute(
-                """SELECT id,content FROM memories WHERE embedding_model<>? AND status IN ('active','candidate')
+                """SELECT id,content FROM memory_records WHERE embedding_model<>? AND status IN ('active','candidate')
                    ORDER BY updated_at DESC,id DESC LIMIT ?""",
                 (embedding_model, limit),
             ))
@@ -654,25 +560,9 @@ class Database:
     ) -> bool:
         with self._lock, self.connection:
             cursor = self.connection.execute(
-                """UPDATE memories SET vector=?,embedding_model=?,embedding_dimensions=? WHERE id=?
+                """UPDATE memory_records SET vector=?,embedding_model=?,embedding_dimensions=? WHERE id=?
                    AND status IN ('active','candidate') AND (? IS NULL OR content=?)""",
                 (vector, embedding_model, embedding_dimensions, memory_id, expected_content, expected_content),
-            )
-            return cursor.rowcount > 0
-
-    def list_user_memories(self, group_id: int, user_id: int, limit: int = 20) -> list[sqlite3.Row]:
-        with self._lock:
-            return list(self.connection.execute(
-                """SELECT id,memory_type,content,confidence,importance,updated_at FROM memories
-                   WHERE group_id=? AND user_id=? ORDER BY updated_at DESC,id DESC LIMIT ?""",
-                (group_id, user_id, limit),
-            ))
-
-    def delete_user_memory(self, group_id: int, user_id: int, memory_id: int) -> bool:
-        with self._lock, self.connection:
-            cursor = self.connection.execute(
-                "DELETE FROM memories WHERE group_id=? AND user_id=? AND id=?",
-                (group_id, user_id, memory_id),
             )
             return cursor.rowcount > 0
 
@@ -682,7 +572,7 @@ class Database:
         placeholders = ",".join("?" for _ in memory_ids)
         with self._lock, self.connection:
             self.connection.execute(
-                f"UPDATE memories SET last_accessed_at=? WHERE id IN ({placeholders})",
+                f"UPDATE memory_records SET last_accessed_at=? WHERE id IN ({placeholders})",
                 (int(time.time()), *memory_ids),
             )
 
@@ -763,7 +653,7 @@ class Database:
             self.memories.clear_user(-user_id, user_id)
             messages = self.connection.execute("DELETE FROM private_messages WHERE user_id=?", (user_id,))
             reminders = self.connection.execute("DELETE FROM reminders WHERE user_id=?", (user_id,))
-            self.connection.execute("DELETE FROM memories WHERE group_id=?", (-user_id,))
+            self.connection.execute("DELETE FROM memory_records WHERE group_id=?", (-user_id,))
             self.connection.execute("DELETE FROM memory_capture_state WHERE namespace=?", (-user_id,))
             return messages.rowcount, reminders.rowcount
 
@@ -874,19 +764,19 @@ class Database:
     def delete_group_user_data(self, group_id: int, user_id: int) -> tuple[int, int]:
         """原子删除本人在当前群的消息、成员档案及作为本人来源的长期记忆。"""
         with self._lock, self.connection:
-            memory_count = self.connection.execute("SELECT count(*) FROM memories WHERE group_id=?", (group_id,)).fetchone()[0]
+            memory_count = self.connection.execute("SELECT count(*) FROM memory_records WHERE group_id=?", (group_id,)).fetchone()[0]
             self.memories.clear_user(group_id, user_id)
             messages = self.connection.execute(
                 "DELETE FROM messages WHERE group_id=? AND user_id=?", (group_id, user_id)
             )
             memories = self.connection.execute(
-                "DELETE FROM memories WHERE group_id=? AND (user_id=? OR source_user_id=?)",
+                "DELETE FROM memory_records WHERE group_id=? AND (user_id=? OR source_user_id=?)",
                 (group_id, user_id, user_id),
             )
             self.connection.execute(
                 "DELETE FROM group_members WHERE group_id=? AND user_id=?", (group_id, user_id)
             )
-            remaining = self.connection.execute("SELECT count(*) FROM memories WHERE group_id=?", (group_id,)).fetchone()[0]
+            remaining = self.connection.execute("SELECT count(*) FROM memory_records WHERE group_id=?", (group_id,)).fetchone()[0]
             return messages.rowcount, memory_count - remaining
 
     def purge_old_messages(self, retention_days: int) -> int:

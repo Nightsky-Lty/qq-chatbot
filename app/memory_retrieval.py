@@ -73,7 +73,7 @@ class HybridRetriever:
         # 全范围流式打分，不先截取“最近300条”；堆只保留top-k，不加载整个库到内存。
         heap, cursor = [], 0
         with self.db._lock:
-            rows = self.db.connection.execute(f"SELECT * FROM memories m WHERE {where} AND m.id>? ORDER BY m.id LIMIT 256", (*args, cursor)).fetchall()
+            rows = self.db.connection.execute(f"SELECT * FROM memory_records m WHERE {where} AND m.id>? ORDER BY m.id LIMIT 256", (*args, cursor)).fetchall()
         while rows:
             for row in rows:
                 dense = dense_model and row["embedding_model"] == dense_model
@@ -87,7 +87,7 @@ class HybridRetriever:
                     heapq.heapreplace(heap, item)
             cursor = rows[-1]["id"]
             with self.db._lock:
-                rows = self.db.connection.execute(f"SELECT * FROM memories m WHERE {where} AND m.id>? ORDER BY m.id LIMIT 256", (*args, cursor)).fetchall()
+                rows = self.db.connection.execute(f"SELECT * FROM memory_records m WHERE {where} AND m.id>? ORDER BY m.id LIMIT 256", (*args, cursor)).fetchall()
         return sorted(heap, reverse=True)
 
     async def search(self, namespace, query, *, user_ids=(), limit=None, layer=None, subject=None,
@@ -109,9 +109,9 @@ class HybridRetriever:
         fts_query = match_query(query)
         with self.db._lock:
             lexical = list(self.db.connection.execute(
-                f"SELECT m.id,bm25(memory_fts) AS score FROM memory_fts JOIN memories m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? AND {where} ORDER BY score LIMIT ?",
+                f"SELECT m.id,bm25(memory_fts) AS score FROM memory_fts JOIN memory_records m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? AND {where} ORDER BY score LIMIT ?",
                 (fts_query, *args, route_limit))) if fts_query else []
-            concepts = list(self.db.connection.execute(f"SELECT m.* FROM memories m WHERE {where} AND m.layer='abstract' AND m.fact_key!=''", args))
+            concepts = list(self.db.connection.execute(f"SELECT m.* FROM memory_records m WHERE {where} AND m.layer='abstract' AND m.fact_key!=''", args))
         exact = [r["id"] for r in concepts if any(k and k.casefold() in query.casefold()
                   for k in [r["fact_key"], *json.loads(r["metadata_json"]).get("aliases", [])]) and self.eligible(r, boundary)][:route_limit]
         expansion = " ".join(json.loads(r["metadata_json"]).get("meaning", "")[:100] for r in concepts if r["id"] in exact[:2])
@@ -207,6 +207,8 @@ class HybridRetriever:
         value = {"记忆编号": row["id"], "层": row["layer"], "成员QQ": row["user_id"] or None,
                  "内容": metadata.get("original_summary", row["content"]), "版本": row["version"], "发生时间": row["occurred_at"] or None,
                  "记录时间": row["created_at"], "依据": row["evidence_kind"], "有效期": row["expires_at"] or None}
+        if metadata.get("storage_migration") and not any(s.get("content") for s in json.loads(row["sources_json"])):
+            value["来源说明"] = "由旧记忆迁入，缺少原始来源摘录；不是本轮新证据"
         for field in ("conditions", "uncertain", "media_ref_id", "aliases", "participants"):
             if metadata.get(field):
                 value[field] = metadata[field]

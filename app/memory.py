@@ -1,4 +1,4 @@
-"""群成员长期记忆：BGE/哈希向量、混合检索和受控写入。"""
+"""分层长期记忆服务：向量生成、混合检索与索引同步。"""
 
 from __future__ import annotations
 
@@ -19,25 +19,11 @@ from app.embeddings import (
     HashEmbeddingProvider,
     create_embedding_provider,
     sparse_vector,
-    tokens,
-    vector_similarity,
 )
 
 
 logger = logging.getLogger(__name__)
 
-
-MEMORY_TYPES = {"profile", "preference", "event", "relationship", "group_meme", "explicit", "episode", "commitment"}
-MEMORY_TYPE_LABELS = {
-    "profile": "个人资料",
-    "preference": "偏好",
-    "event": "经历",
-    "relationship": "关系/称呼",
-    "group_meme": "群梗",
-    "explicit": "本人要求记住",
-    "episode": "共同经历",
-    "commitment": "双方约定（不代表已安排工具执行）",
-}
 
 # 自动写入不接受高风险隐私。用户也不应通过手动命令把这些内容变成长久提示词。
 _SENSITIVE_PATTERNS = (
@@ -93,7 +79,7 @@ class MemoryService:
         while True:
             try:
                 with self.db._lock, self.db.connection:
-                    self.db.connection.execute("UPDATE memories SET status='archived',version=version+1 WHERE status='active' AND expires_at>0 AND expires_at<=?", (int(time.time()),))
+                    self.db.connection.execute("UPDATE memory_records SET status='archived',version=version+1 WHERE status='active' AND expires_at>0 AND expires_at<=?", (int(time.time()),))
                 await self.sync_images()
                 await self.sync_index_once()
             except asyncio.CancelledError:
@@ -110,7 +96,7 @@ class MemoryService:
         completed = 0
         for job in jobs:
             with self.db._lock:
-                found = self.db.connection.execute("SELECT * FROM memories WHERE id=?", (job["memory_id"],)).fetchone()
+                found = self.db.connection.execute("SELECT * FROM memory_records WHERE id=?", (job["memory_id"],)).fetchone()
                 row = dict(found) if found else None
             try:
                 await self.index.sync(job["memory_id"], row, self.provider.model_id, self.provider.dimensions)
@@ -135,7 +121,7 @@ class MemoryService:
         with self.db._lock:
             rows = self.db.connection.execute("""SELECT r.*,b.summary_json FROM image_cache_refs r JOIN image_cache_blobs b ON b.hash=r.hash
               WHERE r.status='ready' AND b.summary_state='ready' AND r.expires_at>? AND NOT EXISTS
-              (SELECT 1 FROM memories m WHERE m.group_id=r.namespace AND m.memory_type='image' AND m.fact_key='media_'||r.id)
+              (SELECT 1 FROM memory_records m WHERE m.group_id=r.namespace AND m.memory_type='image' AND m.fact_key='media_'||r.id)
               ORDER BY r.id LIMIT 8""", (int(time.time()),)).fetchall()
         for row in rows:
             ref = cache.reference(dict(row))
@@ -196,77 +182,8 @@ class MemoryService:
             if updated:
                 logger.info("Memory embedding backfill complete: updated=%s", updated)
 
-    async def remember(
-        self,
-        group_id: int,
-        user_id: int,
-        memory_type: str,
-        content: str,
-        *,
-        source_user_id: int | None = None,
-        confidence: float,
-        importance: float,
-        source_message_id: str,
-        explicit: bool = False,
-    ) -> tuple[int, bool]:
-        content = " ".join(content.split()).strip()
-        if memory_type not in MEMORY_TYPES:
-            raise ValueError("不支持的记忆类型。")
-        if not 2 <= len(content) <= self.settings.memory_max_chars:
-            raise ValueError(f"记忆内容需为 2～{self.settings.memory_max_chars} 字。")
-        if contains_sensitive_memory(content):
-            raise ValueError("这段内容可能包含敏感个人信息，不会写入长期记忆。")
-        if not explicit and confidence < self.settings.memory_min_confidence:
-            raise ValueError("这条信息不够确定，不写入长期记忆。")
-        hash_vector = sparse_vector(content)
-        vector, embedding_model, dimensions = await self._document_embedding(content)
-        return self.db.save_memory(
-            group_id, user_id, source_user_id if source_user_id is not None else user_id,
-            memory_type, content, vector, hash_vector, embedding_model, dimensions,
-            confidence=max(0.0, min(1.0, confidence)),
-            importance=max(0.0, min(1.0, importance)),
-            source_message_id=source_message_id,
-            max_per_user=self.settings.memory_max_per_user,
-        )
-
     async def retrieve(
         self, group_id: int, query: str, *, user_ids: Iterable[int] = (), limit: int | None = None, **filters
     ) -> list[dict[str, Any]]:
         """统一入口：身份/时间条件、FTS、Qdrant、本地降级与来源展开。"""
         return await self.retriever.search(group_id, query, user_ids=user_ids, limit=limit, **filters)
-
-
-REMEMBER_MEMORY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "remember_group_memory",
-        "description": "把当前批次某位群友明确说出的、未来仍有用的稳定信息写入长期记忆。不保存猜测、一次性情绪、敏感信息或普通寒暄。静默执行，不需要向群里播报。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "source_message_id": {"type": "string", "description": "支持该事实的本批新消息号"},
-                "subject_user_id": {"type": "integer", "description": "事实所属群友的QQ号；群梗填0"},
-                "memory_type": {
-                    "type": "string",
-                    "enum": ["profile", "preference", "event", "relationship", "group_meme"],
-                },
-                "content": {"type": "string", "minLength": 2, "maxLength": 200},
-                "confidence": {"type": "number", "minimum": 0.75, "maximum": 1},
-                "importance": {"type": "number", "minimum": 0, "maximum": 1},
-            },
-            "required": ["source_message_id", "subject_user_id", "memory_type", "content", "confidence", "importance"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-
-MEMORY_INSTRUCTIONS = """
-
-【长期成员记忆】
-程序会提供按当前群和相关成员过滤后的长期记忆。它只是背景：仅在确实相关时自然使用，不复述记忆编号、置信度或数据库细节。
-QQ号是稳定身份；昵称相同不代表同一个人，昵称变化也不代表换人。绝不把甲的资料、经历或情绪套给乙。
-remember_group_memory只保存本批新消息中本人明确说出的、未来对聊天仍有帮助的信息，例如稳定资料、偏好、重要经历、固定称呼或反复使用的群梗。
-普通寒暄、一次性情绪、玩笑中的虚构、推测出的性格、密码/证件/电话/住址等敏感信息一律不保存。不为显得聪明而强行记忆。
-事实属于某人时subject_user_id必须等于来源消息的发言人QQ；只有不属于个人的群梗才使用0和group_meme。工具成功或发现重复都保持安静，不发送“已记住”。
-"""

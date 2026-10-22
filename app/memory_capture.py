@@ -248,7 +248,7 @@ class MemoryCapture:
         # 额外提供忘记标记，阻止后台把刚忘掉的旧内容再提取回来。
         with self.db._lock:
             tombstones = self.db.connection.execute(
-                "SELECT * FROM memories WHERE group_id=? AND status='forgotten' ORDER BY updated_at DESC LIMIT 40", (namespace,),
+                "SELECT * FROM memory_records WHERE group_id=? AND status='forgotten' ORDER BY updated_at DESC LIMIT 40", (namespace,),
             ).fetchall()
         public_existing = [{"id": r["id"], "subject_user_id": r["user_id"], "memory_type": r["memory_type"],
                             "content": r["content"], "fact_key": r["fact_key"], "status": r["status"]}
@@ -343,7 +343,7 @@ class MemoryCapture:
             # 尊重已遗忘内容，只有本人新要求记住时才允许重新入库。
             with self.db._lock:
                 forgotten = self.db.connection.execute(
-                    "SELECT 1 FROM memories WHERE group_id=? AND user_id=? AND status='forgotten' AND (fact_key=? OR content=?) LIMIT 1",
+                    "SELECT 1 FROM memory_records WHERE group_id=? AND user_id=? AND status='forgotten' AND (fact_key=? OR content=?) LIMIT 1",
                     (namespace, subject, action["fact_key"], action["content"]),
                 ).fetchone()
             if forgotten or self.db.memories.blocked(namespace, subject, action["fact_key"], action["content"], ids, candidate.conditions):

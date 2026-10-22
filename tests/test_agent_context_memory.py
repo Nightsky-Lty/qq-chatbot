@@ -75,7 +75,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("先解释", rows[0]["content"])
         self.assertTrue(json.loads(rows[0]["sources_json"]))
-        self.assertEqual(self.db.connection.execute("SELECT status FROM memories WHERE id=?", (old_id,)).fetchone()[0], "superseded")
+        self.assertEqual(self.db.connection.execute("SELECT status FROM memory_records WHERE id=?", (old_id,)).fetchone()[0], "superseded")
 
     async def test_provenance_and_atomic_rejection(self):
         record = self.private(11, "记住我喜欢先给正确句子")
@@ -109,7 +109,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_records_not_recalled(self):
         old_id = await self.store_private()
-        self.db.connection.execute("UPDATE memories SET expires_at=? WHERE id=?", (int(time.time()) - 1, old_id))
+        self.db.connection.execute("UPDATE memory_records SET expires_at=? WHERE id=?", (int(time.time()) - 1, old_id))
         self.db.connection.commit()
         self.assertEqual(await self.memory.retrieve(-11, "英语", user_ids={11}), [])
 
@@ -126,7 +126,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         state = self.db.connection.execute("SELECT * FROM memory_capture_state WHERE namespace=-11").fetchone()
         self.assertEqual(state["cursor_id"], first)
         self.assertEqual(state["requested_id"], second)
-        self.assertIn("sources_json", {r["name"] for r in self.db.connection.execute("PRAGMA table_info(memories)")})
+        self.assertIn("sources_json", {r["name"] for r in self.db.connection.execute("PRAGMA table_info(memory_records)")})
 
     async def test_clear_private_data_invalidates_inflight_sources(self):
         await self.store_private()

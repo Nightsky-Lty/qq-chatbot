@@ -82,14 +82,14 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         source = self.source(content, ns, user)
         self.model.actions = [self.action(source, content, kind, user, **extra)]
         await self.capture.extract(ns, self.db.memory_source_rows(ns, {source}))
-        row = self.db.connection.execute("SELECT * FROM memories WHERE group_id=? AND content=?", (ns, content)).fetchone()
+        row = self.db.connection.execute("SELECT * FROM memory_records WHERE group_id=? AND content=?", (ns, content)).fetchone()
         return source, dict(row)
 
     async def test_old_event_not_lost_to_recent_300_and_cross_speaker_recall(self):
         _, old = await self.save("QQ22修复了火星数据库连接错误", user=22)
         # 直接写入测试夹具，避免400次模型/向量调用；旧记录必须仍能被FTS命中。
         with self.db.connection:
-            self.db.connection.executemany("INSERT INTO memories(group_id,user_id,source_user_id,memory_type,content,created_at,updated_at,layer) VALUES(7,11,11,'event',?,?,?,'event')",
+            self.db.connection.executemany("INSERT INTO memory_records(group_id,user_id,source_user_id,memory_type,content,created_at,updated_at,layer) VALUES(7,11,11,'event',?,?,?,'event')",
                                            [(f"普通事件{i}", int(time.time()), int(time.time())) for i in range(400)])
         rows = await self.memory.retrieve(7, "火星数据库怎么修复", user_ids={11})
         self.assertIn(old["id"], [r.get("记忆编号") for r in rows])
@@ -142,7 +142,7 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         source = self.source("我们聊天提到坐牢")
         self.model.actions = [self.action(source, "本群坐牢可能表示调试", "group_meme", 0, meaning="长时间调试")]
         await self.capture.extract(7, self.db.memory_source_rows(7, {source}))
-        self.assertEqual(self.db.connection.execute("SELECT status FROM memories").fetchone()[0], "candidate")
+        self.assertEqual(self.db.connection.execute("SELECT status FROM memory_records").fetchone()[0], "candidate")
         self.assertEqual(await self.memory.retrieve(7, "坐牢什么意思", user_ids={11}), [])
         source = self.source("我们这里坐牢指的是长时间调试程序")
         self.model.actions = [self.action(source, "本群坐牢表示长时间调试程序", "group_meme", 0,
@@ -211,7 +211,7 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.memories.row(7, row["id"], active=False)["status"], "superseded")
         self.assertTrue(self.db.connection.execute("SELECT * FROM memory_revisions WHERE memory_id=?", (row["id"],)).fetchone())
         self.assertFalse((await registry.execute("memory_update", args))["ok"])
-        newest = dict(self.db.connection.execute("SELECT * FROM memories WHERE status='active'").fetchone())
+        newest = dict(self.db.connection.execute("SELECT * FROM memory_records WHERE status='active'").fetchone())
         source = self.source("删除我的绿茶偏好")
         registry = ToolRegistry()
         register_memory_tools(registry, self.capture, 7, 22, self.db.memory_source_rows(7, {source}))
@@ -220,7 +220,7 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         registry = ToolRegistry()
         register_memory_tools(registry, self.capture, 7, 11, self.db.memory_source_rows(7, {source}))
         self.assertTrue((await registry.execute("memory_delete", args))["ok"])
-        self.assertEqual(self.db.connection.execute("SELECT count(*) FROM memories").fetchone()[0], 0)
+        self.assertEqual(self.db.connection.execute("SELECT count(*) FROM memory_records").fetchone()[0], 0)
         self.assertEqual(self.db.connection.execute("SELECT count(*) FROM memory_revisions").fetchone()[0], 0)
         self.assertTrue(self.db.connection.execute("SELECT * FROM memory_index_jobs").fetchone())
 

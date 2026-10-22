@@ -1,4 +1,4 @@
-"""SQLite权威记忆：兼容旧memories，分层、证据、FTS、版本、遗忘和可恢复任务。"""
+"""分层记忆权威存储：证据、FTS、版本、遗忘和可恢复任务。"""
 
 import hashlib
 import json
@@ -31,19 +31,6 @@ class MemoryStore:
         self.db = db
         conn = db.connection
         conn.create_function("memory_terms", 1, terms, deterministic=True)
-        with db._lock, conn:
-            columns = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
-            for name, definition in (
-                ("layer", "TEXT NOT NULL DEFAULT 'abstract'"),
-                ("version", "INTEGER NOT NULL DEFAULT 1"),
-                ("occurred_at", "INTEGER NOT NULL DEFAULT 0"),
-                ("evidence_kind", "TEXT NOT NULL DEFAULT 'reported'"),
-                ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
-            ):
-                if name not in columns:
-                    conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
-            conn.execute("UPDATE memories SET layer='event' WHERE memory_type IN ('event','episode','commitment') AND layer='abstract'")
-            conn.execute("UPDATE memories SET occurred_at=created_at WHERE occurred_at=0")
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS memory_revisions(
           memory_id INTEGER NOT NULL, version INTEGER NOT NULL, snapshot_json TEXT NOT NULL,
@@ -69,23 +56,26 @@ class MemoryStore:
         CREATE TABLE IF NOT EXISTS memory_media_links(
           namespace INTEGER NOT NULL,event_id INTEGER NOT NULL,ref_id INTEGER NOT NULL,
           PRIMARY KEY(namespace,event_id,ref_id));
-        CREATE INDEX IF NOT EXISTS idx_memory_layer_scope ON memories(group_id,layer,status);
+        CREATE INDEX IF NOT EXISTS idx_memory_layer_scope ON memory_records(group_id,layer,status);
+        CREATE INDEX IF NOT EXISTS idx_memory_records_owner ON memory_records(group_id,user_id,updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_records_source ON memory_records(group_id,source_user_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(terms);
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_source_fts USING fts5(
           namespace UNINDEXED, source_id UNINDEXED, terms);
         CREATE TABLE IF NOT EXISTS memory_schema_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-        CREATE VIEW IF NOT EXISTS memory_events AS SELECT * FROM memories WHERE layer='event';
-        CREATE VIEW IF NOT EXISTS memory_concepts AS SELECT * FROM memories WHERE layer='abstract';
-        CREATE TRIGGER IF NOT EXISTS memory_insert_index AFTER INSERT ON memories BEGIN
+        CREATE VIEW IF NOT EXISTS memory_events AS SELECT * FROM memory_records WHERE layer='event';
+        CREATE VIEW IF NOT EXISTS memory_concepts AS SELECT * FROM memory_records WHERE layer='abstract';
+        CREATE VIEW IF NOT EXISTS memory_percepts AS SELECT * FROM memory_records WHERE layer='perceptual';
+        CREATE TRIGGER IF NOT EXISTS memory_insert_index AFTER INSERT ON memory_records BEGIN
           INSERT INTO memory_fts(rowid,terms) VALUES(new.id,memory_terms(new.content||' '||new.fact_key));
           INSERT OR REPLACE INTO memory_index_jobs(memory_id,revision) VALUES(new.id,new.version);
         END;
-        CREATE TRIGGER IF NOT EXISTS memory_update_index AFTER UPDATE OF content,fact_key,status,vector,embedding_model,metadata_json,version ON memories BEGIN
+        CREATE TRIGGER IF NOT EXISTS memory_update_index AFTER UPDATE OF content,fact_key,status,vector,embedding_model,metadata_json,version ON memory_records BEGIN
           DELETE FROM memory_fts WHERE rowid=old.id;
           INSERT INTO memory_fts(rowid,terms) VALUES(new.id,memory_terms(new.content||' '||new.fact_key));
           INSERT OR REPLACE INTO memory_index_jobs(memory_id,revision) VALUES(new.id,new.version);
         END;
-        CREATE TRIGGER IF NOT EXISTS memory_delete_index AFTER DELETE ON memories BEGIN
+        CREATE TRIGGER IF NOT EXISTS memory_delete_index AFTER DELETE ON memory_records BEGIN
           DELETE FROM memory_fts WHERE rowid=old.id;
           INSERT OR REPLACE INTO memory_index_jobs(memory_id,revision) VALUES(old.id,old.version+1);
           DELETE FROM memory_links WHERE source_id=old.id OR target_id=old.id;
@@ -106,18 +96,18 @@ class MemoryStore:
         with db._lock, conn:
             if conn.execute("SELECT 1 FROM memory_schema_meta WHERE key='fts_v1'").fetchone() is None:
                 conn.execute("DELETE FROM memory_fts")
-                conn.execute("INSERT INTO memory_fts(rowid,terms) SELECT id,memory_terms(content||' '||fact_key) FROM memories")
+                conn.execute("INSERT INTO memory_fts(rowid,terms) SELECT id,memory_terms(content||' '||fact_key) FROM memory_records")
                 conn.execute("DELETE FROM memory_source_fts")
                 conn.execute("INSERT INTO memory_source_fts SELECT group_id,id,memory_terms(content) FROM messages")
                 conn.execute("INSERT INTO memory_source_fts SELECT -user_id,id,memory_terms(content) FROM private_messages")
-                conn.execute("INSERT OR IGNORE INTO memory_index_jobs(memory_id,revision) SELECT id,version FROM memories")
+                conn.execute("INSERT OR IGNORE INTO memory_index_jobs(memory_id,revision) SELECT id,version FROM memory_records")
                 conn.execute("INSERT INTO memory_schema_meta VALUES('fts_v1','1')")
             if conn.execute("SELECT 1 FROM memory_schema_meta WHERE key='forgotten_redaction_v1'").fetchone() is None:
-                for row in conn.execute("SELECT * FROM memories WHERE status='forgotten'").fetchall():
+                for row in conn.execute("SELECT * FROM memory_records WHERE status='forgotten'").fetchall():
                     sources = [s.get("id") for s in json.loads(row["sources_json"]) if type(s.get("id")) is int]
                     conn.execute("INSERT OR IGNORE INTO memory_blocks VALUES(?,?,?,?,?,?)", (row["group_id"], row["user_id"],
                         fingerprint(row["fact_key"] + "|"), fingerprint(row["content"]), json.dumps(sources), int(time.time())))
-                    conn.execute("UPDATE memories SET content=?,fact_key='',sources_json='[]',vector='{}',hash_vector='{}',metadata_json='{}',version=version+1 WHERE id=?",
+                    conn.execute("UPDATE memory_records SET content=?,fact_key='',sources_json='[]',vector='{}',hash_vector='{}',metadata_json='{}',version=version+1 WHERE id=?",
                                  (f"[已遗忘:{row['id']}]", row["id"]))
                 conn.execute("INSERT INTO memory_schema_meta VALUES('forgotten_redaction_v1','1')")
 
@@ -127,7 +117,7 @@ class MemoryStore:
 
     def row(self, namespace: int, memory_id: int, *, active: bool = True):
         with self.db._lock:
-            row = self.db.connection.execute("SELECT * FROM memories WHERE group_id=? AND id=?", (namespace, memory_id)).fetchone()
+            row = self.db.connection.execute("SELECT * FROM memory_records WHERE group_id=? AND id=?", (namespace, memory_id)).fetchone()
             if row is None or (active and (row["status"] != "active" or (row["expires_at"] and row["expires_at"] <= time.time()))):
                 return None
             return dict(row)
@@ -191,9 +181,9 @@ class MemoryStore:
                      if item["layer"] == "abstract" else fingerprint(""), fingerprint(item["content"]), json.dumps(sources), int(time.time())))
                 self.db.connection.execute("DELETE FROM memory_revisions WHERE memory_id=?", (target,))
                 if delete:
-                    self.db.connection.execute("DELETE FROM memories WHERE id=?", (target,))
+                    self.db.connection.execute("DELETE FROM memory_records WHERE id=?", (target,))
                 else:
-                    self.db.connection.execute("""UPDATE memories SET status='forgotten',content=?,fact_key='',sources_json='[]',
+                    self.db.connection.execute("""UPDATE memory_records SET status='forgotten',content=?,fact_key='',sources_json='[]',
                       metadata_json='{}',vector='{}',hash_vector='{}',version=version+1,updated_at=? WHERE id=?""",
                       (f"[已遗忘:{target}]", int(time.time()), target))
                 self.db.connection.execute("DELETE FROM memory_links WHERE namespace=? AND (source_id=? OR target_id=?)", (namespace, target, target))
@@ -219,20 +209,20 @@ class MemoryStore:
                     if not old or old["user_id"] != subject or old["version"] != action.get("expected_versions", {}).get(old_id, old["version"]):
                         raise ValueError("旧记忆版本已变化")
                     self.remember_revision(old)
-                    conn.execute("UPDATE memories SET status='superseded',version=version+1,updated_at=? WHERE id=?", (now, old_id))
+                    conn.execute("UPDATE memory_records SET status='superseded',version=version+1,updated_at=? WHERE id=?", (now, old_id))
                 if action["action"] == "forget":
                     # 自动整理不拥有删除/遗忘权限；显式操作走独立绑定工具。
                     raise ValueError("遗忘必须使用本人授权的专用工具")
                 metadata = action.get("metadata", {})
-                duplicate = conn.execute("SELECT * FROM memories WHERE group_id=? AND user_id=? AND memory_type=? AND content=?",
+                duplicate = conn.execute("SELECT * FROM memory_records WHERE group_id=? AND user_id=? AND memory_type=? AND content=?",
                                          (namespace, subject, action["memory_type"], action["content"])).fetchone()
                 if duplicate and self.layer(action["memory_type"]) == "event" and duplicate["occurred_at"] != action.get("occurred_at", 0):
-                    # 旧库按正文唯一；相同描述在不同时间发生不能被当成同一事件。
+                    # 正文唯一键用于幂等；相同描述在不同时间发生不能被当成同一事件。
                     original = action["content"]
                     suffix = f" [事件时间:{action.get('occurred_at', 0)}]"
                     action["content"] = original[:max(2, getattr(self.db, "memory_max_chars", 200) - len(suffix))] + suffix
                     metadata["original_summary"] = original
-                    duplicate = conn.execute("SELECT * FROM memories WHERE group_id=? AND user_id=? AND memory_type=? AND content=?",
+                    duplicate = conn.execute("SELECT * FROM memory_records WHERE group_id=? AND user_id=? AND memory_type=? AND content=?",
                                              (namespace, subject, action["memory_type"], action["content"])).fetchone()
                     if self.blocked(namespace, subject, action["fact_key"], action["content"], action["source_ids"], metadata.get("conditions", "")):
                         raise ValueError("该事件版本已被遗忘")
@@ -248,17 +238,17 @@ class MemoryStore:
                         continue
                     sources = {s["id"]: s for s in json.loads(duplicate["sources_json"])}
                     sources.update({s["id"]: s for s in action["sources"]})
-                    conn.execute("UPDATE memories SET sources_json=? WHERE id=?", (json.dumps(list(sources.values())[-24:], ensure_ascii=False), duplicate["id"]))
+                    conn.execute("UPDATE memory_records SET sources_json=? WHERE id=?", (json.dumps(list(sources.values())[-24:], ensure_ascii=False), duplicate["id"]))
                     if duplicate["status"] == "candidate" and action.get("status", "active") == "active":
                         self.remember_revision(dict(duplicate))
-                        conn.execute("UPDATE memories SET status='active',version=version+1,metadata_json=?,evidence_kind=?,updated_at=? WHERE id=?",
+                        conn.execute("UPDATE memory_records SET status='active',version=version+1,metadata_json=?,evidence_kind=?,updated_at=? WHERE id=?",
                             (json.dumps(metadata, ensure_ascii=False), action.get("evidence_kind", "reported"), now, duplicate["id"]))
                         stats["stored"] += 1
                     else:
                         stats["duplicates"] += 1
                     memory_id = duplicate["id"]
                 else:
-                    cur = conn.execute("""INSERT INTO memories(group_id,user_id,source_user_id,memory_type,content,vector,hash_vector,
+                    cur = conn.execute("""INSERT INTO memory_records(group_id,user_id,source_user_id,memory_type,content,vector,hash_vector,
                       embedding_model,embedding_dimensions,importance,confidence,source_message_id,created_at,updated_at,
                       fact_key,sources_json,expires_at,layer,status,occurred_at,evidence_kind,metadata_json)
                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", values)
@@ -273,8 +263,8 @@ class MemoryStore:
                 for ref_id in metadata.get("media_refs", []):
                     conn.execute("INSERT OR IGNORE INTO memory_media_links VALUES(?,?,?)", (namespace, memory_id, ref_id))
             for subject in {a["subject_user_id"] for a in actions}:
-                conn.execute("""UPDATE memories SET status='archived',version=version+1 WHERE id IN
-                  (SELECT id FROM memories WHERE group_id=? AND user_id=? AND status='active' AND layer!='perceptual'
+                conn.execute("""UPDATE memory_records SET status='archived',version=version+1 WHERE id IN
+                  (SELECT id FROM memory_records WHERE group_id=? AND user_id=? AND status='active' AND layer!='perceptual'
                   ORDER BY importance DESC,updated_at DESC,id DESC LIMIT -1 OFFSET ?)""",
                   (namespace, subject, getattr(self.db, "memory_max_per_user", 200)))
             if cursor_id is not None:
@@ -302,11 +292,11 @@ class MemoryStore:
     def clear_user(self, namespace: int, user_id: int):
         """在调用方事务内删除本人以及含本人来源的派生记忆和待整理任务。"""
         conn = self.db.connection
-        for row in conn.execute("SELECT * FROM memories WHERE group_id=?", (namespace,)).fetchall():
+        for row in conn.execute("SELECT * FROM memory_records WHERE group_id=?", (namespace,)).fetchall():
             sources = json.loads(row["sources_json"])
             if row["user_id"] == user_id or any(s.get("user_id") == user_id for s in sources):
                 conn.execute("DELETE FROM memory_revisions WHERE memory_id=?", (row["id"],))
-                conn.execute("DELETE FROM memories WHERE id=?", (row["id"],))
+                conn.execute("DELETE FROM memory_records WHERE id=?", (row["id"],))
         table, key, target = ("messages", "group_id", namespace) if namespace > 0 else ("private_messages", "user_id", -namespace)
         own_ids = {r[0] for r in conn.execute(f"SELECT id FROM {table} WHERE {key}=?" + (" AND user_id=?" if namespace > 0 else ""),
                    (target, user_id) if namespace > 0 else (target,))}

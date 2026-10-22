@@ -74,7 +74,7 @@ class ImageCache:
             return True
         # 原始聊天自然到期后，只有仍被有效长期事件引用的图片可继续保留。
         return bool(row["retained"] and self.db.connection.execute("""SELECT 1 FROM memory_media_links l
-          JOIN memories m ON m.id=l.event_id WHERE l.namespace=? AND l.ref_id=? AND m.group_id=?
+          JOIN memory_records m ON m.id=l.event_id WHERE l.namespace=? AND l.ref_id=? AND m.group_id=?
           AND m.status='active' AND (m.expires_at=0 OR m.expires_at>?) LIMIT 1""",
           (ns, row["id"], ns, int(time.time()))).fetchone())
 
@@ -162,7 +162,7 @@ class ImageCache:
         until = max(row["expires_at"], int(time.time()) + self.settings.image_memory_retention_days * 86400)
         with self.db._lock, self.db.connection:
             self.db.connection.execute("UPDATE image_cache_refs SET expires_at=?,retained=1 WHERE id=? AND namespace=?", (until, ref_id, namespace))
-            self.db.connection.execute("UPDATE memories SET expires_at=? WHERE group_id=? AND memory_type='image' AND fact_key=?", (until, namespace, f"media_{ref_id}"))
+            self.db.connection.execute("UPDATE memory_records SET expires_at=? WHERE group_id=? AND memory_type='image' AND fact_key=?", (until, namespace, f"media_{ref_id}"))
         return True
 
     def _path(self, digest: str) -> Path:

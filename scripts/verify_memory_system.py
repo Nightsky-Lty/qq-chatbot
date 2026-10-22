@@ -40,9 +40,9 @@ async def main(live):
             assert memory.index.enabled, "Qdrant URL required"
             source = db.log_private_message(110001, "user", "这是一段合成测试：昨天我排查测试网站502错误，启动上游服务后已经恢复。这次具体经历以后排障还会用到，请记住。")
             workspace = capture.open_workspace(-110001, {source})
-            workspace.messages.append({"role": "assistant", "reasoning_content": "synthetic internal scratch, never persist"})
+            assert not hasattr(workspace, "messages"), "任务证据不能承载内部推理/工具链"
             capture.close_workspace(workspace)
-            assert workspace.closed and not workspace.messages
+            assert workspace.closed and not workspace.source_ids and not workspace.search_cache
             assert await capture.process_task_once()
             active = db.memory_candidates(-110001, {110001}, 20)
             assert active, "no synthetic memory stored"
