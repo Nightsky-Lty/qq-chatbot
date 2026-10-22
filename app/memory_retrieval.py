@@ -207,8 +207,8 @@ class HybridRetriever:
         value = {"记忆编号": row["id"], "层": row["layer"], "成员QQ": row["user_id"] or None,
                  "内容": metadata.get("original_summary", row["content"]), "版本": row["version"], "发生时间": row["occurred_at"] or None,
                  "记录时间": row["created_at"], "依据": row["evidence_kind"], "有效期": row["expires_at"] or None}
-        if metadata.get("storage_migration") and not any(s.get("content") for s in json.loads(row["sources_json"])):
-            value["来源说明"] = "由旧记忆迁入，缺少原始来源摘录；不是本轮新证据"
+        if not any(s.get("content") for s in json.loads(row["sources_json"])):
+            value["来源说明"] = "缺少原始来源摘录；不是本轮新证据"
         for field in ("conditions", "uncertain", "media_ref_id", "aliases", "participants"):
             if metadata.get(field):
                 value[field] = metadata[field]

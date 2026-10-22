@@ -102,14 +102,6 @@ class MemoryStore:
                 conn.execute("INSERT INTO memory_source_fts SELECT -user_id,id,memory_terms(content) FROM private_messages")
                 conn.execute("INSERT OR IGNORE INTO memory_index_jobs(memory_id,revision) SELECT id,version FROM memory_records")
                 conn.execute("INSERT INTO memory_schema_meta VALUES('fts_v1','1')")
-            if conn.execute("SELECT 1 FROM memory_schema_meta WHERE key='forgotten_redaction_v1'").fetchone() is None:
-                for row in conn.execute("SELECT * FROM memory_records WHERE status='forgotten'").fetchall():
-                    sources = [s.get("id") for s in json.loads(row["sources_json"]) if type(s.get("id")) is int]
-                    conn.execute("INSERT OR IGNORE INTO memory_blocks VALUES(?,?,?,?,?,?)", (row["group_id"], row["user_id"],
-                        fingerprint(row["fact_key"] + "|"), fingerprint(row["content"]), json.dumps(sources), int(time.time())))
-                    conn.execute("UPDATE memory_records SET content=?,fact_key='',sources_json='[]',vector='{}',hash_vector='{}',metadata_json='{}',version=version+1 WHERE id=?",
-                                 (f"[已遗忘:{row['id']}]", row["id"]))
-                conn.execute("INSERT INTO memory_schema_meta VALUES('forgotten_redaction_v1','1')")
 
     @staticmethod
     def layer(kind: str) -> str:

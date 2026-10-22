@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import json
-import sqlite3
 import tempfile
 import time
 import unittest
@@ -151,25 +150,6 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GroupContextTests(unittest.TestCase):
-    def test_legacy_database_migrates_without_losing_memory(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "old.db"
-            connection = sqlite3.connect(path)
-            connection.executescript("""
-                CREATE TABLE memories(id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, user_id INTEGER,
-                    source_user_id INTEGER,memory_type TEXT,content TEXT,vector TEXT,importance REAL,
-                    confidence REAL,source_message_id TEXT,created_at INTEGER,updated_at INTEGER,last_accessed_at INTEGER,
-                    UNIQUE(group_id,user_id,memory_type,content));
-                INSERT INTO memories VALUES(1,7,11,11,'preference','原有偏好','{}',0.8,0.9,'100',1,1,0);
-            """)
-            connection.close()
-            db = Database(path)
-            rows = db.memory_candidates(7, {11}, 10)
-            self.assertEqual(rows[0]["content"], "原有偏好")
-            self.assertEqual(rows[0]["status"], "active")
-            self.assertEqual(rows[0]["sources_json"], "[]")
-            db.close()
-
     def test_timeline_keeps_identity_quotes_and_no_duplicate_bot_history(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "test.db")

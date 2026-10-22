@@ -128,10 +128,10 @@ class Database:
         self.capture_enabled = False
         self.capture_delay = 30
         self.message_listener = None
-        # 必须先备份/迁移，再建立业务表；不重新创建旧记忆表。
+        # 仅初始化当前分层记忆表，不读取旧记忆存储。
         from app.memory_schema import initialize_memory_schema
         try:
-            self.memory_migration_backup = initialize_memory_schema(self.connection, path)
+            initialize_memory_schema(self.connection)
         except BaseException:
             self.connection.close()
             raise
@@ -148,7 +148,7 @@ class Database:
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_group_role_id ON messages(group_id,role,id DESC)")
             # 旧库的授权表和样本资格字段不再读写，原样保留，避免为升级重建消息表。
             self._migrate_legacy_lists()
-        # 运行时只访问分层存储，旧表仅由一次性导入器识别。
+        # 运行时只访问当前分层存储。
         from app.memory_store import MemoryStore
         self.memories = MemoryStore(self)
 
