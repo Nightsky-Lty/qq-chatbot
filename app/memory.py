@@ -11,6 +11,8 @@ from typing import Any, Iterable
 
 from app.config import Settings
 from app.database import Database
+from app.memory_index import MemoryIndex
+from app.memory_retrieval import HybridRetriever
 from app.embeddings import (
     HASH_MODEL_ID,
     EmbeddingProvider,
@@ -60,12 +62,18 @@ class MemoryService:
         self.provider = provider or create_embedding_provider(settings)
         self.hash_provider = HashEmbeddingProvider()
         self._backfill_task: asyncio.Task[None] | None = None
+        self.index = MemoryIndex(settings)
+        self.retriever = HybridRetriever(self)
+        self.image_cache = None
+        self._index_task = None
 
     async def start(self) -> None:
         """预热向量模型；失败时保持服务可用，并自动退回特征哈希。"""
         if not self.settings.memory_enabled:
             return
         ready = await self.provider.start()
+        if self._index_task is None:
+            self._index_task = asyncio.create_task(self._index_loop(), name="memory-index-sync")
         if ready and self.provider.model_id != HASH_MODEL_ID:
             self._backfill_task = asyncio.create_task(
                 self._backfill_embeddings(), name="memory-embedding-backfill"
@@ -76,6 +84,78 @@ class MemoryService:
             self._backfill_task.cancel()
             await asyncio.gather(self._backfill_task, return_exceptions=True)
         self._backfill_task = None
+        if self._index_task:
+            self._index_task.cancel()
+            await asyncio.gather(self._index_task, return_exceptions=True)
+        await self.index.close()
+
+    async def _index_loop(self):
+        while True:
+            try:
+                with self.db._lock, self.db.connection:
+                    self.db.connection.execute("UPDATE memories SET status='archived',version=version+1 WHERE status='active' AND expires_at>0 AND expires_at<=?", (int(time.time()),))
+                await self.sync_images()
+                await self.sync_index_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Memory index worker deferred: error=%s", type(exc).__name__)
+            await asyncio.sleep(2)
+
+    async def sync_index_once(self):
+        if not self.index.enabled or self.provider.model_id == HASH_MODEL_ID or not self.provider.available:
+            return 0
+        with self.db._lock:
+            jobs = self.db.connection.execute("SELECT * FROM memory_index_jobs WHERE due_at<=? ORDER BY due_at,memory_id LIMIT 16", (int(time.time()),)).fetchall()
+        completed = 0
+        for job in jobs:
+            with self.db._lock:
+                found = self.db.connection.execute("SELECT * FROM memories WHERE id=?", (job["memory_id"],)).fetchone()
+                row = dict(found) if found else None
+            try:
+                await self.index.sync(job["memory_id"], row, self.provider.model_id, self.provider.dimensions)
+                with self.db._lock, self.db.connection:
+                    self.db.connection.execute("DELETE FROM memory_index_jobs WHERE memory_id=? AND revision=?", (job["memory_id"], job["revision"]))
+                completed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                with self.db._lock, self.db.connection:
+                    self.db.connection.execute("UPDATE memory_index_jobs SET attempts=attempts+1,due_at=? WHERE memory_id=? AND revision=?",
+                        (int(time.time()) + min(3600, 10 * 2 ** min(job["attempts"], 8)), job["memory_id"], job["revision"]))
+                logger.warning("Memory index sync deferred: error=%s", type(exc).__name__)
+                self.index.retry_after = time.monotonic() + 30
+                break
+        return completed
+
+    async def sync_images(self):
+        cache = self.image_cache
+        if cache is None or not cache.enabled:
+            return
+        with self.db._lock:
+            rows = self.db.connection.execute("""SELECT r.*,b.summary_json FROM image_cache_refs r JOIN image_cache_blobs b ON b.hash=r.hash
+              WHERE r.status='ready' AND b.summary_state='ready' AND r.expires_at>? AND NOT EXISTS
+              (SELECT 1 FROM memories m WHERE m.group_id=r.namespace AND m.memory_type='image' AND m.fact_key='media_'||r.id)
+              ORDER BY r.id LIMIT 8""", (int(time.time()),)).fetchall()
+        for row in rows:
+            ref = cache.reference(dict(row))
+            if not cache.authorized(ref):
+                continue
+            summary = json.loads(row["summary_json"])
+            content = f"图片media_{row['id']}概要（非原话）：{summary['summary']}\n图中文字：{summary['text']}"[:self.settings.memory_max_chars]
+            if contains_sensitive_memory(content) or self.db.memories.blocked(row["namespace"], row["user_id"], f"media_{row['id']}", content, [row["source_id"]]):
+                continue
+            vector, model, dimensions = await self._document_embedding(content)
+            sources = self.db.memory_source_rows(row["namespace"], {row["source_id"]})
+            if not sources or not cache.authorized(ref):
+                continue
+            action = {"action": "upsert", "subject_user_id": row["user_id"], "memory_type": "image", "content": content,
+                      "fact_key": f"media_{row['id']}", "source_ids": [row["source_id"]], "replaces_ids": [],
+                      "sources": [{"id": row["source_id"], "user_id": row["user_id"], "role": "user", "time": row["created_at"], "content": "[图片附件]"}],
+                      "vector": vector, "hash_vector": sparse_vector(content), "embedding_model": model, "embedding_dimensions": dimensions,
+                      "importance": 0.3, "confidence": 0.8, "expires_at": row["expires_at"], "occurred_at": row["created_at"],
+                      "evidence_kind": "image_summary", "metadata": {"media_ref_id": row["id"], "uncertain": summary["uncertain"]}}
+            self.db.apply_memory_capture(row["namespace"], None, 0, [action])
 
     async def _document_embedding(self, content: str) -> tuple[str, str, int]:
         """生成主向量；模型不可用时本次写入使用可检索的哈希向量。"""
@@ -103,7 +183,7 @@ class MemoryService:
                     raise RuntimeError("Embedding后端返回数量与输入不一致")
                 for row, vector in zip(rows, vectors):
                     self.db.update_memory_embedding(
-                        row["id"], vector, self.provider.model_id, self.provider.dimensions
+                        row["id"], vector, self.provider.model_id, self.provider.dimensions, row["content"]
                     )
                     updated += 1
                 # 给在线查询留出调度机会，避免大量旧记忆回填时持续占满 CPU。
@@ -150,80 +230,10 @@ class MemoryService:
         )
 
     async def retrieve(
-        self, group_id: int, query: str, *, user_ids: Iterable[int], limit: int | None = None
+        self, group_id: int, query: str, *, user_ids: Iterable[int] = (), limit: int | None = None, **filters
     ) -> list[dict[str, Any]]:
-        """先按群和参与者过滤，再按向量、重要度、新鲜度进行混合排序。"""
-        if not self.settings.memory_enabled:
-            return []
-        targets = {int(user_id) for user_id in user_ids if int(user_id) > 0}
-        rows = self.db.memory_candidates(
-            group_id, targets, max(self.settings.memory_candidate_limit, self.settings.memory_retrieval_limit)
-        )
-        hash_query_vector = sparse_vector(query)
-        dense_query_vector: str | None = None
-        if query.strip() and self.provider.model_id != HASH_MODEL_ID and self.provider.available:
-            try:
-                dense_query_vector = await self.provider.embed_query(query)
-            except Exception as exc:
-                logger.warning("Query embedding failed; using hash fallback: error=%s", type(exc).__name__)
-        query_terms = {token for token in tokens(query) if len(token) > 1}
-        now = int(time.time())
-        ranked: list[tuple[float, Any]] = []
-        normalized_query = "".join(query.casefold().split())
-        recall_interaction = bool(re.search(r"上次|之前|以前|约定|答应|说好|记得|回忆", query))
-        for row in rows:
-            use_dense = dense_query_vector is not None and row["embedding_model"] == self.provider.model_id
-            similarity = vector_similarity(
-                dense_query_vector if use_dense else hash_query_vector,
-                row["vector"] if use_dense else (row["hash_vector"] or row["vector"]),
-            )
-            content_terms = {token for token in tokens(row["content"]) if len(token) > 1}
-            lexical_overlap = bool(query_terms & content_terms)
-            content_key = "".join(row["content"].casefold().split())
-            exact = 0.15 if content_key and normalized_query and (
-                content_key in normalized_query or normalized_query in content_key
-            ) else 0.0
-            same_person = 0.12 if row["user_id"] in targets else 0.0
-            age_days = max(0.0, (now - row["updated_at"]) / 86400)
-            freshness = 1.0 / (1.0 + age_days / 90.0)
-            stable_for_person = (
-                row["memory_type"] in {"profile", "preference", "relationship", "explicit"}
-                and row["user_id"] in targets
-            )
-            joint_recall = (recall_interaction and row["memory_type"] in {"episode", "commitment"}
-                            and row["user_id"] in targets)
-            # 稳定档案始终可作为辨人背景；事件和群梗还需字面或语义相关，避免把
-            # 某人的全部往事塞进每一轮上下文。
-            semantically_related = use_dense and similarity >= self.settings.embedding_min_similarity
-            if not stable_for_person and not joint_recall and not lexical_overlap and not exact and not semantically_related:
-                continue
-            score = similarity * 0.62 + row["importance"] * 0.13 + row["confidence"] * 0.08
-            score += freshness * 0.05 + same_person + exact
-            # 稳定档案即使和代词查询没有字面重合，也应进入当前成员上下文。
-            if stable_for_person:
-                score += 0.12
-            if joint_recall:
-                score += 0.18
-            ranked.append((score, row))
-        selected = sorted(ranked, key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
-        selected = selected[: limit or self.settings.memory_retrieval_limit]
-        if selected:
-            self.db.touch_memories([row["id"] for _, row in selected])
-        return [
-            {
-                "记忆编号": row["id"],
-                "成员QQ": row["user_id"] or None,
-                "类型": MEMORY_TYPE_LABELS.get(row["memory_type"], row["memory_type"]),
-                "内容": row["content"],
-                "置信度": round(row["confidence"], 2),
-                "来源消息号": row["source_message_id"],
-                "记录时间": row["updated_at"],
-                "有效期": row["expires_at"] or None,
-                "来源摘录": [{"角色": source.get("role"), "内容": source.get("content", "")[:300],
-                              "时间": source.get("time")} for source in json.loads(row["sources_json"])],
-            }
-            for _, row in selected
-        ]
+        """统一入口：身份/时间条件、FTS、Qdrant、本地降级与来源展开。"""
+        return await self.retriever.search(group_id, query, user_ids=user_ids, limit=limit, **filters)
 
 
 REMEMBER_MEMORY_TOOL = {

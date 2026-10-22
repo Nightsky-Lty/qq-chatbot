@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     context_message_limit: int = Field(default=80, ge=1, le=200)
     context_max_chars: int = Field(default=24000, ge=1000, le=100000)
     context_bot_reply_limit: int = Field(default=12, ge=0, le=50)
-    # 群成员长期记忆：SQLite 持久化，使用本地向量做混合 RAG，不依赖额外服务。
+    # SQLite权威记录＋Qdrant语义索引；不可用时自动降级本地混合检索。
     memory_enabled: bool = True
     memory_auto_capture_enabled: bool = True
     memory_retrieval_limit: int = Field(default=8, ge=1, le=30)
@@ -84,6 +84,15 @@ class Settings(BaseSettings):
     memory_capture_delay_seconds: int = Field(default=30, ge=5, le=300)
     memory_capture_batch_size: int = Field(default=40, ge=5, le=80)
     memory_capture_retry_seconds: int = Field(default=60, ge=10, le=3600)
+    memory_qdrant_url: str = ""
+    memory_qdrant_api_key: str = ""
+    memory_qdrant_collection: str = Field(default="qq_memory", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
+    memory_qdrant_timeout_seconds: float = Field(default=3, ge=0.1, le=15)
+    memory_search_route_limit: int = Field(default=20, ge=5, le=100)
+    memory_context_max_chars: int = Field(default=5000, ge=500, le=20000)
+    memory_source_search_enabled: bool = True
+    memory_job_max_attempts: int = Field(default=5, ge=1, le=10)
+    image_memory_retention_days: int = Field(default=90, ge=7, le=365)
     # bge_onnx 使用只读挂载的本地 INT8 模型；加载或推理失败时自动退回哈希向量。
     embedding_provider: Literal["hash", "bge_onnx"] = "hash"
     embedding_model_path: Path = Path("/app/models/bge-small-zh-v1.5")

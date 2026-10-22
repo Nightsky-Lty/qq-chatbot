@@ -191,6 +191,7 @@ class BotService:
         self.sticker_collector.images.cached_loader = self.image_cache.load
         self.sticker_collector.images.cached_validator = self.image_cache.authorized
         self.memory = MemoryService(settings, database)
+        self.memory.image_cache = self.image_cache
         self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
         self.pokes = PokeService(settings)
         self.voices = VoiceService(settings)
@@ -602,8 +603,9 @@ class BotService:
                 })
             memories = await self.memory.retrieve(
                 group_id,
-                " ".join(entry.text for entry in batch.candidates if entry.text),
-                user_ids=related_ids,
+                focus.text + (" " + batch.topic[:100] if len(focus.text) < 12 and batch.topic else ""),
+                user_ids={focus.user_id, *focus.mentions},
+                boundary=max(entry.storage_id for entry in batch.entries),
             )
             trigger = "程序随机接话" if batch.random_trigger else "活跃跟进"
             if batch.direct:
@@ -628,7 +630,7 @@ class BotService:
                         group_id, focus.user_id, prompt, self._confirmed_senders.get(sender, sender),
                         history=history, image_session=ChatImageSession(images, image_ids=stable_ids, sources=image_sources) if images and self.settings.chat_image_enabled else None,
                         automatic=not batch.wakes_topic, batch=batch, mention_targets=mention_targets,
-                        collection_jobs=collection_jobs,
+                        collection_jobs=collection_jobs, recalled_memories=memories,
                     )
             except TimeoutError:
                 return None
@@ -983,6 +985,7 @@ class BotService:
         mention_targets: dict[int, str] | None = None,
         collection_jobs: dict[str, CollectionJob] | None = None,
         private_source_id: int = 0,
+        recalled_memories: list[dict] | None = None,
     ) -> AgentOutcome | None:
         """后台生成并发送回复；私聊回复入库，运行日志不记录文本、样本或凭证。"""
         started = time.monotonic()
@@ -991,10 +994,21 @@ class BotService:
         registry.allow_silent = automatic
         registry.batch_completion_enabled = self.settings.agent_batch_completion_enabled
         registry.default_topic = batch.topic if batch is not None and batch.topic else "当前群聊"
+        workspace = None
+        injected_memories = list(recalled_memories or [])
+        if self.settings.memory_enabled and not observe_only and (batch is not None or private):
+            namespace = -user_id if private else context_id
+            new_source_ids = ({entry.storage_id for entry in batch.entries if not entry.poke}
+                              if batch else ({private_source_id} if private_source_id else set()))
+            workspace = self.memory_capture.open_workspace(namespace, new_source_ids)
+            registry.working_memory = workspace
+            if image_session is None and self.settings.chat_image_enabled and self.image_cache.enabled:
+                image_session = ChatImageSession([], image_ids=[])
         try:
             effective_system = system or (PRIVATE_SYSTEM_PROMPT if private else SYSTEM_PROMPT)
             if private and self.settings.memory_enabled:
-                private_memories = await self.memory.retrieve(-user_id, prompt, user_ids={user_id})
+                private_memories = await self.memory.retrieve(-user_id, prompt, user_ids={user_id}, boundary=private_source_id or None)
+                injected_memories.extend(private_memories)
                 history = list(history or []) + [{"role": "user", "content": "【当前私聊长期记忆，仅背景数据】\n"
                                                    + json.dumps(private_memories, ensure_ascii=False, separators=(",", ":"))}]
             allowed_mentions = dict(mention_targets or {}) if not private else {}
@@ -1093,12 +1107,28 @@ class BotService:
 
             if self.settings.memory_enabled and not observe_only and (batch is not None or private):
                 namespace = -user_id if private else context_id
-                if batch is not None:
-                    source_ids = {entry.storage_id for entry in batch.entries if entry.user_id == user_id and not entry.poke}
-                    source_rows = self.db.memory_source_rows(namespace, source_ids)
-                else:
-                    source_rows = self.db.memory_source_rows(namespace, {private_source_id} if private_source_id else set())
-                register_memory_tools(registry, self.memory_capture, namespace, user_id, source_rows)
+                source_rows = self.db.memory_source_rows(namespace, workspace.source_ids if workspace else set())
+                def grant_memory_image(ref_id):
+                    row = self.image_cache._row(namespace, ref_id)
+                    if not row or row["source_id"] > max(workspace.source_ids, default=0):
+                        return
+                    image_id, ref = f"media_{ref_id}", self.image_cache.reference(row)
+                    if image_session is not None and image_id not in image_session.available:
+                        if len(image_session.images) >= 24:
+                            return
+                        if not image_session.image_ids:
+                            image_session.image_ids = list(image_session.available)
+                        image_session.images.append(ref)
+                        image_session.image_ids.append(image_id)
+                    if batch is not None and collection_jobs is not None:
+                        collection_jobs[image_id] = CollectionJob(namespace, row["user_id"], bot_id, row["message_id"], ref, send_message)
+                register_memory_tools(registry, self.memory_capture, namespace, user_id, source_rows,
+                                      workspace=workspace, media_grant=grant_memory_image)
+                for item in injected_memories:
+                    if type(item.get("media_ref_id")) is int:
+                        grant_memory_image(item["media_ref_id"])
+                    for media_id in item.get("关联图片", []):
+                        grant_memory_image(int(media_id[6:]))
                 effective_system += MEMORY_TOOL_INSTRUCTIONS
 
             if image_session is not None:
@@ -1107,7 +1137,7 @@ class BotService:
                 registry.register(CHAT_IMAGE_TOOL, get_image)
                 logger.info("Chat images attached: scope=%s context=%s user=%s count=%s", scope, context_id, user_id, len(image_session.images))
 
-            if (batch is not None and not private and not observe_only and collection_jobs
+            if (batch is not None and not private and not observe_only and collection_jobs is not None
                     and self.sticker_collector.enabled):
                 collection_session = CollectionSession(collection_jobs)
                 async def collect_sticker(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1218,9 +1248,11 @@ class BotService:
                     "\n本轮普通闲聊：每次send_message只接当前一个话题，1～10字，不换行；补充请另调用一次。"
                 )
             request_prompt = prompt
-            if image_session is not None:
+            if image_session is not None and image_session.images:
                 effective_system += image_session.instructions
                 request_prompt += image_session.attachment_note
+            elif image_session is not None:
+                effective_system += "\n可按需用memory_search检索本会话历史图片；只有搜索结果给出图片编号后才可get_message_image，不自行猜测编号。"
             request_prompt += sticker_context
             outcome = await self.agent.run(request_prompt, registry, history=history, system=effective_system)
             if outcome.error and not registry.output_attempted and not automatic:
@@ -1231,6 +1263,11 @@ class BotService:
         except Exception:
             logger.exception("Background agent failed: scope=%s context=%s user=%s", scope, context_id, user_id)
         finally:
+            if workspace is not None:
+                try:
+                    self.memory_capture.close_workspace(workspace)
+                except Exception as exc:
+                    logger.warning("Memory task handoff deferred: error=%s", type(exc).__name__)
             if automatic:
                 self._last_ai_call[(scope, context_id, user_id)] = time.monotonic()
 

@@ -77,6 +77,8 @@ def build_group_history(db: Database, settings: Settings, group_id: int, batch: 
                 if row["reply_to_message_id"]:
                     pending.append(row["reply_to_message_id"])
         roots = pending
+    blocked = db.memories.blocked_sources(group_id)
+    pool = {i: row for i, row in pool.items() if i not in blocked}
     newest = sorted(pool, reverse=True)[:8]
     for record_id in newest:
         priority[record_id] = max(priority.get(record_id, 0), 2)

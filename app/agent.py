@@ -66,6 +66,8 @@ class ReactAgent:
         else:
             messages.extend(history or [])
         messages.append({"role": "user", "content": prompt})
+        if registry.working_memory is not None:
+            registry.working_memory.messages = messages
         image_keys: set[str] = set()
         cached: dict[str, tuple[str, dict[str, Any]]] = {}
         steps = calls_used = 0

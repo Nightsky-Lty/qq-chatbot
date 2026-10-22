@@ -143,11 +143,11 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         record = self.private(11, "别忘记我的偏好")
         registry = ToolRegistry()
         register_memory_tools(registry, self.capture, -11, 11, self.db.memory_source_rows(-11, {record}))
-        self.assertFalse((await registry.execute("forget_memory", {"memory_id": old_id}))["ok"])
+        self.assertFalse((await registry.execute("memory_forget", {"memory_id": old_id, "expected_version": 1}))["ok"])
         record = self.private(12, "忘掉我的偏好")
         registry = ToolRegistry()
         register_memory_tools(registry, self.capture, -12, 12, self.db.memory_source_rows(-12, {record}))
-        self.assertFalse((await registry.execute("forget_memory", {"memory_id": old_id}))["ok"])
+        self.assertFalse((await registry.execute("memory_forget", {"memory_id": old_id, "expected_version": 1}))["ok"])
 
 
 class GroupContextTests(unittest.TestCase):
@@ -243,7 +243,7 @@ class ChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(current["机器人身份"]["QQ"], 90)
                 self.assertEqual(current["本批新消息"][0]["寻址"]["对象判断"], "机器人")
                 names = {tool["function"]["name"] for tool in observed[0][1]}
-                self.assertIn("search_memories", names)
+                self.assertIn("memory_search", names)
                 self.assertNotIn("remember_group_memory", names)
                 observed.clear()
                 private_id = db.log_private_message(11, "user", "你好")

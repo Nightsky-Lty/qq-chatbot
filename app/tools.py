@@ -31,6 +31,7 @@ class ToolRegistry:
         self.batch_completion_enabled = True
         self.terminated = False
         self.default_topic = "当前群聊"
+        self.working_memory = None
 
     def register(self, definition: dict[str, Any], handler: Handler, *, terminal: bool = False) -> None:
         name = definition["function"]["name"]

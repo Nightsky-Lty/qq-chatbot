@@ -51,6 +51,9 @@ class ImageCache:
         # 与聊天数据库共享事务锁，避免清除聊天时后台重新插入来源记录。
         with db._lock:
             db.connection.executescript(SCHEMA)
+            if "retained" not in {r["name"] for r in db.connection.execute("PRAGMA table_info(image_cache_refs)")}:
+                db.connection.execute("ALTER TABLE image_cache_refs ADD COLUMN retained INTEGER NOT NULL DEFAULT 0")
+                db.connection.commit()
 
     @property
     def enabled(self):
@@ -59,12 +62,21 @@ class ImageCache:
     def _valid(self, row) -> bool:
         if row["expires_at"] <= time.time():
             return False
+        if row["source_id"] in self.db.memories.blocked_sources(row["namespace"]):
+            return False
         ns = row["namespace"]
         table, key, target = ("messages", "group_id", ns) if ns > 0 else ("private_messages", "user_id", -ns)
-        return self.db.connection.execute(
+        present = self.db.connection.execute(
             f"SELECT 1 FROM {table} WHERE id=? AND {key}=? AND role='user'",
             (row["source_id"], target),
         ).fetchone() is not None
+        if present:
+            return True
+        # 原始聊天自然到期后，只有仍被有效长期事件引用的图片可继续保留。
+        return bool(row["retained"] and self.db.connection.execute("""SELECT 1 FROM memory_media_links l
+          JOIN memories m ON m.id=l.event_id WHERE l.namespace=? AND l.ref_id=? AND m.group_id=?
+          AND m.status='active' AND (m.expires_at=0 OR m.expires_at>?) LIMIT 1""",
+          (ns, row["id"], ns, int(time.time()))).fetchone())
 
     def _row(self, namespace: int, ref_id: int):
         with self.db._lock:
@@ -141,6 +153,17 @@ class ImageCache:
     @staticmethod
     def reference(row: dict) -> dict:
         return {"cache_id": str(row["id"]), "namespace": str(row["namespace"])}
+
+    def retain(self, namespace: int, ref_id: int) -> bool:
+        """被真实事件引用时延长保留；仍受全局文件/容量配额限制，不保证永不淘汰。"""
+        row = self._row(namespace, ref_id)
+        if not row or row["status"] not in {"pending", "ready"}:
+            return False
+        until = max(row["expires_at"], int(time.time()) + self.settings.image_memory_retention_days * 86400)
+        with self.db._lock, self.db.connection:
+            self.db.connection.execute("UPDATE image_cache_refs SET expires_at=?,retained=1 WHERE id=? AND namespace=?", (until, ref_id, namespace))
+            self.db.connection.execute("UPDATE memories SET expires_at=? WHERE group_id=? AND memory_type='image' AND fact_key=?", (until, namespace, f"media_{ref_id}"))
+        return True
 
     def _path(self, digest: str) -> Path:
         if self.directory.is_symlink():
