@@ -146,12 +146,14 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.memory.retrieve(7, "坐牢什么意思", user_ids={11}), [])
         source = self.source("我们这里坐牢指的是长时间调试程序")
         self.model.actions = [self.action(source, "本群坐牢表示长时间调试程序", "group_meme", 0,
-                             fact_key="坐牢", concept_basis="explicit_definition", meaning="长时间调试程序", conditions="技术讨论时")]
+                             fact_key="坐牢", concept_basis="explicit_definition", meaning="长时间调试程序", conditions="技术讨论时", aliases=["工位囚徒"])]
         await self.capture.extract(7, self.db.memory_source_rows(7, {source}))
         rows = await self.memory.retrieve(7, "今天说的坐牢什么意思", user_ids={11})
         self.assertTrue(rows)
         self.assertEqual(rows[0]["层"], "abstract")
         self.assertEqual(rows[0]["conditions"], "技术讨论时")
+        alias = await self.memory.retrieve(7, "工位囚徒什么意思", user_ids={11})
+        self.assertEqual(alias[0]["记忆编号"], rows[0]["记忆编号"])
 
     async def test_same_key_different_conditions_coexist_without_auto_overwrite(self):
         _, first = await self.save("QQ11白天喜欢喝咖啡", kind="preference", fact_key="咖啡偏好", conditions="白天")

@@ -96,7 +96,7 @@ class HybridRetriever:
             return []
         if layer not in {None, "event", "abstract", "perceptual"}:
             raise ValueError("记忆类型无效")
-        if layer is None and re.search(r"什么意思|什么梗|指什么|怎么理解|词义", query):
+        if layer is None and re.search(r"什么意思|什么梗|指什么|怎么理解|词义", query) and not re.search(r"图片|照片|截图|表情|那张|这张", query):
             layer = "abstract"
         if namespace < 0 and subject is not None and subject != -namespace:
             return []
@@ -112,7 +112,8 @@ class HybridRetriever:
                 f"SELECT m.id,bm25(memory_fts) AS score FROM memory_fts JOIN memories m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? AND {where} ORDER BY score LIMIT ?",
                 (fts_query, *args, route_limit))) if fts_query else []
             concepts = list(self.db.connection.execute(f"SELECT m.* FROM memories m WHERE {where} AND m.layer='abstract' AND m.fact_key!=''", args))
-        exact = [r["id"] for r in concepts if r["fact_key"].casefold() in query.casefold() and self.eligible(r, boundary)][:route_limit]
+        exact = [r["id"] for r in concepts if any(k and k.casefold() in query.casefold()
+                  for k in [r["fact_key"], *json.loads(r["metadata_json"]).get("aliases", [])]) and self.eligible(r, boundary)][:route_limit]
         expansion = " ".join(json.loads(r["metadata_json"]).get("meaning", "")[:100] for r in concepts if r["id"] in exact[:2])
         effective_query = query[:600] + (" " + expansion if expansion else "")
         dense = None
