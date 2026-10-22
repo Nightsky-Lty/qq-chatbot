@@ -2,7 +2,7 @@
 
 ## 存储与边界
 
-- Working：`WorkingMemory`按群/私聊持续接收真实对话，跨回复保留原文和有来源的语境摘要，为下一次回复提供短期上下文；默认30分钟、64会话/每会话128条上限。`finish/wait_for_messages`或单次Agent取消不清空语境。任务证据/查询缓存由`TaskEvidence`维护，推理/工具链仍在Agent局部状态，不进入短期对话记忆。详见[对话工作记忆](working-memory.md)。
+- Working：默认最近80条结构化聊天原文，不做短期摘要；当前请求单独注入，保留多人身份、引用、图片资料，受24000字符预算约束。30分钟TTL只控制内存缓存，原文窗口可从SQLite恢复，不因单次finish清空；任务证据/查询缓存仍由`TaskEvidence`维护。详见[对话工作记忆](working-memory.md)。
 - Event：SQLite `memory_records.layer='event'`，通过`memory_events`视图查看。event/episode/commitment保留参与来源、原话摘录、发生/记录时间、版本、有效期、陈述归属；共同经历/约定需要真实双方发言和群内回应关系，约定不是工具成功证明。
 - Abstract：`memory_records.layer='abstract'`与`memory_concepts`视图。profile/preference/relationship/explicit等子类型；group_meme保存条件、别名、含义、支持事件。明确解释或至少三个已提供事件支持可生效，其余为candidate，不自动注入。计数及模型自报置信度均不等于客观正确。
 - Perceptual：`image_cache_blobs/refs`仍是图片资源权威记录，文件在`/app/data/image_cache`按SHA-256去重。概要以`memory_records.layer='perceptual'`建立可检索引用，不把概要当发图人的发言/经历。只实现图片，未实现音频、视频或视觉embedding。
@@ -21,7 +21,7 @@
 
 ## 短期到长期的整合
 
-短期压缩片段、空闲淘汰及显式整合也将真实来源提交同一持久队列；在整理锁内排除游标已处理和已归属任务的来源，不把短期摘要当成新事实。LRU/容量淘汰不删除SQLite原话，原话入库时已有的增量队列仍兜底。
+短期上下文改用原文窗口，不再进行语境压缩；长期整合仍使用原来的持久队列、独立提取模型与证据校验。空闲缓存淘汰及显式整合可提交真实来源，在整理锁内排除游标已处理和已归属任务的来源；缓存淘汰不删除SQLite原话，原话入库时已有的增量队列仍兜底。
 
 任务开始即保存最小的新证据ID任务标记，状态running，以便崩溃后不丢掉已接收证据；并不持久化工作区/推理。结束收集本批真实新消息和确实发出的对应机器人回复，将任务改为pending，然后释放工作区。独立记忆LLM只根据这些证据提出候选，程序检查来源、本人身份、敏感信息、概念依据、版本、图片范围、有效期后原子提交。
 

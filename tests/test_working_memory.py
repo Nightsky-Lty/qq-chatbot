@@ -5,7 +5,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.bot import BotService
@@ -20,32 +19,26 @@ from app.tools import ToolRegistry
 from app.working_memory import WorkingMemoryManager
 
 
-class Summarizer:
+class Extractor:
     def __init__(self):
-        self.settings = SimpleNamespace(deepseek_api_key="synthetic")
         self.inputs = []
-        self.value = None
 
     async def extract_memories(self, instructions, data):
         self.inputs.append(copy.deepcopy(data))
-        if self.value is not None:
-            return self.value
-        source = data["messages"][0]["本地记录ID"]
-        return {"notes": [{"kind": "topic", "text": "QQ11与QQ22在讨论一起练习英语，具体安排待确认", "source_ids": [source]}]}
+        return {"actions": []}
 
 
 class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.cfg = Settings(_env_file=None, embedding_provider="hash", working_memory_max_messages=32,
-            working_memory_recent_messages=4, working_memory_compact_batch=8,
-            working_memory_context_max_chars=4000, working_memory_ttl_seconds=60, working_memory_max_scopes=2)
+            working_memory_context_max_chars=24000, working_memory_ttl_seconds=60, working_memory_max_scopes=2)
         self.db = Database(Path(self.folder.name) / "db.sqlite")
-        self.model = Summarizer()
+        self.model = Extractor()
         self.memory = MemoryService(self.cfg, self.db)
         self.capture = MemoryCapture(self.cfg, self.db, self.memory, self.model)
         self.now = [time.time()]
-        self.manager = WorkingMemoryManager(self.cfg, self.db, self.model, self.capture, clock=lambda: self.now[0])
+        self.manager = WorkingMemoryManager(self.cfg, self.db, self.capture, clock=lambda: self.now[0])
         self.db.message_listener = self.manager.receive
 
     async def asyncTearDown(self):
@@ -67,13 +60,14 @@ class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
     def snapshot(self, namespace=7, **kwargs):
         return self.manager.snapshot(namespace, before_id=999999, bot_id=90, **kwargs)
 
-    def test_invalid_window_configuration_is_rejected(self):
-        with self.assertRaises(ValueError):
-            Settings(_env_file=None, working_memory_max_messages=32,
-                     working_memory_recent_messages=24, working_memory_compact_batch=24)
+    def test_default_window_is_80_and_not_summary_mode(self):
+        cfg = Settings(_env_file=None)
+        self.assertEqual(cfg.context_message_limit, 80)
+        self.assertEqual(cfg.working_memory_context_max_chars, 24000)
+        self.assertFalse(hasattr(cfg, "working_memory_summary_enabled"))
 
     async def test_worker_lifecycle_cancels_without_external_request(self):
-        self.say("后台不应为少量新消息立即调用模型")
+        self.say("短期记忆不应调用摘要模型")
         self.manager.start()
         await asyncio.sleep(0)
         self.assertIsNotNone(self.manager.task)
@@ -93,7 +87,32 @@ class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["QQ"] for r in rows], [11, 22, 90])
         self.assertEqual(rows[1]["寻址"]["对象判断"], "其他群友")
         self.assertEqual(rows[-1]["身份说明"], "你自己实际发送的消息")
+        self.assertNotIn("语境摘要", result)
+        self.assertFalse(hasattr(self.manager.scopes[7], "notes"))
         self.assertEqual(self.model.inputs, [])
+
+    async def test_latest_80_are_present_even_when_cache_only_holds_32(self):
+        ids = [self.say(f"原话{i}", user=11 if i % 2 else 22) for i in range(100)]
+        rows = self.snapshot()["近期往返"]
+        self.assertEqual([r["本地记录ID"] for r in rows], ids[-80:])
+        self.assertEqual(self.model.inputs, [])
+
+    async def test_message_limit_can_be_configured_and_long_original_is_not_summarized(self):
+        self.manager.settings = self.cfg.model_copy(update={"context_message_limit": 20})
+        ids = [self.say(f"最近消息{i}") for i in range(30)]
+        self.assertEqual([r["本地记录ID"] for r in self.snapshot()["近期往返"]], ids[-20:])
+        text = "这是完整的长原话，不能先截成一千字。" * 100
+        source = self.say(text)
+        row = next(r for r in self.snapshot()["近期往返"] if r["本地记录ID"] == source)
+        self.assertEqual(row["内容"], text)
+        self.assertNotIn("原文已截断", row)
+
+    async def test_private_window_is_80_and_current_request_is_not_duplicated(self):
+        ids = [self.say(f"私聊历史{i}", namespace=-11, role="assistant" if i % 2 else "user") for i in range(90)]
+        current = self.say("本轮私聊请求", namespace=-11)
+        rows = self.manager.snapshot(-11, before_id=current)["近期往返"]
+        self.assertEqual([r["本地记录ID"] for r in rows], ids[-80:])
+        self.assertNotIn("本轮私聊请求", json.dumps(rows, ensure_ascii=False))
 
     async def test_scope_isolation_including_identical_group_and_private_numbers(self):
         self.say("群里的事情", namespace=7)
@@ -101,94 +120,39 @@ class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("私聊的事情", json.dumps(self.snapshot(7), ensure_ascii=False))
         self.assertNotIn("群里的事情", json.dumps(self.snapshot(-7), ensure_ascii=False))
 
-    async def test_snapshot_rejects_next_batch_including_summarized_future_sources(self):
-        first = self.say("较早内容")
-        boundary = self.say("本批当前请求")
-        future = self.say("下一批不能提前看到")
-        state = self.manager.scopes[7]
-        state.notes = [{"kind": "topic", "text": "不能提前看到的摘要", "source_ids": [first, future]}]
-        result = self.manager.snapshot(7, before_id=boundary)
-        self.assertNotIn("本批当前请求", json.dumps(result, ensure_ascii=False))
-        self.assertNotIn("不能提前看到", json.dumps(result, ensure_ascii=False))
-        # 边界过滤不能把下一批原文从实际工作记忆里删掉。
-        self.assertIn(future, state.rows)
+    async def test_future_batches_do_not_push_prior_80_out_of_window(self):
+        ids = [self.say(f"上一批历史{i}") for i in range(80)]
+        current = self.say("本批当前请求")
+        for i in range(100):
+            self.say(f"下一批不能提前看到{i}")
+        rows = self.manager.snapshot(7, before_id=current)["近期往返"]
+        self.assertEqual([r["本地记录ID"] for r in rows], ids)
+        self.assertNotIn("本批当前请求", json.dumps(rows, ensure_ascii=False))
+        self.assertNotIn("下一批", json.dumps(rows, ensure_ascii=False))
 
-    async def test_summary_context_dependencies_prevent_future_and_deleted_input_leaks(self):
-        for i in range(12):
-            self.say(f"摘要可读的上下文{i}")
-        self.assertTrue(await self.manager.compact_once(7))
-        note = self.manager.scopes[7].notes[0]
-        self.assertEqual(note["source_ids"], [1])
-        self.assertIn(8, note["context_source_ids"])
-        self.assertEqual(self.manager.snapshot(7, before_id=5)["语境摘要"], [])
-        with self.db._lock, self.db.connection:
-            # 即使不是模型自报引用，读过的上下文被删也必须让摘要失效。
-            self.db.connection.execute("DELETE FROM messages WHERE id=8")
-        self.assertEqual(self.snapshot()["语境摘要"], [])
+    async def test_deleted_and_forgotten_sources_are_excluded_and_window_refilled(self):
+        ids = [self.say(f"原始消息{i}") for i in range(100)]
+        with patch.object(self.db.memories, "blocked_sources", return_value=set(ids[-20:])):
+            rows = self.snapshot()["近期往返"]
+            self.assertEqual([r["本地记录ID"] for r in rows], ids[:80])
+        with self.db.connection:
+            self.db.connection.execute("DELETE FROM messages WHERE id=?", (ids[-1],))
+        self.assertNotIn(ids[-1], [r["本地记录ID"] for r in self.snapshot()["近期往返"]])
 
-    async def test_compaction_is_background_bounded_and_archives_originals_not_summary(self):
-        for i in range(12):
-            self.say(f"一起练习英语，第{i}条", user=11 if i % 2 == 0 else 22)
-        self.assertTrue(await self.manager.compact_once(7))
-        state = self.manager.scopes[7]
-        self.assertEqual(len(state.rows), 4)
-        self.assertEqual(len(state.notes), 1)
-        self.assertIn("具体安排待确认", json.dumps(self.snapshot(), ensure_ascii=False))
-        job = self.db.connection.execute("SELECT * FROM memory_consolidation_jobs").fetchone()
-        ids = set(json.loads(job["source_ids_json"]))
-        self.assertEqual(len(ids), 8)
-        self.assertTrue(all(r["content"].startswith("一起练习英语") for r in self.db.memory_source_rows(7, ids)))
-        self.assertNotIn("语境摘要", job["source_ids_json"])
-        self.assertFalse(await self.manager.compact_once(7))
+    async def test_cache_ttl_does_not_hide_low_frequency_chat_history(self):
+        source = self.say("两小时前的原话仍是最近聊天")
+        with self.db.connection:
+            self.db.connection.execute("UPDATE messages SET created_at=? WHERE id=?", (int(self.now[0]) - 7200, source))
+        self.now[0] += 61
+        await self.manager.maintain_once()
+        self.assertNotIn(7, self.manager.scopes)
+        self.assertIn("两小时前的原话", json.dumps(self.snapshot(), ensure_ascii=False))
+        self.assertEqual(self.model.inputs, [])
 
-    async def test_invalid_schema_or_unprovided_sources_keep_raw_and_back_off(self):
-        for i in range(12):
-            self.say(f"原话{i}")
-        for value in ({"notes": [{"kind": "topic", "text": "编造的跨范围证据", "source_ids": [99999]}]},
-                      {"notes": "不是数组"}, {"actions": []}):
-            self.model.value = value
-            self.manager.scopes[7].retry_at = 0
-            self.assertFalse(await self.manager.compact_once(7))
-            self.assertEqual(len(self.manager.scopes[7].rows), 12)
-        calls = len(self.model.inputs)
-        self.assertFalse(await self.manager.compact_once(7))
-        self.assertEqual(len(self.model.inputs), calls)
-
-    async def test_deleted_and_forgotten_provenance_invalidates_summary_and_raw(self):
-        source = self.say("需要清除的消息")
-        state = self.manager.scopes[7]
-        state.notes = [{"kind": "topic", "text": "需要清除的摘要", "source_ids": [source]}]
-        with patch.object(self.db.memories, "blocked_sources", return_value={source}):
-            self.assertNotIn("需要清除", json.dumps(self.snapshot(), ensure_ascii=False))
-        source = self.say("删除源记录也必须失效")
-        state.notes = [{"kind": "topic", "text": "删除后不能复活的摘要", "source_ids": [source]}]
-        with self.db._lock, self.db.connection:
-            self.db.connection.execute("DELETE FROM messages WHERE id=?", (source,))
-        self.assertNotIn("删除", json.dumps(self.snapshot(), ensure_ascii=False))
-
-    async def test_inflight_compaction_cannot_restore_deleted_sources(self):
-        for i in range(12):
-            self.say(f"原始记录{i}")
-        entered, release = asyncio.Event(), asyncio.Event()
-        original = self.model.extract_memories
-        async def delayed(instructions, data):
-            entered.set()
-            await release.wait()
-            return await original(instructions, data)
-        self.model.extract_memories = delayed
-        task = asyncio.create_task(self.manager.compact_once(7))
-        await entered.wait()
-        with self.db._lock, self.db.connection:
-            self.db.connection.execute("DELETE FROM messages WHERE id=1")
-        release.set()
-        self.assertFalse(await task)
-        self.assertEqual(self.manager.scopes[7].notes, [])
-
-    async def test_capacity_ttl_and_lru_are_bounded_without_deleting_raw_database(self):
+    async def test_capacity_ttl_and_lru_do_not_delete_raw_database(self):
         for i in range(70):
             self.say(f"保留原始记录{i}")
         self.assertEqual(len(self.manager.scopes[7].rows), 32)
-        self.assertEqual(self.db.connection.execute("SELECT count(*) FROM messages").fetchone()[0], 70)
         self.say("其他群", namespace=8)
         self.say("另一个群", namespace=9)
         self.assertEqual(len(self.manager.scopes), 2)
@@ -198,39 +162,56 @@ class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.manager.scopes), 0)
         self.assertEqual(self.db.connection.execute("SELECT count(*) FROM messages").fetchone()[0], 72)
 
-    async def test_cold_restore_once_then_receive_incrementally(self):
+    async def test_restart_restores_raw_window_from_database(self):
         first = self.say("第一次收到")
-        manager = WorkingMemoryManager(self.cfg, self.db, self.model, self.capture)
+        manager = WorkingMemoryManager(self.cfg, self.db, self.capture)
         try:
             self.assertEqual(manager.snapshot(7, before_id=first + 1)["近期往返"][0]["内容"], "第一次收到")
-            with patch.object(manager, "_ensure", wraps=manager._ensure) as ensure:
-                source = self.say("第二次收到")
-                manager.receive(7, source)
-                result = manager.snapshot(7, before_id=source + 1)
-                self.assertEqual(len(result["近期往返"]), 2)
-                self.assertEqual(ensure.call_count, 2)
+            source = self.say("第二次收到")
+            manager.receive(7, source)
+            self.assertEqual(len(manager.snapshot(7, before_id=source + 1)["近期往返"]), 2)
         finally:
             await manager.close()
 
-    async def test_explicit_old_quote_loads_original_with_same_scope_and_boundary(self):
+    async def test_explicit_quote_outside_80_is_loaded_without_cross_scope_or_duplicate_text(self):
         root = self.say("很早但明确引用的原话")
-        for i in range(40):
+        for i in range(90):
             self.say(f"无关消息{i}")
         current = self.say("你说的是这个吗", user=22, reply=str(root))
-        result = self.manager.snapshot(7, before_id=current, roots=[str(root)])
-        self.assertIn("很早但明确引用的原话", json.dumps(result, ensure_ascii=False))
-        other = self.manager.snapshot(8, before_id=current, roots=[str(root)])
-        self.assertNotIn("很早但明确引用的原话", json.dumps(other, ensure_ascii=False))
+        result = self.manager.snapshot(7, before_id=current + 1, roots=[str(root)])
+        text = json.dumps(result, ensure_ascii=False)
+        self.assertEqual(text.count("很早但明确引用的原话"), 1)
+        reply = next(r for r in result["近期往返"] if r["本地记录ID"] == current)
+        self.assertEqual(reply["引用或回应原文"]["本地记录ID"], root)
+        self.assertNotIn("内容", reply["引用或回应原文"])
+        self.assertNotIn("很早但明确引用的原话", json.dumps(self.manager.snapshot(8, before_id=current, roots=[str(root)]), ensure_ascii=False))
 
-    async def test_budget_covers_notes_and_originals_even_when_summary_is_full(self):
+    async def test_budget_is_exact_and_truncation_is_marked(self):
         for i in range(12):
             self.say("长原文" * 300)
-        state = self.manager.scopes[7]
-        state.notes = [{"kind": "topic", "text": "长摘要" * 60, "source_ids": [i]}
-                       for i in sorted(state.rows)[:8]]
         self.manager.settings = self.cfg.model_copy(update={"working_memory_context_max_chars": 1000})
         result = self.snapshot()
         self.assertLessEqual(len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))), 1000)
+        self.assertTrue(result["近期往返"])
+        self.assertTrue(any(r.get("原文已截断") for r in result["近期往返"]))
+
+    async def test_images_remain_separate_metadata_not_user_speech_in_both_scopes(self):
+        for ns in (7, -11):
+            source = self.say("看这张图", namespace=ns)
+            self.manager.media_lookup = lambda scope, ids: [{"本地记录ID": source, "图片编号": "media_1",
+                "发图人QQ": 11, "概要": "蓝色角色举球棒", "概要状态": "ready"}]
+            message = self.snapshot(ns)["近期往返"][0]
+            self.assertEqual(message["内容"], "看这张图")
+            self.assertEqual(message["图片资料（非原话）"][0]["概要"], "蓝色角色举球棒")
+        self.assertEqual(self.model.inputs, [])
+
+    async def test_oversized_image_metadata_keeps_image_id_within_budget(self):
+        source = self.say("有人发图")
+        self.manager.settings = self.cfg.model_copy(update={"working_memory_context_max_chars": 1000})
+        result = self.snapshot(image_lookup=lambda i: [{"图片编号": "media_1", "概要": "很长" * 10000}] if i == source else [])
+        self.assertLessEqual(len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))), 1000)
+        self.assertEqual(result["近期往返"][0]["图片资料（非原话）"][0]["图片编号"], "media_1")
+        self.assertTrue(result["近期往返"][0]["图片资料已缩略"])
 
     async def test_archiving_twice_or_after_incremental_capture_does_not_duplicate_jobs(self):
         source = self.say("本人新的具体事件")
@@ -238,8 +219,8 @@ class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.capture.archive_working(7, {source}))
         self.assertEqual(self.db.connection.execute("SELECT count(*) FROM memory_consolidation_jobs").fetchone()[0], 1)
         source = self.say("旧增量已经处理")
-        self.db.connection.execute("UPDATE memory_capture_state SET cursor_id=? WHERE namespace=7", (source,))
-        self.db.connection.commit()
+        with self.db.connection:
+            self.db.connection.execute("UPDATE memory_capture_state SET cursor_id=? WHERE namespace=7", (source,))
         self.assertFalse(await self.capture.archive_working(7, {source}))
 
     async def test_large_archive_is_batched_and_keeps_fresh_sources_distinct(self):
@@ -253,15 +234,13 @@ class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set().union(*(set(ids) for ids in fresh)), sources)
         self.assertTrue(set(json.loads(jobs[1]["source_ids_json"])) - set(fresh[1]))
 
-    async def test_summary_has_real_image_metadata_but_not_user_authored_caption(self):
-        for i in range(12):
-            self.say(f"原始记录{i}")
-        self.manager.media_lookup = lambda ns, ids: [{"本地记录ID": min(ids), "图片编号": "media_1",
-            "发图人QQ": 11, "概要": "蓝色角色举球棒", "概要状态": "ready"}]
-        self.assertTrue(await self.manager.compact_once(7))
-        message = self.model.inputs[0]["messages"][0]
-        self.assertEqual(message["内容"], "原始记录0")
-        self.assertEqual(message["图片资料（非原话）"][0]["概要"], "蓝色角色举球棒")
+    async def test_explicit_consolidate_uses_real_recent_window(self):
+        ids = [self.say(f"待整合原话{i}") for i in range(90)]
+        self.manager.scopes.clear()
+        self.assertTrue(await self.manager.archive(7, ids[-1] + 1))
+        jobs = self.db.connection.execute("SELECT * FROM memory_consolidation_jobs").fetchall()
+        fresh = set().union(*(set(json.loads(j["new_ids_json"])) for j in jobs))
+        self.assertEqual(fresh, set(ids[-80:]))
 
     async def test_receive_during_idle_archiving_does_not_erase_new_activity(self):
         self.say("旧对话")
@@ -274,28 +253,59 @@ class WorkingMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.capture.archive_working = archive
         task = asyncio.create_task(self.manager.maintain_once())
         await entered.wait()
-        with patch("app.database.time.time", return_value=self.now[0]):
-            self.say("等待归档时又有了新消息")
+        self.say("等待归档时又有了新消息")
         release.set()
         await task
         self.assertIn(7, self.manager.scopes)
         self.assertIn("又有了新消息", json.dumps(self.snapshot(), ensure_ascii=False))
 
-    async def test_no_key_or_disabled_summary_uses_bounded_raw_fallback(self):
-        for i in range(12):
-            self.say(f"不要额外调用模型{i}")
-        self.model.settings.deepseek_api_key = ""
-        self.assertFalse(await self.manager.compact_once(7))
+    async def test_short_window_never_calls_extractor_but_long_memory_still_does(self):
+        source = self.say("请记住，我喜欢红茶", namespace=-11)
+        self.snapshot(-11)
+        await self.manager.maintain_once()
         self.assertEqual(self.model.inputs, [])
-        self.assertEqual(len(self.manager.scopes[7].rows), 12)
-        self.manager.settings = self.cfg.model_copy(update={"working_memory_summary_enabled": False})
-        self.model.settings.deepseek_api_key = "synthetic"
-        self.assertFalse(await self.manager.compact_once(7))
-        self.assertEqual(self.model.inputs, [])
+        await self.capture.extract(-11, self.db.memory_source_rows(-11, {source}), requested_by=11)
+        self.assertEqual(len(self.model.inputs), 1)
 
 
 class WorkingIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_bot_working_tool_expands_summary_sources_without_next_batch(self):
+    async def test_group_prompt_contains_80_originals_and_new_long_memory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = Settings(_env_file=None, embedding_provider="hash", sticker_enabled=False,
+                sticker_collect_enabled=False, web_search_enabled=False, voice_enabled=False, poke_enabled=False)
+            db = Database(Path(folder) / "db.sqlite")
+            llm = DeepSeekClient(cfg)
+            bot = BotService(cfg, db, llm)
+            observed = []
+            long_memory = [{"记忆编号": 9001, "内容": "QQ11偏好乌龙茶", "层": "abstract", "版本": 1}]
+            bot.memory.retrieve = AsyncMock(return_value=long_memory)
+            async def request(messages, temperature, definitions):
+                observed.append(copy.deepcopy(messages))
+                self.assertTrue({"memory_add", "memory_search", "memory_update", "memory_delete", "memory_forget", "memory_consolidate"}
+                                <= {d["function"]["name"] for d in definitions})
+                return {"tool_calls": [{"id": "send", "function": {"name": "send_message",
+                    "arguments": '{"text":"我看到了","next_action":"finish"}'}}]}
+            llm.request_message = request
+            try:
+                ids = [db.log_message(7, 11 if i % 2 else 22, "甲", f"原文{i}", message_id=str(i)) for i in range(100)]
+                current = db.log_message(7, 11, "甲", "当前请求", message_id="current")
+                db.log_message(7, 22, "乙", "未来批次消息", message_id="future")
+                batch = GroupBatch([GroupMessage(current, "current", 11, "甲", "当前请求", 90, direct=True)])
+                await bot._run_group_batch_locked(7, batch, AsyncMock(return_value="sent"))
+                payload = json.loads(observed[0][1]["content"])
+                working = payload["背景资料"]["短期记忆"]
+                self.assertEqual([r["本地记录ID"] for r in working["近期往返"]], ids[-80:])
+                self.assertNotIn("语境摘要", working)
+                self.assertEqual(payload["背景资料"]["长期记忆"], long_memory)
+                self.assertNotIn("未来批次消息", json.dumps(payload, ensure_ascii=False))
+                self.assertNotIn("当前请求", json.dumps(working, ensure_ascii=False))
+                bot.memory.retrieve.assert_awaited_once()
+            finally:
+                await bot.close()
+                await llm.close()
+                db.close()
+
+    async def test_bot_working_tool_returns_raw_sources_without_next_batch(self):
         with tempfile.TemporaryDirectory() as folder:
             cfg = Settings(_env_file=None, embedding_provider="hash", sticker_enabled=False,
                 sticker_collect_enabled=False, web_search_enabled=False, voice_enabled=False, poke_enabled=False)
@@ -307,7 +317,6 @@ class WorkingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 current = db.log_message(7, 22, "乙", "甲刚才说的是什么", message_id="2")
                 future = db.log_message(7, 33, "丙", "下一批的私密测试句", message_id="3")
                 state = bot.working_memory.scopes[7]
-                state.notes = [{"kind": "topic", "text": "QQ11在准备英语演讲", "source_ids": [source]}]
                 state.rows.pop(source)
                 observed = []
                 async def request(messages, temperature, definitions):
@@ -322,7 +331,7 @@ class WorkingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 outcome = await bot._run_group_batch_locked(7, batch, AsyncMock(return_value="1000"))
                 self.assertEqual(outcome.sent, 1)
                 result = json.loads(next(m["content"] for m in observed[1] if m["role"] == "tool"))
-                self.assertEqual(result["memories"][0]["来源摘录"][0]["内容"], "我在准备英语演讲")
+                self.assertEqual(result["memories"][0]["近期往返"][0]["内容"], "我在准备英语演讲")
                 self.assertNotIn("下一批的私密测试句", json.dumps(observed, ensure_ascii=False))
                 self.assertIn(future, state.rows)
             finally:
@@ -348,7 +357,7 @@ class WorkingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 db.log_message(7, 11, "甲", "我和乙约好九点练习英语", message_id="1")
                 first = db.log_message(7, 22, "乙", "你知道了吗", message_id="2")
                 batch = GroupBatch([GroupMessage(first, "2", 22, "乙", "你知道了吗", 90, direct=True)])
-                with patch("app.bot.build_group_history", side_effect=AssertionError("不应重新拼80条历史")):
+                with patch("app.bot.build_group_history", side_effect=AssertionError("不应回退旧的重复时间线组装")):
                     await bot._run_group_batch_locked(7, batch, sender)
                     second = db.log_message(7, 11, "甲", "你刚才说了什么", message_id="3")
                     batch = GroupBatch([GroupMessage(second, "3", 11, "甲", "你刚才说了什么", 90, direct=True)])
@@ -374,9 +383,9 @@ class WorkingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             cfg = Settings(_env_file=None, embedding_provider="hash")
             db = Database(Path(folder) / "db.sqlite")
             memory = MemoryService(cfg, db)
-            model = Summarizer()
+            model = Extractor()
             capture = MemoryCapture(cfg, db, memory, model)
-            manager = WorkingMemoryManager(cfg, db, model, capture)
+            manager = WorkingMemoryManager(cfg, db, capture)
             db.message_listener = manager.receive
             try:
                 source = db.log_private_message(11, "user", "今天在准备英语演讲")

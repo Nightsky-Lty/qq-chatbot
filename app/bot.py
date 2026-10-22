@@ -124,7 +124,7 @@ class BotService:
         self.memory = MemoryService(settings, database)
         self.memory.image_cache = self.image_cache
         self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
-        self.working_memory = WorkingMemoryManager(settings, database, self.memory_llm, self.memory_capture)
+        self.working_memory = WorkingMemoryManager(settings, database, self.memory_capture)
         self.working_memory.media_lookup = lambda ns, ids: [self.image_cache.describe(r)
             for r in self.image_cache.rows(ns, max(ids, default=0), set(ids)) if r["source_id"] in ids]
         self.db.message_listener = self.working_memory.receive
@@ -488,7 +488,7 @@ class BotService:
                     if row["source_id"] in timeline_sources and "概要" in image_sources[image_id]:
                         for field in ("概要", "图中文字", "不确定"):
                             image_sources[image_id].pop(field, None)
-                        image_sources[image_id]["概要位置"] = "群聊时间线中此来源消息的图片资料"
+                        image_sources[image_id]["概要位置"] = "短期记忆近期往返或群聊时间线中此来源消息的图片资料"
                     if row["status"] in {"ready", "pending"}:
                         collection_jobs[image_id] = CollectionJob(group_id, row["user_id"], focus.self_id,
                             row["message_id"], ref, self._confirmed_senders.get(sender, sender))
@@ -1084,14 +1084,8 @@ class BotService:
                     if batch is not None and collection_jobs is not None:
                         collection_jobs[image_id] = CollectionJob(namespace, row["user_id"], bot_id, row["message_id"], ref, send_message)
                 def working_search(query, arguments):
-                    snapshot = self.working_memory.snapshot(namespace, before_id=max(workspace.source_ids, default=0) + 1,
+                    return self.working_memory.snapshot(namespace, before_id=max(workspace.source_ids, default=0) + 1,
                         query=query, roots=[e.reply_to for e in batch.entries if e.reply_to] if batch else [], bot_id=bot_id)
-                    if arguments.get("include_sources"):
-                        ids = {i for note in snapshot["语境摘要"] for i in note["来源记录"]}
-                        originals = self.working_memory._valid(namespace, ids)
-                        snapshot["来源摘录"] = [self.working_memory._public(namespace, originals[i], bot_id)
-                                                for i in sorted(originals, reverse=True)[:3]]
-                    return snapshot
                 async def working_consolidate():
                     return await self.working_memory.archive(namespace, max(workspace.source_ids, default=0) + 1)
                 register_memory_tools(registry, self.memory_capture, namespace, user_id, source_rows,
