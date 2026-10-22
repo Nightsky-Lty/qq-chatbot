@@ -62,7 +62,7 @@ def registry(*, group=True, enabled=True, fail_first=False):
         if not finished["ok"]:
             return finished
         result.wait_for_messages = True
-        result.topic = arguments["topic"]
+        assert arguments == {}
         return {"ok": True}
     result.register(SEND_MESSAGE_TOOL, send)
     result.register(FINISH_TOOL, finish, terminal=True)
@@ -74,11 +74,13 @@ def registry(*, group=True, enabled=True, fail_first=False):
 class EfficiencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_send_and_wait_in_one_model_call(self):
         tools, delivered = registry()
-        llm = ScriptedLLM([calls(("send_message", {"text": "九点见", "next_action": "wait", "topic": "游戏时间"}))])
+        llm = ScriptedLLM([calls(("send_message", {"text": "九点见", "next_action": "wait"}))])
         outcome = await ReactAgent(Settings(_env_file=None), llm).run("几点", tools, system="群聊")
         self.assertEqual(outcome.steps, 1)
         self.assertTrue(outcome.wait_for_messages)
-        self.assertEqual(outcome.topic, "游戏时间")
+        self.assertFalse(hasattr(outcome, "topic"))
+        for definition in tools.definitions:
+            self.assertNotIn("topic", definition["function"]["parameters"]["properties"])
         self.assertEqual(delivered, ["九点见"])
 
     async def test_private_send_and_finish_in_one_model_call(self):
@@ -91,19 +93,20 @@ class EfficiencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_completion_is_rejected_before_sending(self):
         tools, delivered = registry()
-        for arguments in ({"text": "hi", "next_action": "wait"},
+        for arguments in ({"text": "hi", "next_action": "wait", "topic": "旧锚点"},
                           {"text": "hi", "next_action": "invalid"},
                           {"text": "hi", "next_action": "finish", "topic": "不允许"}):
             result = await tools.execute("send_message", arguments)
             self.assertFalse(result["ok"])
         self.assertEqual(delivered, [])
         self.assertFalse(tools.terminated)
+        self.assertFalse((await tools.execute("wait_for_messages", {"topic": "旧锚点"}))["ok"])
 
     async def test_failed_send_does_not_trigger_completion(self):
         tools, delivered = registry(fail_first=True)
         llm = ScriptedLLM([
-            calls(("send_message", {"text": "too long", "next_action": "wait", "topic": "话题"})),
-            calls(("send_message", {"text": "修正", "next_action": "wait", "topic": "话题"})),
+            calls(("send_message", {"text": "too long", "next_action": "wait"})),
+            calls(("send_message", {"text": "修正", "next_action": "wait"})),
         ])
         outcome = await ReactAgent(Settings(_env_file=None), llm).run("你好", tools, system="群聊")
         self.assertEqual(outcome.steps, 2)
@@ -146,13 +149,13 @@ class EfficiencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.steps, 1)
         self.assertFalse((await tools.execute("send_message", {"text": "已结束"}))["ok"])
 
-    async def test_compatibility_plain_text_uses_program_default(self):
+    async def test_compatibility_plain_text_waits_without_topic(self):
         tools, delivered = registry()
-        tools.default_topic = "正在聊的游戏"
         llm = ScriptedLLM([{"content": "九点见"}])
         outcome = await ReactAgent(Settings(_env_file=None), llm).run("几点", tools, system="群聊")
         self.assertEqual(outcome.steps, 1)
-        self.assertEqual(outcome.topic, "正在聊的游戏")
+        self.assertTrue(outcome.wait_for_messages)
+        self.assertFalse(hasattr(tools, "default_topic"))
         self.assertEqual(delivered, ["九点见"])
 
     async def test_legacy_tool_flow_remains_available(self):

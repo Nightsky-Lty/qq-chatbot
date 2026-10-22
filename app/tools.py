@@ -27,10 +27,8 @@ class ToolRegistry:
         self.delivery_uncertain = False
         self.allow_silent = False
         self.wait_for_messages = False
-        self.topic = ""
         self.batch_completion_enabled = True
         self.terminated = False
-        self.default_topic = "当前群聊"
         self.task_evidence = None
 
     def register(self, definition: dict[str, Any], handler: Handler, *, terminal: bool = False) -> None:
@@ -50,10 +48,7 @@ class ToolRegistry:
         properties = definition["function"]["parameters"]["properties"]
         actions = ["continue"] + (["finish"] if "finish" in self.bindings else []) + (["wait"] if "wait_for_messages" in self.bindings else [])
         properties["next_action"] = {"type": "string", "enum": actions,
-            "description": "最后一次发送用finish结束，或wait继续群话题；成功后程序直接收尾。省略/continue仍需后续决策。"}
-        if "wait_for_messages" in self.bindings:
-            properties["topic"] = {"type": "string", "minLength": 1, "maxLength": 120,
-                                   "description": "next_action=wait时必填的简短话题锚点。"}
+            "description": "最后一次发送用finish退出跟进，或wait等待新群消息（不绑定话题）；成功后程序直接收尾。省略/continue仍需后续决策。"}
         return definition
 
     async def execute(self, name: str, arguments: Any) -> dict[str, Any]:
@@ -82,14 +77,8 @@ class ToolRegistry:
                 return {"ok": False, "error": "工具参数数值超出限制。"}
         handler_arguments = dict(arguments)
         next_action = "continue"
-        topic = None
         if self.batch_completion_enabled and name in OUTPUT_TOOLS:
             next_action = handler_arguments.pop("next_action", "continue")
-            topic = handler_arguments.pop("topic", None)
-            if next_action == "wait" and ("wait_for_messages" not in self.bindings or not isinstance(topic, str) or not topic.strip()):
-                return {"ok": False, "error": "wait需要提供本轮可用的等待工具和非空topic；尚未发送。"}
-            if topic is not None and next_action != "wait":
-                return {"ok": False, "error": "topic只用于next_action=wait；尚未发送。"}
         logger.info("Agent action: tool=%s", name)
         try:
             result = await binding.handler(handler_arguments)
@@ -97,7 +86,7 @@ class ToolRegistry:
                 self.terminated = True
             if result.get("ok") is True and next_action != "continue":
                 terminal = "wait_for_messages" if next_action == "wait" else "finish"
-                completion = await self.execute(terminal, {"topic": topic.strip()} if next_action == "wait" else {})
+                completion = await self.execute(terminal, {})
                 result = {**result, "next_action": next_action, "completed": completion.get("ok") is True}
                 if completion.get("ok") is not True:
                     result["completion_error"] = completion.get("error", "收尾失败，请依据回执继续。")
@@ -109,14 +98,11 @@ class ToolRegistry:
 
 
 FINISH_TOOL = {"type": "function", "function": {
-    "name": "finish", "description": "结束当前处理，群话题回到低活跃度；后续明确提问或程序随机触发可重新唤醒。想继续当前话题用wait_for_messages。私聊正常回应后结束。",
+    "name": "finish", "description": "结束当前处理并退出群活跃跟进；后续明确提问或程序随机触发可重新唤醒。想继续接收新群消息用wait_for_messages。私聊正常回应后结束。",
     "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 }}
 
 WAIT_FOR_MESSAGES_TOOL = {"type": "function", "function": {
-    "name": "wait_for_messages", "description": "本批处理完成，继续参与当前群话题，等待新消息而不立即请求模型。无新消息不发言；话题结束应finish。",
-    "parameters": {"type": "object", "properties": {
-        "topic": {"type": "string", "minLength": 1, "maxLength": 120,
-                  "description": "当前单一话题的简短锚点，不记录所有历史话题。"},
-    }, "required": ["topic"], "additionalProperties": False},
+    "name": "wait_for_messages", "description": "本批处理完成，保持群活跃跟进，等待新消息而不立即请求模型。不绑定旧话题，新消息到来后重新理解；明确停止或不再需要跟进时finish。无新消息不发言。",
+    "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 }}

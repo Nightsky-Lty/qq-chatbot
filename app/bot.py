@@ -447,7 +447,7 @@ class BotService:
             return None
         try:
             state = self.conversations.states.get(group_id)
-            if not batch.wakes_topic and (state is None or not state.active(time.monotonic())):
+            if not batch.wakes_followup and (state is None or not state.active(time.monotonic())):
                 return None
             focus = batch.focus
             boundary = max(entry.storage_id for entry in batch.entries)
@@ -561,13 +561,13 @@ class BotService:
                 })
             memories = await self.memory.retrieve(
                 group_id,
-                focus.text + (" " + batch.topic[:100] if len(focus.text) < 12 and batch.topic else ""),
+                focus.text,
                 user_ids={focus.user_id, *focus.mentions},
                 boundary=max(entry.storage_id for entry in batch.entries),
             )
             context = ContextPacket(
                 task={"唤醒消息号": [e.message_id for e in batch.entries if e.direct],
-                      "当前话题": batch.topic, "当前焦点消息号": focus.message_id, "本批新消息": current},
+                      "当前焦点消息号": focus.message_id, "本批新消息": current},
                 timeline=[] if short_context else history_entries, working=short_context,
                 images=list(image_sources.values()),
                 runtime={"机器人身份": {"QQ": focus.self_id, "角色": "群内参与者，不是所有消息的收件人"},
@@ -577,12 +577,12 @@ class BotService:
                         group_id, len(history_entries), len(current), len(images))
             try:
                 # 无@跟进不能因等待并发名额或模型耗时而越过活跃期时限。
-                timeout = None if batch.wakes_topic else max(0.01, min(state.idle_until, state.hard_until) - time.monotonic())
+                timeout = None if batch.wakes_followup else max(0.01, min(state.idle_until, state.hard_until) - time.monotonic())
                 async with asyncio.timeout(timeout):
                     return await self._run_ai_reply(
                         group_id, focus.user_id, focus.text, self._confirmed_senders.get(sender, sender),
                         context=context, image_session=ChatImageSession(images, image_ids=stable_ids, sources=image_sources) if images and self.settings.chat_image_enabled else None,
-                        automatic=not batch.wakes_topic, batch=batch, mention_targets=mention_targets,
+                        automatic=not batch.wakes_followup, batch=batch, mention_targets=mention_targets,
                         collection_jobs=collection_jobs, recalled_memories=memories,
                     )
             except TimeoutError:
@@ -950,7 +950,6 @@ class BotService:
         registry = ToolRegistry()
         registry.allow_silent = automatic
         registry.batch_completion_enabled = self.settings.agent_batch_completion_enabled
-        registry.default_topic = batch.topic if batch is not None and batch.topic else "当前群聊"
         workspace = None
         injected_memories = list(recalled_memories or [])
         if self.settings.memory_enabled and not observe_only and (batch is not None or private):
@@ -1049,7 +1048,6 @@ class BotService:
                 if not automatic and not registry.output_attempted:
                     return {"ok": False, "error": "请先通过发送工具回应当前用户，再finish；不要只在内部口头回答。"}
                 registry.wait_for_messages = False
-                registry.topic = ""
                 return {"ok": True, "finished": True, "active": False}
             registry.register(FINISH_TOOL, finish, terminal=True)
             if batch is not None:
@@ -1057,12 +1055,8 @@ class BotService:
                     result = await finish({})
                     if result.get("ok") is not True:
                         return result
-                    topic = arguments["topic"].strip()
-                    if not topic:
-                        return {"ok": False, "error": "需要简短的当前话题锚点。"}
                     registry.wait_for_messages = True
-                    registry.topic = topic
-                    return {"ok": True, "waiting": True, "note": "本批结束，等待新群消息；程序控制超时。"}
+                    return {"ok": True, "waiting": True, "note": "本批结束，等待新群消息，不绑定旧话题；程序控制超时。"}
                 registry.register(WAIT_FOR_MESSAGES_TOOL, wait_for_messages, terminal=True)
 
             if self.settings.memory_enabled and not observe_only and (batch is not None or private):
@@ -1134,7 +1128,7 @@ class BotService:
                     if registry.delivery_uncertain:
                         return {"ok": False, "error": "上一条发送未确认，本轮不再发送。"}
                     if sticker_sent:
-                        return {"ok": False, "error": "本轮表情已发送，最多一张；可用wait_for_messages等待后续，或finish退出话题。"}
+                        return {"ok": False, "error": "本轮表情已发送，最多一张；可用wait_for_messages等待后续，或finish退出跟进。"}
                     try:
                         reply_to = messages.resolve_reply(arguments)
                     except ValueError as exc:

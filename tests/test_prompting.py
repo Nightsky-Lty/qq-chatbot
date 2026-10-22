@@ -199,6 +199,23 @@ class PromptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(data["运行环境"]["输出约束"]["允许多行"])
         self.assertEqual(data["运行环境"]["输出约束"]["单条文字字数上限"], 4000)
 
+    async def test_new_question_has_no_persistent_topic_or_query_suffix(self):
+        self.db.log_message(7, 11, "甲", "今晚打游戏吗", message_id="1")
+        source = self.db.log_message(7, 22, "乙", "向量呢？", message_id="2")
+        self.bot.memory.retrieve = AsyncMock(return_value=[])
+        batch = GroupBatch([GroupMessage(source, "2", 22, "乙", "向量呢？", 90, direct=True)])
+        await self.bot._run_group_batch_locked(7, batch, self.sender)
+        self.assertEqual(self.bot.memory.retrieve.await_args.args, (7, "向量呢？"))
+        data = json.loads(self.requests[0][0][1]["content"])
+        self.assertNotIn("当前话题", data["当前任务"])
+        self.assertIn("今晚打游戏吗", self.requests[0][0][1]["content"])
+        self.assertIn("不表示延续上一轮话题", self.requests[0][0][0]["content"])
+        definitions = {item["function"]["name"]: item["function"]["parameters"]
+                       for item in self.requests[0][1]}
+        self.assertEqual(definitions["wait_for_messages"]["properties"], {})
+        self.assertEqual(definitions["wait_for_messages"]["required"], [])
+        self.assertNotIn("topic", definitions["send_message"]["properties"])
+
     async def test_private_recalled_memory_is_background_and_workspace_releases(self):
         self.bot.settings = self.cfg.model_copy(update={"memory_enabled": True})
         self.bot.memory_capture.settings = self.bot.settings

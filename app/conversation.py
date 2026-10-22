@@ -1,4 +1,4 @@
-"""群会话调度：固定聚批、串行处理和由工具控制的话题活跃期。"""
+"""群会话调度：固定聚批、串行处理和不绑定语义话题的活跃跟进。"""
 
 import asyncio
 import logging
@@ -42,7 +42,6 @@ class GroupMessage:
 @dataclass(slots=True)
 class GroupBatch:
     entries: list[GroupMessage]
-    topic: str = ""
 
     @property
     def candidates(self) -> list[GroupMessage]:
@@ -69,7 +68,7 @@ class GroupBatch:
         return not self.direct and any(entry.random_trigger for entry in self.entries)
 
     @property
-    def wakes_topic(self) -> bool:
+    def wakes_followup(self) -> bool:
         return self.direct or self.random_trigger
 
     @property
@@ -82,16 +81,20 @@ class ConversationState:
     sender: Sender
     pending: list[GroupMessage] = field(default_factory=list)
     worker: asyncio.Task[None] | None = None
-    topic: str = ""
+    following: bool = False
     idle_until: float = 0
     hard_until: float = 0
     next_run_at: float = 0
 
     def active(self, now: float) -> bool:
-        if self.topic and now < min(self.idle_until, self.hard_until):
+        if self.following and now < min(self.idle_until, self.hard_until):
             return True
-        self.topic = ""
+        self.stop_followup()
         return False
+
+    def stop_followup(self) -> None:
+        self.following = False
+        self.idle_until = self.hard_until = 0
 
 
 Runner = Callable[[int, GroupBatch, Sender], Awaitable["AgentOutcome | None"]]
@@ -181,7 +184,7 @@ class GroupConversations:
             while state.pending and not self.closed:
                 now = time.monotonic()
                 active = state.active(now)
-                # 只有明确提问或程序随机抽中的新消息能启动话题。
+                # 只有明确提问或程序随机抽中的新消息能开启活跃跟进。
                 if not active and not any(entry.direct or entry.random_trigger for entry in state.pending):
                     state.pending.clear()
                     break
@@ -200,7 +203,7 @@ class GroupConversations:
                 active = state.active(now)
                 if not active and not any(entry.direct or entry.random_trigger for entry in fresh):
                     continue
-                batch = GroupBatch(fresh, state.topic if active else "")
+                batch = GroupBatch(fresh)
                 if not batch.candidates:
                     continue
                 logger.info("Group batch: group=%s messages=%s direct=%s random=%s active=%s",
@@ -209,21 +212,20 @@ class GroupConversations:
                 now = time.monotonic()
                 state.next_run_at = now + self.settings.ai_cooldown_seconds
                 if outcome is not None and not outcome.error and outcome.wait_for_messages:
-                    # 不发送的等待不能开启话题或刷新寿命，否则模型会永久保持活跃。
-                    if outcome.sent and (batch.wakes_topic or not state.hard_until or now < state.hard_until):
-                        if not batch.topic or (batch.wakes_topic and now >= state.hard_until):
+                    # 沉默不续期；普通跟进不能跨过超时重新开启，明确唤醒可以。
+                    still_active = state.active(now)
+                    if outcome.sent and (still_active or batch.wakes_followup):
+                        if not still_active:
                             state.hard_until = now + self.settings.chat_active_max_seconds
-                        state.topic = outcome.topic[:120]
+                        state.following = True
                         state.idle_until = now + self.settings.chat_active_idle_seconds
-                    elif not state.active(now):
-                        state.topic = ""
                 else:
-                    state.topic = ""
+                    state.stop_followup()
                 logger.info("Group conversation state: group=%s active=%s", group_id, state.active(now))
         except asyncio.CancelledError:
             raise
         except Exception:
-            state.topic = ""
+            state.stop_followup()
             state.pending.clear()
             logger.exception("Group conversation failed: group=%s", group_id)
         finally:
@@ -236,7 +238,7 @@ class GroupConversations:
         for key, state in targets:
             self.states.pop(key, None)
             state.pending.clear()
-            state.topic = ""
+            state.stop_followup()
             if state.worker is not None:
                 state.worker.cancel()
                 tasks.append(state.worker)

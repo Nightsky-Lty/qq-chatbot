@@ -22,7 +22,6 @@ class AgentOutcome:
     sent: int
     error: str | None = None
     wait_for_messages: bool = False
-    topic: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
     reasoning_tokens: int = 0
@@ -80,7 +79,7 @@ class ReactAgent:
                                 send_result = await registry.execute("send_message", {"text": text})
                         if registry.batch_completion_enabled and (registry.outputs_sent or registry.delivery_uncertain):
                             terminal = "wait_for_messages" if "wait_for_messages" in registry.bindings and not registry.delivery_uncertain else "finish"
-                            completion = await registry.execute(terminal, {"topic": registry.default_topic} if terminal == "wait_for_messages" else {})
+                            completion = await registry.execute(terminal, {})
                             if completion.get("ok") is True:
                                 break
                         if text and "wait_for_messages" in registry.bindings:
@@ -148,5 +147,5 @@ class ReactAgent:
             await registry.execute("send_message", {"text": "\n".join(dict.fromkeys(registry.receipts))})
         logger.info("Agent finished: steps=%s tool_calls=%s images=%s sent=%s error=%s prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s cache_hit_tokens=%s usage_requests=%s",
                     steps, calls_used, len(image_keys), registry.outputs_sent, error is not None, *usage.values(), usage_requests)
-        return AgentOutcome(steps, calls_used, registry.outputs_sent, error, registry.wait_for_messages, registry.topic,
+        return AgentOutcome(steps, calls_used, registry.outputs_sent, error=error, wait_for_messages=registry.wait_for_messages,
                             **usage, usage_requests=usage_requests)
