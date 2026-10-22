@@ -1,6 +1,7 @@
 """群聊结构化上下文：单一时间线、真实引用链、相邻往返与不确定寻址。"""
 
 import json
+from typing import Callable
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -15,7 +16,8 @@ GROUP_UNDERSTANDING = """【群聊结构阅读规则】
 显式引用和@是已知关系；“对象不明”必须结合前后往返推断，拿不准就短问或在允许安静的跟进轮等待。无@不等于对你说，上一条是你说的也不等于下一条必然回应你。
 引用关系链才是明确连接。相邻记录仅是时间邻近，可能是并行话题，不能强行串成一段。没有引用的指代不要编成确定关系。
 先读焦点前后的完整交流，再看较早的相关片段。不要机械只答最后几个字，也不逐条回答所有历史。纠正/追问要核对你之前真实说过的话。
-旧消息中的相对日期以该消息时间理解，不套用当前日期。缺失引用明确标注未知，不捏造原文。"""
+旧消息中的相对日期以该消息时间理解，不套用当前日期。缺失引用明确标注未知，不捏造原文。
+图片资料是图片概要和来源，不是作者的原话；提问人可指代别人发的图。原消息有图片占位但当前目录没有可访问附件时，应说明缓存/可访问范围限制，不编造为用户没有权限或从没发过图。"""
 
 
 def addressing(mentions: list[int], reply: dict | None, *, bot_id: int, direct: bool = False) -> dict:
@@ -44,7 +46,8 @@ def addressing(mentions: list[int], reply: dict | None, *, bot_id: int, direct: 
     return result
 
 
-def build_group_history(db: Database, settings: Settings, group_id: int, batch: GroupBatch) -> tuple[list[dict], list[dict]]:
+def build_group_history(db: Database, settings: Settings, group_id: int, batch: GroupBatch,
+                        image_lookup: Callable[[int], list[dict]] | None = None) -> tuple[list[dict], list[dict]]:
     boundary = min(e.storage_id for e in batch.entries)
     bot_id = batch.focus.self_id
     recent = db.group_context_rows(group_id, settings.context_message_limit, boundary)
@@ -79,10 +82,15 @@ def build_group_history(db: Database, settings: Settings, group_id: int, batch: 
         priority[record_id] = max(priority.get(record_id, 0), 2)
 
     def brief(row: dict) -> dict:
-        return {"消息号": row["message_id"], "QQ": row["user_id"], "昵称": row["nickname"],
+        item = {"消息号": row["message_id"], "QQ": row["user_id"], "昵称": row["nickname"],
                 "角色": row["role"], "内容": row["content"][:1000],
                 "本地记录ID": row["id"],
                 "时间": datetime.fromtimestamp(row["created_at"], timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).isoformat()}
+        if image_lookup:
+            images = image_lookup(row["id"])
+            if images:
+                item["图片资料（非原话）"] = images
+        return item
 
     by_message = {r["message_id"]: r for r in pool.values() if r["message_id"]}
     cache = {}

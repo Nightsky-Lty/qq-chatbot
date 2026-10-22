@@ -18,8 +18,10 @@ services:
       ADMIN_QQ_IDS: ${ADMIN_QQ_IDS:-}
       STICKER_LLM_API_KEY: ${STICKER_LLM_API_KEY:-}
       MEMORY_LLM_API_KEY: ${MEMORY_LLM_API_KEY:-}
+      IMAGE_LLM_API_KEY: ${IMAGE_LLM_API_KEY:-}
       # 固定写入挂载目录，避免 .env 中的相对路径将数据库写进临时文件系统。
       DATABASE_PATH: /app/data/bot.db
+      IMAGE_CACHE_DIRECTORY: /app/data/image_cache
       STICKER_DIRECTORY: /app/app/sticker_images
       # 收藏目录位于已有持久数据卷中，不写入只读的人工图库。
       STICKER_COLLECTED_DIRECTORY: /app/data/collected_stickers

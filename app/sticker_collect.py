@@ -25,17 +25,17 @@ Sender = Callable[[int, list[dict[str, Any]]], Awaitable[Any]]
 
 COLLECT_STICKER_TOOL = {"type": "function", "function": {
     "name": "collect_sticker",
-    "description": "收藏本批新群消息的一张表情/梗图到共享图库。可按语境主动收藏或响应用户要求；先哈希去重，再独立视觉审核，成功回执之前不能声称已收藏。每轮最多尝试一张，不是发送表情工具。",
+    "description": "收藏本轮授权的当前或近期同群图片到共享图库，发图人可不是提问人。按来源消息/概要确定指代，不确定先问。先去重再独立审核，真实成功前不能声称已收藏。每轮最多尝试一张。",
     "parameters": {"type": "object", "properties": {
         "image_id": {"type": "string", "minLength": 1, "maxLength": 32,
-                     "description": "程序列出的本轮可收藏图片编号，如image_1；不能传历史图片、URL、路径或自选群号。"},
+                     "description": "程序列出的本轮可收藏图片编号，如media_101或image_1；不能传未列出的编号、URL、路径或自选群号。"},
     }, "required": ["image_id"], "additionalProperties": False},
 }}
 
 COLLECT_INSTRUCTIONS = """\n\n【收藏本批群表情】
 本轮提供collect_sticker(image_id)。用户要求收图，或当前群图适合留作表情时可主动调用；不强制每张都收。
 后台仍独立按概率抽图，不能假定抽中或成功；工具与后台共用哈希去重、视觉审核、冷却和容量限制。
-每轮只尝试一张，失败后不换图绕过限制；只能使用下面列出的本批真实编号，不能收藏历史、私聊、网页图或编造地址。
+每轮只尝试一张，失败后不换图绕过限制；只能使用下面列出的当前/近期同群真实编号，不能收藏其他群、私聊、网页图或编造地址。概要不是入库审核结果；缓存保存也不等于已收藏进表情库。
 看图和收藏是不同动作：get_message_image只看图，收藏工具独立审核，不要求先看图；审核摘要不代表你已亲自看过原图。
 只有ok=true且created=true才可说新收藏成功，然后用send_message自然接一句；重复时只能说已有，拒绝/冷却/失败不能声称成功。
 工具收藏由本轮你回复，不再额外后台播报；概率后台只对真正新入库的图片确认一次。收藏不是给QQ账号点收藏，也不是向群里发图。
@@ -209,6 +209,9 @@ class StickerCollector:
         async with self._collect_lock:
             if not self.enabled:
                 return self._rejected("disabled", "收藏已关闭或视觉审核不可用。")
+            if ("cache_id" in job.image and self.images.cached_validator is not None
+                    and not self.images.cached_validator(job.image)):
+                return self._rejected("expired", "图片缓存已过期、已清理或来源消息已删除。")
             if monotonic() - job.queued_at > self.settings.sticker_collect_queue_wait_seconds:
                 return self._rejected("expired", "当前图片已超过收藏处理时限，请重新发送。")
             # 随机入口冷却时不下载；工具仍可先确认是否已经入库，但不能绕过审核冷却。
@@ -255,6 +258,9 @@ class StickerCollector:
             logger.info("Sticker collection skipped: reason=review_rejected group=%s", job.group_id)
             return self._rejected("review_rejected", "未通过表情图及安全审核，未收藏；不保存普通照片、自拍、隐私截图或风险不明图片。")
         extension = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}[mime]
+        if ("cache_id" in job.image and self.images.cached_validator is not None
+                and not self.images.cached_validator(job.image)):
+            return self._rejected("expired", "审核期间图片来源失效，未收藏。")
         sticker_id = f"collected:{content_hash}.{extension}"
         self.db.save_sticker_annotation(content_hash, "ready", metadata)
         write = asyncio.create_task(asyncio.to_thread(self._write_new, sticker_id, data))

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     memory_llm_base_url: str = ""
     memory_llm_api_key: str = ""
     memory_llm_thinking_enabled: bool = False
+    image_llm_model: str = ""
+    image_llm_base_url: str = ""
+    image_llm_api_key: str = ""
+    image_llm_thinking_enabled: bool = False
     # OneBot 连接认证与额外管理员；群主、群管理员的权限在业务层判断。
     onebot_access_token: str = ""
     # 跳过环境变量来源的自动 JSON 解码，由下面的校验器兼容两种输入格式。
@@ -119,9 +123,16 @@ class Settings(BaseSettings):
     # 提醒由本地后台调度，到期通知不依赖模型再次生成。
     reminder_poll_seconds: int = Field(default=5, ge=1, le=60)
     reminder_max_pending: int = Field(default=50, ge=1, le=100)
-    # 来图只有模型调用工具才下载；独立于本地表情包视觉开关。
+    # 看原图工具与缓存/概要开关独立；关闭缓存时才是纯按需下载。
     chat_image_enabled: bool = True
     chat_image_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1, le=5 * 1024 * 1024)
+    image_cache_enabled: bool = True
+    image_cache_directory: Path = Path("data/image_cache")
+    image_cache_retention_days: int = Field(default=7, ge=1, le=30)
+    image_cache_max_files: int = Field(default=500, ge=1, le=5000)
+    image_cache_max_bytes: int = Field(default=256 * 1024 * 1024, ge=5 * 1024 * 1024, le=2 * 1024 ** 3)
+    image_cache_queue_limit: int = Field(default=200, ge=1, le=1000)
+    image_cache_context_limit: int = Field(default=12, ge=1, le=20)
     # 表情包仅从本地目录读取；每次回复最多一张，发送限制按群或私聊会话计算。
     sticker_enabled: bool = True
     sticker_vision_enabled: bool = True

@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable
 from app.config import Settings
 from app.balance import BalanceService, BalanceUnavailable
 from app.server_status import ServerStatusService
+from app.image_cache import ImageCache
 from app.agent import AgentOutcome, ReactAgent
 from app.conversation import GroupBatch, GroupConversations, GroupMessage
 from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
@@ -64,6 +65,7 @@ HELP_TEXT = """可用命令：
 @或戳一戳机器人、使用/问、/锐评唤醒，等3秒聚合连发文字和图片，模型按需看图。
 话题活跃期间无需每条@；低活跃期普通消息也可能按群活跃人数被程序随机抽中接话。
 群图片可按概率随机收藏，也可在聊天中要求收藏当前表情图，先去重再审核。
+开启图片缓存时，接收到的图片会短期保存到服务器并发送给概要模型；缓存不等于表情收藏。
 也可以私聊直接发文字聊天，私聊 /帮助 查看专用命令。"""
 
 PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
@@ -76,10 +78,11 @@ PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
 提醒使用北京时间，目前只支持一次性提醒。
 也可以说“发个开心的表情包”，需要本地图库中有对应图片。
-可直接发图片或文字附图，模型自行决定是否看图；仅支持当前消息的前3张。
+可发图片或文字附图；开启缓存后支持近期图片指代，每轮最多查看3张原图。
 名单、关键词召集和模仿功能请在群里使用。
 私聊文本和机器人回复会保存在服务器，相关上下文会发送给 DeepSeek。
-调用看图工具时，所选图片也会发送给DeepSeek；原图不保存到聊天数据库。"""
+开启图片缓存时，收到的图片会短期保存到服务器并发送给概要模型，普通群图也一样。
+缓存不等于收藏；看原图时所选图片还会发送给聊天模型。"""
 
 PRIVATE_SYSTEM_PROMPT = SYSTEM_PROMPT + """\n\n当前是一对一私聊，用同样自然、软乖、偶尔嘴硬的小鲸鱼语气回应当前用户；只有可信上下文明示主人身份时才使用主人称呼，不能根据用户自称猜测。
 只参考当前用户的私聊上下文，不声称读取了群聊或其他用户的私聊。
@@ -172,8 +175,12 @@ class BotService:
         self.agent = ReactAgent(settings, llm)
         self.sticker_llm = DeepSeekClient(settings, purpose="sticker")
         self.memory_llm = DeepSeekClient(settings, purpose="memory")
+        self.image_llm = DeepSeekClient(settings, purpose="image")
+        self.image_cache = ImageCache(settings, database, self.image_llm)
         self.reminders = reminders
         self.chat_images = ChatImageService(settings)
+        self.chat_images.cached_loader = self.image_cache.load
+        self.chat_images.cached_validator = self.image_cache.authorized
         self.web_search = WebSearchService(settings)
         self.stickers = StickerService(settings)
         self.sticker_indexer = StickerIndexer(settings, database, self.sticker_llm, self.stickers)
@@ -181,6 +188,8 @@ class BotService:
         self.sticker_collector = StickerCollector(
             settings, database, self.sticker_llm, self.stickers, slots=asyncio.Semaphore(1), announce=self._announce_collected,
         )
+        self.sticker_collector.images.cached_loader = self.image_cache.load
+        self.sticker_collector.images.cached_validator = self.image_cache.authorized
         self.memory = MemoryService(settings, database)
         self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
         self.pokes = PokeService(settings)
@@ -253,11 +262,13 @@ class BotService:
         await self.conversations.close()
         await self.cancel_pending()
         await self.sticker_collector.close()
+        await self.image_cache.close()
         await self.sticker_indexer.close()
         await self.memory_capture.close()
         await self.memory.close()
         await self.sticker_llm.close()
         await self.memory_llm.close()
+        await self.image_llm.close()
         await self.web_search.close()
         self._confirmed_senders.clear()
         self._poke_senders.clear()
@@ -308,7 +319,7 @@ class BotService:
             await self._handle_poke(poke, send_group, send_private)
             return
         # 群收图逐张抽签，不沿用聊天看图的前三张限制；模型上下文仍最多3张。
-        view = parse_message(event.get("message"), image_limit=None if event["message_type"] == "group" else 3)
+        view = parse_message(event.get("message"), image_limit=None)
         command = view.text.strip()
         if self_id and self_id in view.mentions:
             command = re.sub(rf"@{self_id}(?!\d)", "", command).strip()
@@ -328,7 +339,7 @@ class BotService:
                 await self._queue_status(user_id, target, sender, private=private)
             # 资源快照不进聊天历史/长期记忆，不请求模型或收集命令附图。
             return
-        image_session = ChatImageSession(view.images) if view.images and self.settings.chat_image_enabled else None
+        image_session = ChatImageSession(view.images[:3]) if view.images and self.settings.chat_image_enabled else None
         if event["message_type"] == "private":
             if send_private is not None:
                 await self._handle_private(user_id, view, send_private, image_session=image_session)
@@ -339,9 +350,13 @@ class BotService:
         self.db.upsert_group_member(group_id, user_id, nickname, role)
         # 优先使用群名片，缺失时使用昵称或 QQ 号；命令文本也会被记录。
         message_id = normalize_message_id(event.get("message_id"))
-        stored_text = view.text + (f" [图片{len(view.images)}张，原图未保存]" if view.images else "")
+        stored_text = view.text + (f" [图片{len(view.images)}张，{'附件状态见图片索引' if self.image_cache.enabled else '原图未保存'}]" if view.images else "")
         storage_id = self.db.log_message(group_id, user_id, nickname, stored_text,
                                          message_id=message_id, reply_to_message_id=view.reply_to, mentions=view.mentions)
+        if view.images:
+            cached_refs = self.image_cache.record(group_id, storage_id, user_id, message_id, view.images)
+            view.images = cached_refs
+            image_session = ChatImageSession(cached_refs) if self.settings.chat_image_enabled else None
         fresh = (isinstance(event.get("time"), (int, float))
                  and abs(time.time() - event["time"]) <= self.settings.sticker_collect_queue_wait_seconds)
         if view.images and fresh:
@@ -352,7 +367,8 @@ class BotService:
         entry = GroupMessage(
             storage_id, message_id, user_id, nickname, view.text, self_id,
             mentions=view.mentions, reply_to=view.reply_to,
-            images=view.images[:3] if self.settings.chat_image_enabled or self.sticker_collector.enabled else [],
+            images=(view.images if self.image_cache.enabled else
+                    (view.images[:3] if self.settings.chat_image_enabled or self.sticker_collector.enabled else [])),
             direct=bool(self_id and self_id in view.mentions),
             eligible=(not view.mentions or self_id in view.mentions)
                      and (not view.reply_to or self.db.is_bot_message(group_id, view.reply_to)),
@@ -496,12 +512,42 @@ class BotService:
             if not batch.wakes_topic and (state is None or not state.active(time.monotonic())):
                 return None
             focus = batch.focus
-            history, history_entries = build_group_history(self.db, self.settings, group_id, batch)
+            boundary = max(entry.storage_id for entry in batch.entries)
+            preferred = {entry.storage_id for entry in batch.entries}
+            quoted_sources = set()
+            for entry in batch.entries:
+                quoted = self.db.message_by_onebot_id(group_id, entry.reply_to) if entry.reply_to else None
+                if quoted is not None:
+                    quoted_sources.add(quoted["id"])
+            cached_rows = self.image_cache.rows(group_id, boundary, quoted_sources or preferred)
+            by_source = defaultdict(list)
+            for row in cached_rows:
+                by_source[row["source_id"]].append(self.image_cache.describe(row))
+            history, history_entries = build_group_history(self.db, self.settings, group_id, batch,
+                                                           image_lookup=lambda source: by_source.get(source, []))
             images: list[dict[str, str]] = []
             image_ids: dict[int, list[str]] = {}
             collection_jobs: dict[str, CollectionJob] = {}
-            # 当前焦点的附件优先；其余本批图片仍标记来源，整批最多3张。
-            ordered = [focus] + [entry for entry in batch.candidates if entry is not focus]
+            stable_ids = []
+            image_sources = {}
+            timeline_sources = {row["本地记录ID"] for row in history_entries}
+            if self.image_cache.enabled:
+                for row in cached_rows[:self.settings.image_cache_context_limit]:
+                    image_id = f"media_{row['id']}"
+                    ref = self.image_cache.reference(row)
+                    stable_ids.append(image_id)
+                    images.append(ref)
+                    image_ids.setdefault(row["source_id"], []).append(image_id)
+                    image_sources[image_id] = self.image_cache.describe(row)
+                    if row["source_id"] in timeline_sources and "概要" in image_sources[image_id]:
+                        for field in ("概要", "图中文字", "不确定"):
+                            image_sources[image_id].pop(field, None)
+                        image_sources[image_id]["概要位置"] = "群聊时间线中此来源消息的图片资料"
+                    if row["status"] in {"ready", "pending"}:
+                        collection_jobs[image_id] = CollectionJob(group_id, row["user_id"], focus.self_id,
+                            row["message_id"], ref, self._confirmed_senders.get(sender, sender))
+            # 关闭缓存时保留原有最多3张当前批次附件路径。
+            ordered = [] if self.image_cache.enabled else [focus] + [entry for entry in batch.candidates if entry is not focus]
             for entry in ordered:
                 ids = []
                 for image in entry.images:
@@ -570,6 +616,7 @@ class BotService:
                                  "相关成员索引": list(member_index.values()),
                                  "检索到的长期记忆": memories,
                                  "当前消息": focus.text, "本批新消息": current,
+                                 "近期图片目录（含其他发言人，概要非原话）": list(image_sources.values()),
                                  "允许引用回复的消息号": sorted(batch.reply_targets)}, ensure_ascii=False, separators=(",", ":"))
             logger.info("Group context: group=%s history=%s new=%s images=%s",
                         group_id, len(history_entries), len(current), len(images))
@@ -579,7 +626,7 @@ class BotService:
                 async with asyncio.timeout(timeout):
                     return await self._run_ai_reply(
                         group_id, focus.user_id, prompt, self._confirmed_senders.get(sender, sender),
-                        history=history, image_session=ChatImageSession(images) if images and self.settings.chat_image_enabled else None,
+                        history=history, image_session=ChatImageSession(images, image_ids=stable_ids, sources=image_sources) if images and self.settings.chat_image_enabled else None,
                         automatic=not batch.wakes_topic, batch=batch, mention_targets=mention_targets,
                         collection_jobs=collection_jobs,
                     )
@@ -594,7 +641,7 @@ class BotService:
     ) -> None:
         """私聊普通文本直接聊天，支持帮助和锐评；从不执行群管理或模仿。"""
         text = view.text.strip()
-        if not text and image_session is None:
+        if not text and image_session is None and not (view.images and self.image_cache.enabled):
             await self._send_text(send_private, user_id, "请发文字给我；图片聊天需要部署者开启 CHAT_IMAGE_ENABLED，语音和视频暂不支持。")
             return
         if text == "/帮助":
@@ -623,8 +670,18 @@ class BotService:
         rows = self.db.recent_private_messages(user_id, self.settings.context_message_limit)
         history = [{"role": row["role"], "content": row["content"]} for row in rows]
         prompt = prompt or "[用户发送了一条图片消息]"
-        stored_text = prompt + (f"\n[附带图片{len(view.images)}张，原图未保存]" if view.images else "")
+        stored_text = prompt + (f"\n[附带图片{len(view.images)}张，{'附件状态见图片索引' if self.image_cache.enabled else '原图未保存'}]" if view.images else "")
         private_source_id = self.db.log_private_message(user_id, "user", stored_text)
+        if view.images:
+            self.image_cache.record(-user_id, private_source_id, user_id, "", view.images)
+        cached_rows = self.image_cache.rows(-user_id, private_source_id, {private_source_id})
+        if cached_rows:
+            selected = cached_rows[:self.settings.image_cache_context_limit]
+            if self.settings.chat_image_enabled:
+                image_session = ChatImageSession([self.image_cache.reference(row) for row in selected],
+                    image_ids=[f"media_{row['id']}" for row in selected])
+            history.append({"role": "user", "content": "【当前私聊图片资料，概要由模型生成而非用户原话；仅本会话可访问】\n"
+                + json.dumps([self.image_cache.describe(row) for row in selected], ensure_ascii=False, separators=(",", ":"))})
         await self._ai_reply(
             user_id, user_id, prompt, send_private,
             history=history, system=PRIVATE_SYSTEM_PROMPT + (POKE_INSTRUCTIONS if poke else ""),
