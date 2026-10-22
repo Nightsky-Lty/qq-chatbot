@@ -1000,7 +1000,17 @@ class BotService:
             namespace = -user_id if private else context_id
             new_source_ids = ({entry.storage_id for entry in batch.entries if not entry.poke}
                               if batch else ({private_source_id} if private_source_id else set()))
-            workspace = self.memory_capture.open_workspace(namespace, new_source_ids)
+            context_ids = set()
+            if batch:
+                for entry in batch.entries:
+                    quoted = self.db.group_context_message(namespace, entry.reply_to) if entry.reply_to else None
+                    if quoted and quoted["id"] < min(new_source_ids, default=0):
+                        context_ids.add(quoted["id"])
+            elif private_source_id:
+                with self.db._lock:
+                    context_ids = {r[0] for r in self.db.connection.execute("SELECT id FROM private_messages WHERE user_id=? AND id<? ORDER BY id DESC LIMIT 4", (user_id, private_source_id))}
+            context_ids -= self.db.memories.blocked_sources(namespace)
+            workspace = self.memory_capture.open_workspace(namespace, new_source_ids, context_ids)
             registry.working_memory = workspace
             if image_session is None and self.settings.chat_image_enabled and self.image_cache.enabled:
                 image_session = ChatImageSession([], image_ids=[])

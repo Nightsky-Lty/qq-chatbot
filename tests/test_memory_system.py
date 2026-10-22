@@ -101,6 +101,28 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.memory.retrieve(7, "量子力学", user_ids={11}), [])
         self.assertIsInstance(await self.memory.retrieve(7, '红茶" OR * NOT NEAR(', user_ids={11}), list)
 
+    async def test_personal_episode_is_normalized_without_weakening_joint_provenance(self):
+        source = self.source("昨天我修好了网站", -11)
+        self.model.actions = [self.action(source, "QQ11昨天修好了网站", "episode")]
+        await self.capture.extract(-11, self.db.memory_source_rows(-11, {source}))
+        row = self.db.memory_candidates(-11, {11}, 10)[0]
+        self.assertEqual(row["memory_type"], "event")
+        self.model.actions = [self.action(source, "QQ11与机器人一起修好了网站", "episode")]
+        with self.assertRaises(ValueError):
+            await self.capture.extract(-11, self.db.memory_source_rows(-11, {source}))
+
+    async def test_old_quoted_evidence_is_context_not_new_authorization(self):
+        old = self.source("删除我的红茶记忆", -11)
+        new = self.source("今天只是问候", -11)
+        workspace = self.capture.open_workspace(-11, {new}, {old})
+        registry = ToolRegistry()
+        register_memory_tools(registry, self.capture, -11, 11, self.db.memory_source_rows(-11, {old, new}), workspace=workspace)
+        self.assertFalse((await registry.execute("memory_delete", {"memory_id": 1, "expected_version": 1}))["ok"])
+        self.capture.close_workspace(workspace)
+        self.model.actions = []
+        await self.capture.process_task_once()
+        self.assertEqual(self.model.inputs[-1]["new_source_ids"], [new])
+
     async def test_time_filter_uses_event_time_and_not_record_time(self):
         source, row = await self.save("我昨天修复了金星网站报错")
         yesterday, end = time_range("昨天")

@@ -24,7 +24,8 @@ def register_memory_tools(registry: ToolRegistry, capture: MemoryCapture, namesp
         registry.register({"type": "function", "function": {"name": name, "description": description,
             "parameters": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}}}, handler)
 
-    own_text = "\n".join(r["content"] for r in sources if r["role"] == "user" and capture._subject(namespace, r) == user_id)
+    own_text = "\n".join(r["content"] for r in sources if r["role"] == "user" and capture._subject(namespace, r) == user_id
+                         and (workspace is None or r["id"] in workspace.new_source_ids))
     intent_text = re.sub(r"(?:别|不要|不能|不许)(?:忘(?:记|掉)|删除|清除|移除)", "", own_text)
     remembered = None
     search_cache = workspace.search_cache if workspace else {}
@@ -75,7 +76,8 @@ def register_memory_tools(registry: ToolRegistry, capture: MemoryCapture, namesp
             return {"ok": False, "error": "仅本人明确要求记住时使用；普通聊天由任务结束整合"}
         async with capture.lock:
             if remembered is None:
-                remembered = await capture.extract(namespace, sources, requested_by=user_id)
+                remembered = await capture.extract(namespace, sources, requested_by=user_id,
+                    new_source_ids=set(workspace.new_source_ids) if workspace else None)
             return remembered
 
     def target(arguments):
@@ -94,7 +96,8 @@ def register_memory_tools(registry: ToolRegistry, capture: MemoryCapture, namesp
                 row = target(arguments)
             except ValueError as exc:
                 return {"ok": False, "error": str(exc)}
-            return await capture.extract(namespace, sources, requested_by=user_id, update_target=row)
+            return await capture.extract(namespace, sources, requested_by=user_id, update_target=row,
+                new_source_ids=set(workspace.new_source_ids) if workspace else None)
 
     async def revoke(arguments, delete=False):
         pattern = r"删除|清除|删掉|移除" if delete else r"忘记|忘掉|别记|不要记|不许记"

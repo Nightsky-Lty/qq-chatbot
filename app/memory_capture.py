@@ -39,6 +39,7 @@ concept_basis（explicit_definition/repeated_usage/inferred）、support_ids（�
 检索出的旧记忆和background不算新的独立证据；无新证据不重复提取，不把重复检索当成反复确认。
 你不拥有删除/遗忘权，action只输出upsert；用户要求遗忘由专用工具处理。
 图片概要仅用于理解事件，原图和概要已经由感知缓存管理，不要另存一条伪造的用户事实。
+个人单方面报告的经历使用event，不要因为本系统称为Episodic记忆就误用“双方共同经历”episode；没有机器人真实回复时不得编造共同经历。不同条件的同一属性可以分别输出动作。
 """
 
 
@@ -133,10 +134,11 @@ class MemoryCapture:
                 logger.warning("Memory capture retry: scope=%s error=%s delay=%s",
                                "group" if job["namespace"] > 0 else "private", type(exc).__name__, delay)
 
-    def open_workspace(self, namespace: int, source_ids: set[int]) -> WorkingMemory:
-        workspace = WorkingMemory(namespace, set(source_ids))
+    def open_workspace(self, namespace: int, source_ids: set[int], context_ids: set[int] | None = None) -> WorkingMemory:
+        all_sources = set(source_ids) | (context_ids or set())
+        workspace = WorkingMemory(namespace, all_sources, new_source_ids=set(source_ids))
         if self.db.capture_enabled and source_ids:
-            self.db.memories.enqueue(workspace.task_id, namespace, source_ids, source_ids)
+            self.db.memories.enqueue(workspace.task_id, namespace, all_sources, source_ids)
             with self.db._lock, self.db.connection:
                 self.db.connection.execute("UPDATE memory_consolidation_jobs SET status='running' WHERE task_id=?", (workspace.task_id,))
         return workspace
@@ -145,14 +147,14 @@ class MemoryCapture:
         try:
             if self.db.capture_enabled and workspace.source_ids:
                 ns = workspace.namespace
-                initial = self.db.memory_source_rows(ns, workspace.source_ids)
+                initial = self.db.memory_source_rows(ns, workspace.new_source_ids)
                 message_ids = {r.get("message_id") for r in initial if r.get("message_id")}
                 table, key, owner = ("messages", "group_id", ns) if ns > 0 else ("private_messages", "user_id", -ns)
                 with self.db._lock:
                     tail = self.db.connection.execute(f"SELECT * FROM {table} WHERE {key}=? AND id>? AND role='assistant' ORDER BY id LIMIT 40", (owner, max(workspace.source_ids))).fetchall()
                 own_replies = {r["id"] for r in tail if ns < 0 or r["reply_to_message_id"] in message_ids}
                 ids = workspace.source_ids | own_replies
-                self.db.memories.enqueue(workspace.task_id, ns, ids, ids)
+                self.db.memories.enqueue(workspace.task_id, ns, ids, workspace.new_source_ids | own_replies)
         finally:
             workspace.release()
 
@@ -268,6 +270,11 @@ class MemoryCapture:
             if not any(r["id"] in fresh_ids for r in evidence):
                 raise ValueError("旧证据不能作为新增记忆来源")
             personal_sources = [r for r in evidence if r["role"] == "user" and self._subject(namespace, r) == subject]
+            has_bot_evidence = any(r["role"] == "assistant" for r in evidence)
+            joint_claim = bool(re.search(r"(?:与|和|跟|同)(?:机器人|小鲸鱼)|(?:机器人|小鲸鱼).*(?:共同|一起|约定|答应)", candidate.content))
+            if candidate.memory_type == "episode" and not has_bot_evidence and not joint_claim:
+                # 模型常将Episodic个人经历叫episode；只归一类型，不放松共同经历的证据要求。
+                action["memory_type"] = "event"
             if candidate.memory_type == "group_meme":
                 if namespace < 0 or subject != 0 or not any(r["role"] == "user" for r in evidence):
                     raise ValueError("群梗归属无效")
@@ -279,9 +286,10 @@ class MemoryCapture:
             shared_update = update_target is not None and update_target["user_id"] == 0 and subject == 0
             if requested_by is not None and subject != requested_by and not shared_update:
                 raise ValueError("显式操作只能处理本人记忆")
-            if candidate.memory_type in {"episode", "commitment"} and not any(r["role"] == "assistant" for r in evidence):
+            needs_bot = candidate.memory_type == "commitment" or (candidate.memory_type == "episode" and action["memory_type"] != "event")
+            if needs_bot and not has_bot_evidence:
                 raise ValueError("共同经历缺少机器人真实回复")
-            if candidate.memory_type in {"episode", "commitment"} and namespace > 0 and not any(
+            if needs_bot and namespace > 0 and not any(
                     bot.get("reply_to_message_id") == user.get("message_id") and user.get("message_id")
                     for bot in evidence if bot["role"] == "assistant" for user in personal_sources):
                 raise ValueError("群内共同经历缺少双方明确回应关系")
@@ -295,7 +303,7 @@ class MemoryCapture:
                 raise ValueError("不允许修改其他人或未提供的记忆")
             if candidate.action != "upsert":
                 raise ValueError("整理模型无权执行删除或遗忘")
-            correction_sources = personal_sources or ([r for r in evidence if r["role"] == "user" and self._subject(namespace, r) == requested_by] if shared_update else [])
+            correction_sources = [r for r in (personal_sources or ([r for r in evidence if r["role"] == "user" and self._subject(namespace, r) == requested_by] if shared_update else [])) if r["id"] in fresh_ids]
             if candidate.replaces_ids and not any(re.search(r"改|纠正|不再|换|现在|取消|之前.*错|其实|从今天", r["content"]) for r in correction_sources):
                 raise ValueError("替代旧记忆需要本人明确的新纠正")
             if update_target and ((subject != requested_by and not shared_update) or candidate.replaces_ids != [update_target["id"]]):
@@ -342,7 +350,7 @@ class MemoryCapture:
                 explicit_days = {day for _, day in dated if day is not None}
                 if len(explicit_days) == 1:
                     action["occurred_at"] = explicit_days.pop()
-            action["evidence_kind"] = "reported" if candidate.memory_type in {"event", "profile", "preference", "relationship"} else "conversation"
+            action["evidence_kind"] = "reported" if action["memory_type"] in {"event", "profile", "preference", "relationship"} else "conversation"
             if candidate.memory_type == "group_meme":
                 explicit = candidate.concept_basis == "explicit_definition" and any(
                     re.search(r"意思|指的是|表示|简称|别名|梗|我们.*叫|这里.*指", r["content"]) for r in evidence if r["role"] == "user")
