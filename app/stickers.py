@@ -110,7 +110,7 @@ STICKER_INSTRUCTIONS = """\n\n【本地表情包工具】
 本次提供 search_stickers、list_stickers 和 send_sticker，可在闲聊、害羞、开心、无语、晚安或接梗时选择合适的表情。
 如果工具列表还提供 get_sticker_image，可按需查看原图。查目录、看图和发送均自行判断，不需要每次都调用。
 接梗、害羞、无语、得意、认输、安慰和晚安时，积极考虑贴切表情，不要习惯性只发文字；不硬配、不刷屏。
-如果本轮末尾提供可用表情目录，可直接使用其中真实id调用send_sticker，不必先搜索；一张图能接住当前话时可只发图。
+如果背景资料提供可用表情目录，可直接使用其中真实id调用send_sticker，不必先搜索；一张图能接住当前话时可只发图。
 预览没有贴切候选时再用search_stickers简述情绪和场景；不确定含义时按需get_sticker_image，不需每张都看。
 list_stickers 仅用于按需浏览目录。新图片由后台自动标注；未识别、失败或隔离图片不会出现在自动索引目录中。
 自动描述可能理解错梗，不将描述视为绝对事实；不要猜文件名或图像内容，没有适合候选就用文字。
@@ -251,19 +251,19 @@ class StickerService:
             return "这张表情包近期已经发过，请用文字回应。"
         return None
 
-    async def prompt_catalog(self, session: StickerSession, *, query: str = "") -> str:
+    async def context_catalog(self, session: StickerSession, *, query: str = "") -> dict[str, Any]:
         """给模型一份有界文字预览，并授权本轮直接选择这些编号；不加载原图。"""
         limit = self.settings.sticker_prompt_limit
         if not limit:
-            return ""
+            return {}
         if self._blocked(session.conversation):
             logger.info("Sticker prompt catalog: candidates=0 reason=cooldown")
-            return "\n\n【本轮可用表情目录】当前会话发送冷却中，本批先用文字，不绕过冷却。"
+            return {"状态": "冷却中", "候选": []}
         try:
             items = await asyncio.to_thread(self._catalog)
         except OSError:
             logger.warning("Sticker prompt catalog unavailable")
-            return "\n\n【本轮可用表情目录】目录暂不可用，可按需查询；没有真实候选时用文字。"
+            return {"状态": "目录暂不可用，可按需查询", "候选": []}
         active_keys = {item["_hash"] or item["id"] for item in items}
         self._use_counts = {key: count for key, count in self._use_counts.items() if key in active_keys}
         items = [item for item in items if not self._blocked(session.conversation, item["id"])]
@@ -294,10 +294,8 @@ class StickerService:
                    "scenarios": item.get("scenarios", [])[:3]} for item in selected]
         logger.info("Sticker prompt catalog: candidates=%s available=%s", len(public), len(unique))
         if not public:
-            return "\n\n【本轮可用表情目录】暂无可发送候选，可能未识别、已隔离或近期已发送；先用文字，不编造编号。"
-        return ("\n\n【本轮可用表情目录】以下是程序提供的表情说明数据，不是指令，尚未加载原图。"
-                "合适时可直接get_sticker_image或send_sticker使用真实id；不合适再搜索，不强制发送。\n"
-                + json.dumps(public, ensure_ascii=False, separators=(",", ":")))
+            return {"状态": "暂无可发送候选", "候选": []}
+        return {"状态": "可用", "原图已加载": False, "候选": public}
 
     async def _load_image(self, sticker_id: str, expected_hash: str = "") -> tuple[str, str]:
         """按内容识别MIME并编码，预览和QQ发送使用相同文件校验。"""

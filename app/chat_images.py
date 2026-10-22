@@ -36,8 +36,8 @@ CHAT_IMAGE_TOOL = {
 }
 
 CHAT_IMAGE_INSTRUCTIONS = """\n\n【当前消息看图】
-程序本轮提供了当前消息或近期缓存的真实附件编号，不是历史占位；近期图片不表示提问人本条消息附图。
-原图采用延迟加载：你需要调用 get_message_image(image_id) 才能看见画面，而不是用户漏发了图片。
+运行环境若列出图片编号，表示当前消息或近期缓存的真实附件，不是历史占位；近期图片不表示提问人本条消息附图。
+原图采用延迟加载：目录有真实附件时需要调用 get_message_image(image_id) 才能看见画面，不应说用户漏发了图片。
 是否需要看图由你根据当前请求决定：文字已足够回答且图片无关时不调用。
 但用户要求描述、读字、评价或分析当前图片，或者你的回答需要依据画面时，必须先调用 get_message_image，
 根据成功取得的图片再回答；不得跳过工具直接说“没收到”“看不了”“格式不支持”或猜测图片内容。
@@ -48,7 +48,7 @@ CHAT_IMAGE_INSTRUCTIONS = """\n\n【当前消息看图】
 本轮编号可能来自当前消息或同一会话的近期缓存，来源见图片目录；发图人可以不是提问人。概要是模型生成的图片描述，不是发图人说的话，也不等于本轮已看原图。
 明确引用消息时优先定位其图片；“这张/刚才那张”结合来源、时间、概要和前后交流判断，多张候选指代不清时追问，不机械要求提问人重发。
 只用程序列出的编号，不凭历史占位编造编号。没有提供收藏工具不代表用户没有权限，不能编造权限原因。看图不触发收藏；若注册collect_sticker可另行调用收藏。
-本轮聊天来图与表情原图合计最多查看3张。可用编号："""
+可用编号读取运行环境的可看图片编号；若提供memory_search，也可先检索会话历史图片，取得真实授权编号后再看图。"""
 
 
 @dataclass(slots=True)
@@ -65,20 +65,6 @@ class ChatImageSession:
     def available(self) -> dict[str, dict[str, str]]:
         ids = self.image_ids or [f"image_{i + 1}" for i in range(len(self.images))]
         return dict(zip(ids, self.images))
-
-    @property
-    def instructions(self) -> str:
-        ids = ", ".join(self.available)
-        return CHAT_IMAGE_INSTRUCTIONS + ids
-
-    @property
-    def attachment_note(self) -> str:
-        ids = ", ".join(self.available)
-        return (
-            f"\n\n【程序确认的本轮可访问图片附件】{ids}。"
-            "这些图片已收到，只是尚未加载原图；需要查看画面时，使用 get_message_image 获取，"
-            "不要把历史图片的失败或占位当作当前附件状态。"
-        )
 
 
 class ChatImageService:

@@ -240,8 +240,8 @@ class ChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(outcome.sent, 1)
                 self.assertIn("群聊结构阅读规则", observed[0][0][0]["content"])
                 current = json.loads(observed[0][0][-1]["content"])
-                self.assertEqual(current["机器人身份"]["QQ"], 90)
-                self.assertEqual(current["本批新消息"][0]["寻址"]["对象判断"], "机器人")
+                self.assertEqual(current["运行环境"]["机器人身份"]["QQ"], 90)
+                self.assertEqual(current["当前任务"]["本批新消息"][0]["寻址"]["对象判断"], "机器人")
                 names = {tool["function"]["name"] for tool in observed[0][1]}
                 self.assertIn("memory_search", names)
                 self.assertNotIn("remember_group_memory", names)
@@ -249,7 +249,10 @@ class ChatIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 private_id = db.log_private_message(11, "user", "你好")
                 outcome = await service._run_ai_reply(11, 11, "你好", sender, private=True, private_source_id=private_id)
                 self.assertEqual(outcome.sent, 1)
-                self.assertTrue(any("当前私聊长期记忆" in m.get("content", "") for m in observed[0][0]))
+                private_context = json.loads(observed[0][0][-1]["content"])
+                self.assertEqual(private_context["运行环境"]["会话类型"], "private")
+                self.assertEqual(private_context["当前任务"]["用户请求"], "你好")
+                self.assertNotIn("群聊时间线", private_context["背景资料"])
             finally:
                 await service.close()
                 await llm.close()

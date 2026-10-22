@@ -5,10 +5,12 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
-from app.agent import AgentOutcome
 from app.config import Settings
+
+if TYPE_CHECKING:
+    from app.agent import AgentOutcome
 
 logger = logging.getLogger(__name__)
 Sender = Callable[[int, list[dict[str, Any]]], Awaitable[Any]]
@@ -92,7 +94,7 @@ class ConversationState:
         return False
 
 
-Runner = Callable[[int, GroupBatch, Sender], Awaitable[AgentOutcome | None]]
+Runner = Callable[[int, GroupBatch, Sender], Awaitable["AgentOutcome | None"]]
 
 
 @dataclass(slots=True)

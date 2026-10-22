@@ -8,7 +8,7 @@ import httpx
 from app.config import Settings
 from app.persona import SYSTEM_PROMPT
 
-# 完整角色卡在app/persona.py中维护，群聊、私聊及锐评复用；模仿提示词保持独立。
+# 此处只导入基础人设；聊天Agent的系统规则和动态上下文由app/prompting.py统一组装。
 
 
 class LLMUnavailable(RuntimeError):

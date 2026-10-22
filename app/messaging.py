@@ -10,7 +10,7 @@ from app.models import at_segment, normalize_message_id, reply_segment, text_seg
 from app.tools import ToolRegistry
 
 SEND_MESSAGE_TOOL = {"type": "function", "function": {
-    "name": "send_message", "description": "向当前会话发送一条文字，只回应一条新消息和一个话题。默认不引用、不@；群聊可用at_user_ids主动@本轮允许的成员，引用另用reply_to_message_id。普通群聊最多100字且不换行。",
+    "name": "send_message", "description": "向当前会话发送一条文字，只回应一条新消息和一个话题。默认不引用、不@；群聊可用at_user_ids主动@本轮允许的成员，引用另用reply_to_message_id。长度、条数和排版遵守运行环境的输出约束。",
     "parameters": {"type": "object", "properties": {
         "text": {"type": "string", "minLength": 1, "maxLength": 4000},
         "reply_to_message_id": {"type": "string", "minLength": 1, "maxLength": 24,

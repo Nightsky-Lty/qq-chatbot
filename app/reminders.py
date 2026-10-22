@@ -47,12 +47,8 @@ def display_time(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, BEIJING).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def reminder_instructions() -> str:
-    """向模型提供当前北京时间，避免用训练知识猜测今天或相对日期。"""
-    now = datetime.now(BEIJING)
-    weekday = "一二三四五六日"[now.weekday()]
-    return f"""\n\n【私聊备忘录工具】
-当前北京时间是 {now.isoformat(timespec='seconds')}，星期{weekday}，默认所有时间均为北京时间（UTC+8）。
+REMINDER_INSTRUCTIONS = """【私聊备忘录工具】
+当前时间读取运行环境的当前北京时间，默认所有时间均为北京时间（UTC+8）。
 用户明确要求提醒时，解析日期、时间和事项后调用 create_reminder；相对时间以当前时间计算。
 只给了钟点时采用下一次该钟点，但含糊表达如“晚上”“过会儿”必须先追问具体时间。
 缺少事项、无法确定日期、编号不明或要求每天等循环提醒时，先说明并追问，不擅自创建。

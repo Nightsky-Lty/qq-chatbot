@@ -233,9 +233,10 @@ class ImageConversationTests(unittest.IsolatedAsyncioTestCase):
                 captured.append(json.loads(json.dumps(messages)))
                 if not any(message["role"] == "tool" for message in messages):
                     self.assertIn("collect_sticker", {tool["function"]["name"] for tool in tools})
-                    context = json.loads(messages[-1]["content"].split("\n\n【")[0])
-                    candidate = context["近期图片目录（含其他发言人，概要非原话）"][0]
+                    context = json.loads(messages[-1]["content"])
+                    candidate = context["背景资料"]["图片目录（概要非原话）"][0]
                     self.assertEqual(candidate["发图人QQ"], 11)
+                    self.assertIn(candidate["图片编号"], context["运行环境"]["可收藏图片编号"])
                     self.assertIn(SUMMARY["summary"], json.dumps(messages, ensure_ascii=False))
                     return {"tool_calls": [{"id": "collect", "function": {"name": "collect_sticker",
                             "arguments": json.dumps({"image_id": candidate["图片编号"]})}}]}

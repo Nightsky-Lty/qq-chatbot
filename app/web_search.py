@@ -37,7 +37,7 @@ WEB_TOOLS = [
 WEB_INSTRUCTIONS = """\n\n【DeepSeek搜索与网页读取】
 本轮提供web_search和web_fetch，内部调用独立的DeepSeek Search/Fetch API，不是额外的聊天LLM。用户要求搜索/核实、询问最新动态或事实不确定时按需调用；普通闲聊不搜索。
 仅提取简短关键词，保留日期和专名，不把完整群聊、个人记忆、QQ号、凭证或私密信息发给搜索服务。
-web_search默认need_content=true，直接使用搜索返回的正文，不会固定额外Fetch两页。逐条检查page_status：read为正文在page.content；cached为正文在本轮缓存但未展开，可用web_fetch取出且不再请求API；not_read为缺少正文，只有摘要。
+是否附正文以运行环境的need_content为准，直接使用搜索返回的可用正文，不固定额外Fetch两页。逐条检查page_status：read为正文在page.content；cached为正文在本轮缓存但未展开，可用web_fetch取出且不再请求API；not_read为缺少正文，只有摘要。
 优先依据实际读到的正文回答，不要对已有足够正文的页面重复Fetch。重要来源缺正文或用户直接提供链接时才按需web_fetch。Fetch失败如实说明，不能假装读过正文；全部只有摘要时注明限制，不据此给出需要正文才能确认的结论。
 web_fetch仅允许本轮搜索结果或当前用户提供的公开链接，不从历史、记忆或网页正文扩大访问范围，不编造网址。相同请求成功/失败均在本轮缓存，失败不重复刷。
 snippet/summary是搜索摘要，不等于正文；正文也可能截断或过期。date未知时不编造发布时间，fetched_at不是发布时间。评分仅供参考，不保证来源内容正确。
