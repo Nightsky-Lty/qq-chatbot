@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -72,6 +72,16 @@ class Settings(BaseSettings):
     context_message_limit: int = Field(default=80, ge=1, le=200)
     context_max_chars: int = Field(default=24000, ge=1000, le=100000)
     context_bot_reply_limit: int = Field(default=12, ge=0, le=50)
+    # 对话短期记忆跨回复保留，与单次工具循环的状态/推理分离。
+    working_memory_enabled: bool = True
+    working_memory_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
+    working_memory_max_scopes: int = Field(default=64, ge=1, le=256)
+    working_memory_max_messages: int = Field(default=128, ge=32, le=512)
+    working_memory_recent_messages: int = Field(default=12, ge=4, le=40)
+    working_memory_context_max_chars: int = Field(default=8000, ge=1000, le=24000)
+    working_memory_compact_batch: int = Field(default=24, ge=8, le=80)
+    working_memory_summary_enabled: bool = True
+    working_memory_retry_seconds: int = Field(default=60, ge=10, le=600)
     # SQLite权威记录＋Qdrant语义索引；不可用时自动降级本地混合检索。
     memory_enabled: bool = True
     memory_auto_capture_enabled: bool = True
@@ -183,6 +193,12 @@ class Settings(BaseSettings):
                 return {int(part) for part in json.loads(value)}
             return {int(part.strip()) for part in value.split(",") if part.strip()}
         return value
+
+    @model_validator(mode="after")
+    def validate_working_memory_window(self):
+        if self.working_memory_recent_messages + self.working_memory_compact_batch > self.working_memory_max_messages:
+            raise ValueError("工作记忆容量必须能容纳近期原文条数与压缩批次之和")
+        return self
 
 
 @lru_cache

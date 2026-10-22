@@ -1,6 +1,7 @@
 """SQLite 持久化层：保存群配置及聊天，私聊记录独立按用户隔离。"""
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -149,6 +150,7 @@ class Database:
         self._lock = threading.RLock()
         self.capture_enabled = False
         self.capture_delay = 30
+        self.message_listener = None
         with self._lock:
             self.connection.executescript(SCHEMA)
         with self._lock, self.connection:
@@ -480,7 +482,15 @@ class Database:
                 self._queue_memory_capture(group_id, record_id)
                 if role == "assistant":
                     self._assign_memory_reply(group_id, record_id, reply_to_message_id)
-            return record_id
+        self._notify_message(group_id, record_id)
+        return record_id
+
+    def _notify_message(self, namespace: int, record_id: int) -> None:
+        if self.message_listener is not None:
+            try:
+                self.message_listener(namespace, record_id)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Working memory receive failed: error=%s", type(exc).__name__)
 
     def upsert_group_member(self, group_id: int, user_id: int, display_name: str, role: str = "member") -> None:
         """以群号和 QQ 号维护稳定成员身份，并保留最近使用过的昵称。"""
@@ -723,7 +733,9 @@ class Database:
                 self._queue_memory_capture(-user_id, int(cursor.lastrowid))
                 if role == "assistant":
                     self._assign_memory_reply(-user_id, int(cursor.lastrowid))
-            return int(cursor.lastrowid)
+            record_id = int(cursor.lastrowid)
+        self._notify_message(-user_id, record_id)
+        return record_id
 
     def recent_private_messages(self, user_id: int, limit: int) -> list[sqlite3.Row]:
         """只读取该用户与机器人的私聊，按时间顺序返回角色和文本。"""

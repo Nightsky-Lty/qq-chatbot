@@ -227,13 +227,13 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
     async def test_task_release_durable_consolidation_no_thoughts_or_old_retrieval(self):
         source = self.source("今天修复了银河网站")
         workspace = self.capture.open_workspace(7, {source})
-        workspace.messages.extend([{"role": "assistant", "reasoning_content": "不应入库的推理"},
-                                   {"role": "tool", "content": "检索出来的旧事"}])
+        self.assertFalse(hasattr(workspace, "messages"))
+        workspace.search_cache["query"] = [(9999, 1)]
         original = self.db.memory_source_rows(7, {source})[0]
         reply = self.source("我们刚刚讨论了处理方法", role="assistant", reply=original["message_id"])
         self.capture.close_workspace(workspace)
         self.assertTrue(workspace.closed)
-        self.assertEqual(workspace.messages, [])
+        self.assertEqual(workspace.search_cache, {})
         self.model.actions = [self.action(source, "QQ11今天修复了银河网站")]
         self.assertTrue(await self.capture.process_task_once())
         data = self.model.inputs[-1]
@@ -341,8 +341,7 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         service = BotService(cfg, self.db, llm)
         observed = []
         async def cancelled(prompt, registry, **kwargs):
-            observed.append(registry.working_memory)
-            registry.working_memory.messages.append({"reasoning_content": "must release"})
+            observed.append(registry.task_evidence)
             raise asyncio.CancelledError()
         service.agent.run = cancelled
         try:
@@ -350,7 +349,7 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await service._run_ai_reply(11, 11, "合成任务", AsyncMock(), private=True, private_source_id=source)
             self.assertTrue(observed[0].closed)
-            self.assertFalse(observed[0].messages)
+            self.assertFalse(observed[0].source_ids)
             self.assertEqual(self.db.connection.execute("SELECT status FROM memory_consolidation_jobs").fetchone()[0], "pending")
         finally:
             await service.close()

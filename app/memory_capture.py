@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -15,7 +16,7 @@ from app.database import Database
 from app.embeddings import sparse_vector
 from app.llm import DeepSeekClient
 from app.memory import MemoryService, contains_sensitive_memory
-from app.working_memory import WorkingMemory
+from app.task_evidence import TaskEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -135,16 +136,16 @@ class MemoryCapture:
                 logger.warning("Memory capture retry: scope=%s error=%s delay=%s",
                                "group" if job["namespace"] > 0 else "private", type(exc).__name__, delay)
 
-    def open_workspace(self, namespace: int, source_ids: set[int], context_ids: set[int] | None = None) -> WorkingMemory:
+    def open_workspace(self, namespace: int, source_ids: set[int], context_ids: set[int] | None = None) -> TaskEvidence:
         all_sources = set(source_ids) | (context_ids or set())
-        workspace = WorkingMemory(namespace, all_sources, new_source_ids=set(source_ids))
+        workspace = TaskEvidence(namespace, all_sources, new_source_ids=set(source_ids))
         if self.db.capture_enabled and source_ids:
             self.db.memories.enqueue(workspace.task_id, namespace, all_sources, source_ids)
             with self.db._lock, self.db.connection:
                 self.db.connection.execute("UPDATE memory_consolidation_jobs SET status='running' WHERE task_id=?", (workspace.task_id,))
         return workspace
 
-    def close_workspace(self, workspace: WorkingMemory):
+    def close_workspace(self, workspace: TaskEvidence):
         try:
             if self.db.capture_enabled and workspace.source_ids:
                 ns = workspace.namespace
@@ -158,6 +159,30 @@ class MemoryCapture:
                 self.db.memories.enqueue(workspace.task_id, ns, ids, workspace.new_source_ids | own_replies)
         finally:
             workspace.release()
+
+    async def archive_working(self, namespace: int, source_ids: set[int]) -> bool:
+        """短期片段归档真实原话；与旧增量整理互斥，已处理/已归属来源不重复提取。"""
+        if not self.db.capture_enabled or not source_ids:
+            return False
+        async with self.lock:
+            with self.db._lock:
+                assigned = {r[0] for r in self.db.connection.execute(
+                    f"SELECT source_id FROM memory_task_sources WHERE namespace=? AND source_id IN ({','.join('?' for _ in source_ids)})",
+                    (namespace, *sorted(source_ids)))}
+                state = self.db.connection.execute(
+                    "SELECT cursor_id FROM memory_capture_state WHERE namespace=?", (namespace,)).fetchone()
+            fresh = {i for i in source_ids if i > (state[0] if state else 0)} - assigned
+            if not fresh:
+                return False
+            ordered, new_ids = sorted(source_ids), sorted(fresh)
+            queued = False
+            for start in range(0, len(new_ids), self.settings.memory_capture_batch_size):
+                chunk = set(new_ids[start:start + self.settings.memory_capture_batch_size])
+                index = ordered.index(min(chunk))
+                # 批次分界保留少量前文，允许真实双方回应配对；旧前文不是新证据。
+                evidence = chunk | set(ordered[max(0, index - 4):index])
+                queued |= self.db.memories.enqueue("working-" + uuid.uuid4().hex, namespace, evidence, chunk)
+            return queued
 
     async def process_task_once(self) -> bool:
         with self.db._lock:

@@ -83,6 +83,7 @@ class ContextPacket:
 
     task: dict[str, Any] = field(default_factory=dict)
     timeline: list[dict[str, Any]] = field(default_factory=list)
+    working: dict[str, Any] = field(default_factory=dict)
     memories: list[dict[str, Any]] = field(default_factory=list)
     images: list[dict[str, Any]] = field(default_factory=list)
     sticker_catalog: dict[str, Any] = field(default_factory=dict)
@@ -138,6 +139,8 @@ class PromptBuilder:
         runtime["收尾能力"] = [name for name in ("finish", "wait_for_messages") if name in registry.bindings]
         runtime["合并发送与收尾"] = registry.batch_completion_enabled
         background: dict[str, Any] = {}
+        if context.working:
+            background["短期记忆"] = context.working
         if context.timeline:
             background["群聊时间线"] = context.timeline
         if history:

@@ -40,8 +40,6 @@ class ReactAgent:
                   context: ContextPacket | None = None, scene: PromptScene | None = None) -> AgentOutcome:
         messages = PromptBuilder.messages(prompt, registry, persona=system, scene=scene,
                                           context=context, history=history)
-        if registry.working_memory is not None:
-            registry.working_memory.messages = messages
         image_keys: set[str] = set()
         cached: dict[str, tuple[str, dict[str, Any]]] = {}
         steps = calls_used = 0

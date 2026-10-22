@@ -141,6 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         reminders.start()
         await app.state.bot.memory.start()
         app.state.bot.memory_capture.start()
+        app.state.bot.working_memory.start()
         app.state.bot.sticker_indexer.start()
         app.state.bot.image_cache.start()
         # yield 前是启动逻辑，yield 后是应用关闭时执行的清理逻辑。

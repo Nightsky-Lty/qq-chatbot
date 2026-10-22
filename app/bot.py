@@ -26,6 +26,7 @@ from app.messaging import MessageSession, SEND_MESSAGE_TOOL
 from app.poking import PokeService, PokeSession, SendPoke, SEND_POKE_TOOL
 from app.memory import MemoryService
 from app.memory_capture import MemoryCapture
+from app.working_memory import WorkingMemoryManager
 from app.memory_tools import register_memory_tools
 from app.group_context import addressing, build_group_history
 from app.prompting import ContextPacket, PromptBuilder, PromptScene
@@ -123,6 +124,10 @@ class BotService:
         self.memory = MemoryService(settings, database)
         self.memory.image_cache = self.image_cache
         self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
+        self.working_memory = WorkingMemoryManager(settings, database, self.memory_llm, self.memory_capture)
+        self.working_memory.media_lookup = lambda ns, ids: [self.image_cache.describe(r)
+            for r in self.image_cache.rows(ns, max(ids, default=0), set(ids)) if r["source_id"] in ids]
+        self.db.message_listener = self.working_memory.receive
         self.pokes = PokeService(settings)
         self.voices = VoiceService(settings)
         self._confirmed_senders: dict[SendMessage, SendMessage] = {}
@@ -195,6 +200,8 @@ class BotService:
         await self.sticker_collector.close()
         await self.image_cache.close()
         await self.sticker_indexer.close()
+        self.db.message_listener = None
+        await self.working_memory.close()
         await self.memory_capture.close()
         await self.memory.close()
         await self.sticker_llm.close()
@@ -454,8 +461,16 @@ class BotService:
             by_source = defaultdict(list)
             for row in cached_rows:
                 by_source[row["source_id"]].append(self.image_cache.describe(row))
-            _, history_entries = build_group_history(self.db, self.settings, group_id, batch,
-                                                           image_lookup=lambda source: by_source.get(source, []))
+            short_context = {}
+            if self.settings.working_memory_enabled:
+                short_context = self.working_memory.snapshot(
+                    group_id, before_id=min(e.storage_id for e in batch.entries), query=focus.text,
+                    roots=[e.reply_to for e in batch.entries if e.reply_to], bot_id=focus.self_id,
+                    image_lookup=lambda source: by_source.get(source, []))
+                history_entries = short_context["近期往返"]
+            else:
+                _, history_entries = build_group_history(self.db, self.settings, group_id, batch,
+                                                         image_lookup=lambda source: by_source.get(source, []))
             images: list[dict[str, str]] = []
             image_ids: dict[int, list[str]] = {}
             collection_jobs: dict[str, CollectionJob] = {}
@@ -553,7 +568,8 @@ class BotService:
             context = ContextPacket(
                 task={"唤醒消息号": [e.message_id for e in batch.entries if e.direct],
                       "当前话题": batch.topic, "当前焦点消息号": focus.message_id, "本批新消息": current},
-                timeline=history_entries, images=list(image_sources.values()),
+                timeline=[] if short_context else history_entries, working=short_context,
+                images=list(image_sources.values()),
                 runtime={"机器人身份": {"QQ": focus.self_id, "角色": "群内参与者，不是所有消息的收件人"},
                          "相关成员索引": list(member_index.values())},
             )
@@ -606,8 +622,10 @@ class BotService:
             await self._send_text(send_private, user_id, "未知私聊命令，请发送 /帮助；普通文字可以直接聊天。")
             return
         # 先读历史再写当前文本，不把当前问题重复加入上下文；按用户独立查询。
-        rows = self.db.recent_private_messages(user_id, self.settings.context_message_limit)
-        history = [{"role": row["role"], "content": row["content"]} for row in rows]
+        history = None
+        if not self.settings.working_memory_enabled:
+            rows = self.db.recent_private_messages(user_id, self.settings.context_message_limit)
+            history = [{"role": row["role"], "content": row["content"]} for row in rows]
         prompt = prompt or "[用户发送了一条图片消息]"
         stored_text = prompt + (f"\n[附带图片{len(view.images)}张，{'附件状态见图片索引' if self.image_cache.enabled else '原图未保存'}]" if view.images else "")
         private_source_id = self.db.log_private_message(user_id, "user", stored_text)
@@ -950,11 +968,17 @@ class BotService:
                     context_ids = {r[0] for r in self.db.connection.execute("SELECT id FROM private_messages WHERE user_id=? AND id<? ORDER BY id DESC LIMIT 4", (user_id, private_source_id))}
             context_ids -= self.db.memories.blocked_sources(namespace)
             workspace = self.memory_capture.open_workspace(namespace, new_source_ids, context_ids)
-            registry.working_memory = workspace
+            registry.task_evidence = workspace
             if image_session is None and self.settings.chat_image_enabled and self.image_cache.enabled:
                 image_session = ChatImageSession([], image_ids=[])
         try:
             context = context or ContextPacket(task={"用户请求": prompt})
+            if private and self.settings.working_memory_enabled:
+                boundary = private_source_id
+                if not boundary:
+                    with self.db._lock:
+                        boundary = self.db.connection.execute("SELECT coalesce(max(id),0)+1 FROM private_messages WHERE user_id=?", (user_id,)).fetchone()[0]
+                context.working = self.working_memory.snapshot(-user_id, before_id=boundary, query=prompt)
             if private and self.settings.memory_enabled:
                 private_memories = await self.memory.retrieve(-user_id, prompt, user_ids={user_id}, boundary=private_source_id or None)
                 injected_memories.extend(private_memories)
@@ -1059,8 +1083,21 @@ class BotService:
                         image_session.sources[image_id] = self.image_cache.describe(row)
                     if batch is not None and collection_jobs is not None:
                         collection_jobs[image_id] = CollectionJob(namespace, row["user_id"], bot_id, row["message_id"], ref, send_message)
+                def working_search(query, arguments):
+                    snapshot = self.working_memory.snapshot(namespace, before_id=max(workspace.source_ids, default=0) + 1,
+                        query=query, roots=[e.reply_to for e in batch.entries if e.reply_to] if batch else [], bot_id=bot_id)
+                    if arguments.get("include_sources"):
+                        ids = {i for note in snapshot["语境摘要"] for i in note["来源记录"]}
+                        originals = self.working_memory._valid(namespace, ids)
+                        snapshot["来源摘录"] = [self.working_memory._public(namespace, originals[i], bot_id)
+                                                for i in sorted(originals, reverse=True)[:3]]
+                    return snapshot
+                async def working_consolidate():
+                    return await self.working_memory.archive(namespace, max(workspace.source_ids, default=0) + 1)
                 register_memory_tools(registry, self.memory_capture, namespace, user_id, source_rows,
-                                      workspace=workspace, media_grant=grant_memory_image)
+                    workspace=workspace, media_grant=grant_memory_image,
+                    working_search=working_search if self.settings.working_memory_enabled else None,
+                    working_consolidate=working_consolidate)
                 for item in injected_memories:
                     if type(item.get("media_ref_id")) is int:
                         grant_memory_image(item["media_ref_id"])
