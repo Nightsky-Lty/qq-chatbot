@@ -123,6 +123,13 @@ class MemorySystemTests(unittest.IsolatedAsyncioTestCase):
         await self.capture.process_task_once()
         self.assertEqual(self.model.inputs[-1]["new_source_ids"], [new])
 
+    async def test_task_cannot_reextract_personal_fact_from_only_old_context(self):
+        old = self.source("我喜欢红茶", user=11)
+        new = self.source("今天聊别的", user=22)
+        self.model.actions = [self.action(old, "QQ11喜欢红茶", "preference", source_ids=[old, new])]
+        with self.assertRaises(ValueError):
+            await self.capture.extract(7, self.db.memory_source_rows(7, {old, new}), new_source_ids={new})
+
     async def test_time_filter_uses_event_time_and_not_record_time(self):
         source, row = await self.save("我昨天修复了金星网站报错")
         yesterday, end = time_range("昨天")

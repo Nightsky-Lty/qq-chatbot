@@ -280,8 +280,8 @@ class MemoryCapture:
                     raise ValueError("群梗归属无效")
             elif not personal_sources or (namespace < 0 and subject != -namespace):
                 raise ValueError("个人记忆缺少本人证据")
-            if cursor_id is not None and candidate.memory_type not in {"episode", "commitment"} and not any(
-                    r["id"] > cursor_id for r in personal_sources) and subject != 0:
+            if action["memory_type"] not in {"episode", "commitment"} and not any(
+                    r["id"] in fresh_ids for r in personal_sources) and subject != 0:
                 raise ValueError("人物事实需要本批新本人发言")
             shared_update = update_target is not None and update_target["user_id"] == 0 and subject == 0
             if requested_by is not None and subject != requested_by and not shared_update:
