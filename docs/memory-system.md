@@ -7,15 +7,15 @@
 - Abstract：`memory_records.layer='abstract'`与`memory_concepts`视图。profile/preference/relationship/explicit等子类型；group_meme保存条件、别名、含义、支持事件。明确解释或至少三个已提供事件支持可生效，其余为candidate，不自动注入。计数及模型自报置信度均不等于客观正确。
 - Perceptual：`image_cache_blobs/refs`仍是图片资源权威记录，文件在`/app/data/image_cache`按SHA-256去重。概要以`memory_records.layer='perceptual'`建立可检索引用，不把概要当发图人的发言/经历。只实现图片，未实现音频、视频或视觉embedding。
 
-`memory_records`是长期记忆唯一权威表，事件/抽象/感知按layer分层；`memory_events/memory_concepts/memory_percepts`是视图。`memory_type`仅是层内子类型（偏好、约定、群梗等），不是旧系统的独立入口。`memory_links`表达derived_from/revises，`memory_media_links`连接事件和图片。未部署Neo4j。
+`memory_records`是长期记忆唯一权威表，事件/抽象/感知按layer分层；`memory_events/memory_concepts/memory_percepts`是视图。`memory_type`是层内子类型（偏好、约定、群梗等）。`memory_links`表达derived_from/revises，`memory_media_links`连接事件和图片。未部署Neo4j。
 
 ## 初始化与已有数据
 
-旧记忆已在部署版本 `52c13a5` 完成转换。当前版本仅幂等创建新存储结构，不再包含旧库检测、拒绝启动、导入、转换、自动迁移备份或离线迁移脚本；不会自动读取或清理旧`memories`表。仅支持当前数据库，全新部署从空的`memory_records`开始。
+当前版本启动时幂等初始化存储结构，支持使用当前结构的数据库或全新数据库；全新部署从空的`memory_records`开始。其他结构的历史数据库需要在部署前单独处理。
 
-仍使用现有SQLite `bot.db`，以保留聊天原话、图片引用、整合游标/队列和记忆的关联事务。已转换的记忆、来源、版本、状态、遗忘阻断和既有备份不因清理迁移代码而变动。所有正常写入继续通过证据校验与`MemoryStore.apply`；缺少来源摘录时统一说明来源不足，不再依赖迁移标记判断。
+SQLite `bot.db`保存聊天原话、图片引用、整合游标/队列和记忆，支持关联事务。记忆记录包含来源、版本、状态和遗忘阻断信息。所有正常写入通过证据校验与`MemoryStore.apply`；缺少来源摘录时说明来源不足。
 
-已有升级前备份由部署者按保留策略管理，不自动删除，也不要直接用于当前版本；历史转换代码可在Git版本`52c13a5`中查阅。备份含完整敏感数据，不上传Git。运行中的数据库和图片目录仍应定期备份。
+备份由部署者按保留策略管理，恢复前需确认数据库结构与当前版本兼容。备份含完整敏感数据，不上传Git。运行中的数据库和图片目录应定期备份。
 
 事件明确引用的图片默认延长至90天，可由`IMAGE_MEMORY_RETENTION_DAYS`调整；普通图片仍默认7天。仍受全局500文件/256MiB配额约束，FIFO容量淘汰可早于保留期。原始消息自然到期后，只要有有效事件引用，保留图仍可访问；本人数据清除会失效对应引用，不因保留而复活。物理文件去重不授予跨会话权限。
 
@@ -40,7 +40,7 @@
 
 空间、请求者由程序绑定，不接受模型提供namespace/路径/SQL。个人记忆只有本人可修改；共享群概念仅已验证的群管理者/配置管理员可显式管理，管理权限不延伸到任何私聊。普通后台整理器不拥有delete/forget权限。
 
-thread只接管工作记忆的交流划分与原文读取。旧`memory_search`的working分支已移除，群原文回查由`read_thread_history`负责；六个长期记忆工具、摘要/来源展开、原话FTS兜底、整合队列、版本与权限校验均保留。`memory_consolidate`是短期到长期的桥接，不随工作记忆查询退役；`WorkingMemoryManager`仍承担私聊/回退上下文、原文预算和归档，不属于废弃工具。
+thread负责工作记忆的交流划分与原文读取，群原文回查由`read_thread_history`提供。长期记忆提供上述六个工具、摘要/来源展开、原话FTS兜底、整合队列、版本与权限校验。`memory_consolidate`负责短期到长期的整合；`WorkingMemoryManager`承担私聊/回退上下文、原文预算和归档。
 
 删除/遗忘会阻断关联源消息进入后续原话回查和聊天上下文，可能保守地排除同一条消息中的其他信息。阻断依靠来源ID、正文摘要和带条件的语义键，并不能保证识别任意改写的全新发言；第一版不支持自动恢复已遗忘事实。原始QQ聊天与历史备份不因删除一条记忆自动擦除，SQLite空闲页/既已发给模型的数据也不能承诺安全擦除。完整个人资料清除仍使用现有数据清除功能，并按部署者备份保留策略处理历史备份。
 
@@ -74,7 +74,7 @@ SELECT id,version FROM memory_records;
 
 ## 验证
 
-`python3 -m unittest discover -s tests -p 'test_memory_system.py' -q`覆盖跨空间/跨人物、超过300条旧事件、中文词条、日期、概念候选、条件共存、版本/权限、原话兜底与遗忘、任务交接/重启、Qdrant协议和旧索引删除、感知检索与保留。`test_memory_schema.py`另覆盖初始化和重启保持；旧工作记忆接口的退役断言不属于当前长期工具约定。
+`python3 -m unittest discover -s tests -p 'test_memory_system.py' -q`覆盖跨空间/跨人物、超过300条旧事件、中文词条、日期、概念候选、条件共存、版本/权限、原话兜底与遗忘、任务交接/重启、Qdrant协议和旧索引删除、感知检索与保留。`test_memory_schema.py`另覆盖初始化和重启保持。
 
 真实BGE/Qdrant和记忆LLM的额外验证使用项目外的一次性脚本、临时数据库和独立临时collection，输入仅合成对话，不读真实聊天、不发送QQ。验证后清理脚本和临时资源；真实API验证会消耗调用额度。
 

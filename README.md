@@ -56,7 +56,7 @@
 
 ### 减少收尾轮次与上下文重复
 
-默认开启 `AGENT_BATCH_COMPLETION_ENABLED=true`。最后一个发送工具（文字、表情、语音或戳一戳）可以携带 `next_action="finish"`，群聊继续跟进则携带 `next_action="wait"`，不再提供 `topic`。程序先执行原有校验、等待真实发送成功，再调用绑定的结束/等待处理器，不必额外请求模型只做收尾。例如 `send_message({"text":"九点见","next_action":"wait"})`。仍需观察工具结果、补充发送或继续操作时省略该字段，或使用 `continue`；有依赖的搜索/读取/提醒操作依旧先取得真实回执。原有结束工具保留。关掉配置可恢复逐步收尾。
+默认开启 `AGENT_BATCH_COMPLETION_ENABLED=true`。最后一个发送工具（文字、表情、语音或戳一戳）可以携带 `next_action="finish"`，群聊继续跟进则携带 `next_action="wait"`。程序先执行原有校验、等待真实发送成功，再调用绑定的结束/等待处理器，不必额外请求模型只做收尾。例如 `send_message({"text":"九点见","next_action":"wait"})`。仍需观察工具结果、补充发送或继续操作时省略该字段，或使用 `continue`；有依赖的搜索/读取/提醒操作依旧先取得真实回执。原有结束工具保留。关掉配置可恢复逐步收尾。
 
 无工具调用的最终文本通过原发送器成功提交后，由程序直接收尾：群聊默认保持当前交流焦点等待新消息，私聊结束；需要明确告别时模型可通过发送工具指定finish。所有发送预算、目标、冷却及失败不重发约束不变。一次工具批次中收尾成功后，后面的动作不再执行。
 
@@ -64,7 +64,7 @@
 
 `Agent finished` 日志记录实际模型轮次及API返回的 `prompt_tokens`、`completion_tokens`、`reasoning_tokens`、`cache_hit_tokens` 和 `usage_requests`。后者表示提供完整输入/输出计数的请求数；服务不报告的计数不能视为真实零消耗。推理token通常已包含在completion内，不重复相加；缓存命中影响计费，不能直接把总输入token降幅当成账单降幅。日志不包含正文或推理内容。
 
-此前合成回放和上下文大小对比见[效率验证记录](docs/agent-efficiency-results.md)。一次性测量脚本不再保留在项目中。
+此前合成回放和上下文大小对比见[效率验证记录](docs/agent-efficiency-results.md)。
 
 ## 群聊QQ AI语音
 
@@ -90,7 +90,7 @@
 
 API请求只发往固定DeepSeek官方HTTPS地址，不跟随重定向、不继承环境代理，Key不随网页URL发送。网页URL仍限制为标准端口、无凭证的HTTP/HTTPS，拒绝字面内网/本机/特殊地址；Fetch只接受本轮搜索结果或当前用户消息中的链接，不从历史/记忆/网页正文扩大范围。目标网站的DNS、跳转与访问安全由DeepSeek远端抓取服务处理，本机不再直接访问或逐跳解析目标网页。网页资料仍是不可信数据，不执行其中指令；查询词和待抓取URL会发给DeepSeek，提示模型不外发完整聊天、QQ号、私密记忆或凭证，但不是自动脱敏保证。检索结果不单独落库，最终回复仍按原聊天历史规则保存；日志只记数量、状态，不记Key、查询、URL或正文，不回显API原始错误体。鉴权失败、余额不足、限流或网页受限时如实返回，不切回Bing或假装成功。
 
-Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结果另产生输入token费用；直接调用不套用其他产品临时免费政策，费用以[官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)为准。配置项：`WEB_SEARCH_ENABLED`、`WEB_SEARCH_MAX_RESULTS`、`WEB_SEARCH_MAX_CALLS`、`WEB_SEARCH_NEED_CONTENT`、`WEB_SEARCH_CONTENT_MAX_CHARS`、`WEB_FETCH_MAX_CALLS`、`WEB_TIMEOUT_SECONDS`、`WEB_MAX_RESPONSE_BYTES`、`WEB_FETCH_MAX_CHARS`，重建容器后生效。旧 `WEB_SEARCH_AUTO_FETCH_PAGES` 已移除，不再自动读两页。
+Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结果另产生输入token费用；直接调用不套用其他产品临时免费政策，费用以[官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)为准。配置项：`WEB_SEARCH_ENABLED`、`WEB_SEARCH_MAX_RESULTS`、`WEB_SEARCH_MAX_CALLS`、`WEB_SEARCH_NEED_CONTENT`、`WEB_SEARCH_CONTENT_MAX_CHARS`、`WEB_FETCH_MAX_CALLS`、`WEB_TIMEOUT_SECONDS`、`WEB_MAX_RESPONSE_BYTES`、`WEB_FETCH_MAX_CHARS`，重建容器后生效。
 
 ## 聊天人设
 
@@ -112,13 +112,13 @@ Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结
 
 群Agent可用`read_thread_history({})`按需向前翻阅当前thread原文，默认10条、最多20条；继续读取时传回`next_before_source_id`作为`before_source_id`。默认每轮最多3次，每页12000字符、合计24000字符，返回完整消息，受预算限制可能少于请求条数。仅查询已划入当前thread、当前批次之前且仍可访问的记录，不额外调用解析模型、不跨thread，也不扩大旧消息的操作授权。详见[主动历史回查](docs/dialogue-threads.md#agent主动向前翻阅原文)。
 
-工作记忆回查已统一到thread工具，旧`memory_search(layer="working")`分支及接线已移除。`memory_search`仍保留`all/event/abstract/perceptual`、人物/时间过滤、来源摘录和原话检索兜底；新增、更新、删除、遗忘、短期转长期整合接口全部保留。私聊自动原文上下文和长期记忆存储/提取流程不受此次入口清理影响。
+当前thread原文通过`read_thread_history`回查。`memory_search`检索长期记忆，支持`all/event/abstract/perceptual`、人物/时间过滤、来源摘录和原话检索兜底；长期记忆还提供新增、更新、删除、遗忘和短期转长期整合接口。私聊上下文自动注入近期原文。
 
-四层记忆：Working维护跨回复的短期对话；任务级证据和查询缓存由`TaskEvidence`保存并在单次Agent结束释放，内部推理/完整工具链仅在本轮执行状态，不进入对话记忆。事件、抽象概念以SQLite的`memory_records`为唯一权威记录，感知记忆目前仅支持图片缓存/概要，视图分层、关联表保存事件—概念—图片关系，不部署Neo4j。旧记忆已完成转换；旧版自由写入接口、迁移代码/脚本及旧库检查均已移除，仅初始化当前结构。已有记忆与备份不删除。仍使用同一个`bot.db`以保留原话/图片/队列事务，不另建空库。正群号/负私聊QQ隔离，工具不接受自选空间。详情见[四层记忆说明](docs/memory-system.md)。
+四层记忆：Working维护跨回复的短期对话；任务级证据和查询缓存由`TaskEvidence`保存并在单次Agent结束释放，内部推理/完整工具链仅在本轮执行状态，不进入对话记忆。事件、抽象概念以SQLite的`memory_records`为唯一权威记录，感知记忆目前仅支持图片缓存/概要，视图分层、关联表保存事件—概念—图片关系，不部署Neo4j。启动时幂等初始化当前存储结构；聊天原话、图片、队列和记忆使用同一个`bot.db`，以支持关联事务。正群号/负私聊QQ隔离，工具不接受自选空间。详情见[四层记忆说明](docs/memory-system.md)。
 
 任务结束后独立后台LLM将短期新证据整合为长期事件/概念，不保存推理、工具轨迹或把旧检索当新证据。未唤醒Agent的普通文字仍默认30秒/40条分批整理，任务来源不重复提取；失败默认5次后保留failed任务，避免无限堵塞。模型只提候选，无删除/遗忘权；程序核对来源、本人身份、敏感信息、概念依据和版本。未确认群梗为candidate，不注入；同键不同条件可共存，只有明确纠正才修订。约定不代表工具已执行。
 
-聊天侧提供`memory_add/search/update/delete/forget/consolidate`六种操作；整合指短期转长期，排队或候选不等于成功保存。更新、删除、遗忘要求真实编号和版本，个人记录仅本人可改，共享概念仅已验证群管理者可显式管理。精确词条＋中文FTS＋Qdrant语义召回，应用层RRF融合，SQLite再核验权限/状态/版本；不再先截最近300条，也不让无关档案填满上下文。默认各路20候选、最终8条/5000字符，必要时展开来源或回查允许的原话。Qdrant仅存可重建索引，故障退回本地流式向量/FTS，BGE故障退回哈希。完整结构、操作和限制见[四层记忆说明](docs/memory-system.md)。
+聊天侧提供`memory_add/search/update/delete/forget/consolidate`六种操作；整合指短期转长期，排队或候选不等于成功保存。更新、删除、遗忘要求真实编号和版本，个人记录仅本人可改，共享概念仅已验证群管理者可显式管理。精确词条＋中文FTS＋Qdrant语义召回，应用层RRF融合，SQLite再核验权限/状态/版本，按相关性选择候选。默认各路20候选、最终8条/5000字符，必要时展开来源或回查允许的原话。Qdrant仅存可重建索引，故障退回本地流式向量/FTS，BGE故障退回哈希。完整结构、操作和限制见[四层记忆说明](docs/memory-system.md)。
 
 ## 聊天图片缓存、概要与按需看图
 
