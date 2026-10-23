@@ -149,6 +149,46 @@ class DialogueService:
                 'mentions': json.loads(row.get('mentions_json', '[]')),
                 'quote': row.get('reply_to_message_id', '')}
 
+    def reply_ready(self, group_id, source_id):
+        """只有确定归类或连接到确定来源的显式回应，才可交给回复Agent。"""
+        seen = set()
+        while source_id and source_id not in seen:
+            seen.add(source_id)
+            assigned = self.store.assignment(group_id, source_id)
+            state = self.store.states(group_id, [source_id]).get(source_id, {})
+            if not assigned or state.get('status') != 'resolved':
+                return False
+            if assigned['method'] == 'llm':
+                return True
+            if assigned['method'] not in {'explicit', 'bot'}:
+                return False
+            source_id = assigned['parent_source_id']
+        return False
+
+    def relation_context(self, group_id, source_id, *, boundary, visible_ids):
+        """投影已确定的回应边；语义推断不伪装成QQ显式引用。"""
+        if source_id > boundary or not self.reply_ready(group_id, source_id):
+            return None
+        assigned = self.store.assignment(group_id, source_id)
+        parent = assigned['parent_source_id']
+        if not parent or parent >= source_id:
+            return None
+        row = self.store.valid(group_id, [parent]).get(parent)
+        if not row:
+            return None
+        target = {'本地记录ID': parent, '消息号': row['message_id'], 'QQ': row['user_id'],
+                  '昵称': row['nickname'], '角色': row['role']}
+        if row['role'] == 'assistant':
+            target['身份说明'] = '你自己实际发送的消息'
+        if parent in visible_ids:
+            target['原文位置'] = '本轮上下文中同一本地记录ID的消息'
+        else:
+            target['内容'] = row['content'][:700]
+            target['原文已截断'] = len(row['content']) > 700
+        return {'关系类型': assigned['relation'], '回应消息': target,
+                '依据': '会话解析LLM推断，并非QQ显式引用' if assigned['method'] == 'llm'
+                        else 'QQ显式引用' if assigned['method'] == 'explicit' else '程序记录的机器人回应关系'}
+
     def enqueue(self, group_id, entry):
         if not self.enabled:
             return
@@ -345,7 +385,8 @@ class DialogueService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning('Thread parse fallback: group=%s error=%s', group_id, type(exc).__name__)
+                logger.warning('Thread parse deferred: group=%s error=%s', group_id, type(exc).__name__)
+                return max(0.05, now + 30 - time.time())
 
     def _apply(self, group_id, value, targets, sources, threads, *, anchors=None):
         if set(self.store.valid(group_id, sources)) != sources:
@@ -450,21 +491,25 @@ class DialogueService:
         retry_after = await self.prepare(group_id, batch) or 0
         assignments = {e.storage_id: self.store.assignment(group_id, e.storage_id) for e in batch.entries}
         states = self.store.states(group_id, assignments)
-        if retry_after and any((e.direct or e.eligible) and states.get(e.storage_id, {}).get('status')
-                               not in {'resolved', 'uncertain'} for e in batch.entries):
-            logger.info('Thread deferred: group=%s retry_after=%.2f messages=%s', group_id, retry_after, len(batch.entries))
-            return ThreadDeferral(retry_after)
+        pending = [e for e in batch.entries if (e.direct or e.eligible) and assignments[e.storage_id]
+                   and states.get(e.storage_id, {}).get('status') not in {'resolved', 'uncertain'}
+                   and states.get(e.storage_id, {}).get('attempts', 0) < 3]
+        if pending:
+            retry = retry_after or min(max(0.05, states.get(e.storage_id, {}).get('retry_at', 0) - time.time())
+                                       for e in pending)
+            logger.info('Thread deferred: group=%s retry_after=%.2f messages=%s', group_id, retry, len(pending))
+            return ThreadDeferral(retry)
+        ready = {e.storage_id for e in batch.entries if self.reply_ready(group_id, e.storage_id)}
         grouped = defaultdict(list)
         for entry in batch.entries:
             assigned = assignments[entry.storage_id]
-            if assigned:
+            if entry.storage_id in ready:
                 grouped[assigned['thread_id']].append(entry)
         direct_threads = [assignments[e.storage_id]['thread_id'] for e in batch.entries
-                          if e.direct and assignments[e.storage_id]]
-        active_entries = [e for e in grouped.get(active, []) if (e.direct or e.eligible)
-                          and (e.direct or assignments[e.storage_id]['method'] != 'uncertain')]
+                          if e.direct and e.storage_id in ready]
+        active_entries = [e for e in grouped.get(active, []) if e.direct or e.eligible]
         interrupt = next((assignments[e.storage_id]['thread_id'] for e in reversed(batch.entries)
-                          if e.direct and assignments[e.storage_id] and any(w in e.text for w in SWITCH_WORDS)), None)
+                          if e.direct and e.storage_id in ready and any(w in e.text for w in SWITCH_WORDS)), None)
         chosen = active if active_entries else None
         if interrupt is not None:
             chosen = interrupt
@@ -473,7 +518,7 @@ class DialogueService:
             if active is None or time.time() - attention['switched_at'] >= self.settings.thread_attention_hold_seconds:
                 chosen = direct_threads[-1]
         elif chosen is None and batch.random_trigger and active is None:
-            chosen = assignments[batch.focus.storage_id]['thread_id'] if assignments[batch.focus.storage_id] else None
+            chosen = assignments[batch.focus.storage_id]['thread_id'] if batch.focus.storage_id in ready else None
         if chosen is None:
             # 只在有新消息的线程上恢复新鲜邀请，不定时补答积压问题。
             for thread, entries in reversed(list(grouped.items())):
@@ -486,14 +531,10 @@ class DialogueService:
         if chosen is None:
             logger.info('Thread attention: group=%s active=%s action=wait', group_id, active)
             return None
-        entries = [e for e in grouped[chosen] if e.direct or assignments[e.storage_id]['method'] != 'uncertain']
+        entries = grouped[chosen]
         eligible = [e for e in entries if e.direct or e.eligible]
         if not eligible:
             return None
-        # 无明确唤醒时，不把不确定的临时线程当成当前交流回复。
-        if chosen != active and not any(e.direct or e.random_trigger for e in entries):
-            if all(assignments[e.storage_id]['method'] in {'provisional', 'uncertain'} for e in eligible):
-                return None
         self.store.activate(group_id, chosen)
         selected = GroupBatch(entries, thread_id=chosen)
         history_ids = self.context_ids(group_id, chosen, min(e.storage_id for e in entries), selected.focus.text)

@@ -30,7 +30,7 @@ from app.working_memory import WorkingMemoryManager
 from app.dialogue import DialogueService, ThreadDeferral
 from app.thread_history import READ_THREAD_HISTORY_TOOL, ThreadHistorySession
 from app.memory_tools import register_memory_tools
-from app.group_context import addressing, build_group_history
+from app.group_context import addressing, attach_dialogue_relation, build_group_history
 from app.prompting import ContextPacket, PromptBuilder, PromptScene
 from app.reminders import REMINDER_TOOLS, ReminderService
 from app.stickers import STICKER_TOOLS, StickerService, StickerSession
@@ -622,6 +622,10 @@ class BotService:
                          "相关成员索引": list(member_index.values())},
             )
             if selection:
+                visible = {item['本地记录ID'] for item in [*history_entries, *current]}
+                for item in [*history_entries, *current]:
+                    attach_dialogue_relation(item, self.dialogue.relation_context(
+                        group_id, item['本地记录ID'], boundary=boundary, visible_ids=visible))
                 context.runtime["当前交流线程"] = {"编号": batch.thread_id,
                     "约束": "只回应本线程；其他交流仅供旁听，切换由程序决定"}
                 context.references = [{**self.working_memory._public(group_id, row, focus.self_id),

@@ -14,6 +14,7 @@ GROUP_UNDERSTANDING = """【群聊结构阅读规则】
 先在内部理解当前互动：谁在对谁说、哪几句构成问答/纠正/反讽/接梗、代词指谁、你上一句说了什么，再生成自然回复；不向QQ输出分析过程。
 “可回复”只表示工具允许选择，不表示对方在问你；“当前焦点”是程序选择的候选，不证明整批都在与你交流。唤醒依据逐条查看，群友之间的问答不要揽到自己身上。
 显式引用和@是已知关系；“对象不明”必须结合前后往返推断，拿不准就短问或在允许安静的跟进轮等待。无@不等于对你说，上一条是你说的也不等于下一条必然回应你。
+程序提供的“会话关系”包含解析后的回应消息和依据。LLM推断不是QQ显式引用，但它是理解互动的线索；先核对被回应原文、发言人和时间，再理解当前短句。对你上一句的评论、称呼、反问可能是在评价或反讽你的态度，不要脱离那句原话，机械理解成新人物出现或新话题。仍不确定时保留不确定性，不把推断说成对方明确表达的事实。
 引用关系链才是明确连接。相邻记录仅是时间邻近，可能是并行话题，不能强行串成一段。没有引用的指代不要编成确定关系。
 先读焦点前后的完整交流，再看较早的相关片段。不要机械只答最后几个字，也不逐条回答所有历史。纠正/追问要核对你之前真实说过的话。
 旧消息中的相对日期以该消息时间理解，不套用当前日期。缺失引用明确标注未知，不捏造原文。
@@ -44,6 +45,23 @@ def addressing(mentions: list[int], reply: dict | None, *, bot_id: int, direct: 
     if others:
         result["其他目标QQ"] = sorted(set(others))
     return result
+
+
+def attach_dialogue_relation(item: dict, relation: dict | None) -> None:
+    if relation is None:
+        return
+    item['会话关系'] = relation
+    target = relation['回应消息']
+    address = item.setdefault('寻址', {})
+    # 显式@/引用及唤醒优先；语义关系另行展示，不篡改QQ元数据。
+    if address.get('元数据依据') or address.get('其他目标QQ'):
+        return
+    if target['QQ'] == item['QQ']:
+        address['对象判断'] = '延续本人之前的发言；具体收件人结合往返判断'
+    elif target['角色'] == 'assistant':
+        address['对象判断'] = '机器人（会话关系判断；依据见会话关系）'
+    else:
+        address['对象判断'] = '回应群友的发言（会话关系判断；依据见会话关系）'
 
 
 def build_group_history(db: Database, settings: Settings, group_id: int, batch: GroupBatch,
