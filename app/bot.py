@@ -27,7 +27,7 @@ from app.poking import PokeService, PokeSession, SendPoke, SEND_POKE_TOOL
 from app.memory import MemoryService
 from app.memory_capture import MemoryCapture
 from app.working_memory import WorkingMemoryManager
-from app.dialogue import DialogueService
+from app.dialogue import DialogueService, ThreadDeferral
 from app.thread_history import READ_THREAD_HISTORY_TOOL, ThreadHistorySession
 from app.memory_tools import register_memory_tools
 from app.group_context import addressing, build_group_history
@@ -470,6 +470,8 @@ class BotService:
                 if state is None or not state.active(time.monotonic()):
                     self.dialogue.release(group_id)
                 selection = await self.dialogue.select(group_id, batch)
+                if isinstance(selection, ThreadDeferral):
+                    return AgentOutcome(0, 0, 0, wait_for_messages=True, retry_after=selection.retry_after)
                 if selection is None:
                     # 旁听/待切换不调用回复模型，也不把沉默当成退出当前交流。
                     return AgentOutcome(0, 0, 0, wait_for_messages=True)
@@ -1054,6 +1056,12 @@ class BotService:
             conversation = ("private", user_id) if private else ("group", context_id)
             sticker_session = None
             sticker_context = {}
+            def record_thread_reply(source_id: int, reply_to: str) -> None:
+                if self.dialogue.enabled and batch is not None and batch.thread_id is not None:
+                    # 戳一戳没有QQ消息号，仍通过本地来源绑定真实回复，不能丢失往返。
+                    parent = next((entry for entry in batch.entries if reply_to and entry.message_id == reply_to), batch.focus)
+                    self.dialogue.store.assign(context_id, source_id, batch.thread_id,
+                                               parent=parent.storage_id, method='bot')
             messages = MessageSession(
                 registry, self.db, send_message, context_id, private=private,
                 automatic=automatic, preserve_layout=preserve_layout,
@@ -1063,6 +1071,7 @@ class BotService:
                 bot_id=bot_id, mention_targets=set(allowed_mentions),
                 max_chars=self.settings.group_reply_max_chars,
                 max_messages=(2 if batch.direct else 1) if batch else None,
+                on_group_reply=record_thread_reply,
             )
             async def send_text(arguments: dict[str, Any]) -> dict[str, Any]:
                 if observe_only:
@@ -1206,9 +1215,8 @@ class BotService:
                         registry.outputs_sent += 1
                         messages.last_reply = reply_to
                         if not private:
-                            self.db.log_message(context_id, messages.bot_id, "机器人",
-                                                f"[表情包：{sticker_session.selected_id}]", role="assistant",
-                                                message_id=normalize_message_id(sent_id), reply_to_message_id=reply_to)
+                            messages.log_group_reply(f"[表情包：{sticker_session.selected_id}]",
+                                                     message_id=normalize_message_id(sent_id), reply_to=reply_to)
                     async with self._group_reply_locks[context_id]:
                         submitted = await self.stickers.send_selected(sticker_session, context_id, confirmed_sender)
                     if not submitted:

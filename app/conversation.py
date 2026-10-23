@@ -222,6 +222,13 @@ class GroupConversations:
                         state.idle_until = now + self.settings.chat_active_idle_seconds
                 else:
                     state.stop_followup()
+                if outcome is not None and not outcome.error and outcome.retry_after > 0 and state.active(now):
+                    # 解析限流只推迟当前新消息，不丢弃，也不轮询回复模型。
+                    pending_ids = {entry.storage_id for entry in state.pending}
+                    deferred = [entry for entry in fresh if entry.storage_id not in pending_ids]
+                    room = max(0, self.settings.chat_batch_max_messages - len(state.pending))
+                    state.pending[:0] = deferred[-room:] if room else []
+                    state.next_run_at = max(state.next_run_at, now + outcome.retry_after)
                 logger.info("Group conversation state: group=%s active=%s", group_id, state.active(now))
         except asyncio.CancelledError:
             raise

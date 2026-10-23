@@ -89,8 +89,7 @@ class PokeSession:
                 if messages.private:
                     messages.db.log_private_message(messages.target, "assistant", content)
                 else:
-                    messages.db.log_message(messages.target, messages.bot_id, "机器人", content,
-                                            role="assistant", reply_to_message_id=reply_to)
+                    messages.log_group_reply(content, reply_to=reply_to)
             except Exception:
                 return {"ok": False, "error": "戳一戳发送失败或未确认，本轮不重试；不能声称已经戳到。"}
             registry.delivery_uncertain = False

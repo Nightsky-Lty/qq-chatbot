@@ -18,6 +18,7 @@ PARSER_INSTRUCTIONS = """你是多人群聊的会话关系解析器，不是回�
 判断每条待解析消息在延续哪段具体交流、回应哪条消息。语义相似不等于同一交流，同一个人也能参与多段交流。
 引用是已知连接，但可以引用旧消息开启新交流；@只表示交流对象，不能据此合并所有找机器人的问题。
 结合参与者、真实往返、待回答问题、时间、纠正和补充判断。不要因机器人当前关注某thread就把新消息都划进去。
+current_sources是本批新消息，优先判断这些消息；省略主语的追问、对机器人上一句的回答或纠正，可以延续已有交流，不需要再次@。动作通知的author是动作发起者，也可参与后续交流。
 只能输出JSON：{"assignments":[{"source_id":整数,"thread":整数或"new:来源ID"或null,"parent":整数或null,"relation":"answer|question|correction|supplement|continuation|new","certain":布尔值}]}。
 source_id只能来自待解析消息。已有thread只能来自候选会话；新交流用new:ID，其中ID必须是这段交流最早的一条待解析消息ID，且该锚点也必须在输出中归入同一个new:ID。
 parent只能指向已提供、比本消息更早的来源ID，不能引用未来消息。可以只输出有把握的部分；模糊短句不强行归属，thread=null且certain=false。
@@ -31,6 +32,11 @@ class ThreadSelection:
     history_ids: set[int]
     references: list[dict]
     original_boundary: int
+
+
+@dataclass(slots=True)
+class ThreadDeferral:
+    retry_after: float
 
 
 class DialogueService:
@@ -132,11 +138,10 @@ class DialogueService:
         calls = self._calls[group_id]
         while calls and calls[0] < now - 60:
             calls.popleft()
-        if (attention['parsed_boundary'] >= boundary
-                or now - attention['last_parse_at'] < self.settings.thread_parse_min_interval_seconds
-                or len(calls) >= self.settings.thread_parse_calls_per_minute):
+        if attention['parsed_boundary'] >= boundary:
             return
-        candidates = self._candidate_rows(group_id, batch, boundary)
+        # 本批尚未解析的临时thread不能作为自己的历史候选。
+        candidates = self._candidate_rows(group_id, batch, min(e.storage_id for e in batch.entries) - 1)
         # 优先本批，再补有限的近期未定消息；不扫描/补解析全部历史积压。
         recent = self.store.recent(group_id, min(e.storage_id for e in batch.entries) - 1, 12)
         incoming = self.store.valid(group_id, [e.storage_id for e in batch.entries])
@@ -158,6 +163,10 @@ class DialogueService:
             return
         if all((self.store.assignment(group_id, i) or {}).get('method') in {'explicit', 'llm', 'bot'} for i in incoming):
             return
+        retry_after = max(0, attention['last_parse_at'] + self.settings.thread_parse_min_interval_seconds - now,
+                          calls[0] + 60 - now if len(calls) >= self.settings.thread_parse_calls_per_minute else 0)
+        if retry_after:
+            return retry_after
         target_ids = {r['id'] for r in targets}
         # 原文可以在一个位置出现一次，其他地方只连接来源ID。
         source_rows = {r['id']: r for _, rows in candidates for r in rows}
@@ -165,7 +174,8 @@ class DialogueService:
         if len(source_rows) == 1:
             return
         data = {'active_thread': attention['active_thread_id'], 'bot_id': batch.focus.self_id,
-                'wake_sources': [e.storage_id for e in batch.entries if e.direct], 'targets': sorted(target_ids),
+                'wake_sources': [e.storage_id for e in batch.entries if e.direct],
+                'current_sources': sorted(set(incoming) & target_ids), 'targets': sorted(target_ids),
                 'threads': [{'thread': t, 'sources': [r['id'] for r in rows],
                              'waiting_source': (self.store.state(group_id, t) or {}).get('waiting_source_id')}
                             for t, rows in candidates],
@@ -263,7 +273,7 @@ class DialogueService:
                                       method='explicit', invited=assigned['invited'])
         self.store.prune(group_id)
 
-    async def select(self, group_id: int, batch: GroupBatch) -> ThreadSelection | None:
+    async def select(self, group_id: int, batch: GroupBatch) -> ThreadSelection | ThreadDeferral | None:
         """在群串行锁内执行；只返回一个thread，不产生历史问题的补答队列。"""
         boundary = max(e.storage_id for e in batch.entries)
         self.store.prune(group_id)
@@ -282,11 +292,10 @@ class DialogueService:
                 active_rows and time.time() - active_rows[-1]['created_at'] > self.settings.thread_dormant_seconds):
             active = None
             self.store.activate(group_id, None)
-        participants = {r['user_id'] for r in active_rows if r['role'] == 'user'}
+        participants = {r['user_id'] for r in active_rows if r['role'] in {'user', 'notice'}}
         # 只有明确唤醒，或当前交流参与者的可回复新话，才值得语义消歧。
         relevant = batch.wakes_followup or any(e.eligible and e.user_id in participants for e in batch.entries)
-        if relevant:
-            await self._parse(group_id, batch, boundary)
+        retry_after = (await self._parse(group_id, batch, boundary) or 0) if relevant else 0
         assignments = {e.storage_id: self.store.assignment(group_id, e.storage_id) for e in batch.entries}
         grouped = defaultdict(list)
         for entry in batch.entries:
@@ -318,6 +327,12 @@ class DialogueService:
                     chosen = thread
                     break
         if chosen is None:
+            if retry_after and active is not None and any(
+                    e.eligible and e.user_id in participants and assignments[e.storage_id]
+                    and assignments[e.storage_id]['method'] in {'provisional', 'rule', 'uncertain'}
+                    for e in batch.entries):
+                logger.info('Thread deferred: group=%s retry_after=%.2f messages=%s', group_id, retry_after, len(batch.entries))
+                return ThreadDeferral(retry_after)
             logger.info('Thread attention: group=%s active=%s action=wait', group_id, active)
             return None
         entries = [e for e in grouped[chosen] if e.direct or assignments[e.storage_id]['method'] != 'uncertain']

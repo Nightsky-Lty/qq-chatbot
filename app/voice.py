@@ -201,9 +201,8 @@ class VoiceSession:
                 messages.count += 1
                 messages.spoken_texts.add(text)
                 messages.delivered_texts.add(text)
-                messages.db.log_message(messages.target, messages.bot_id, "机器人",
-                                        f"[AI语音，音色：{voices[voice_id]['name']}] {text}", role="assistant",
-                                        message_id=message_id, reply_to_message_id=reply_to)
+                messages.log_group_reply(f"[AI语音，音色：{voices[voice_id]['name']}] {text}",
+                                         message_id=message_id, reply_to=reply_to)
             except Exception as exc:
                 logger.warning("AI voice send unconfirmed: error=%s", type(exc).__name__)
                 return {"ok": False, "error": "语音合成/发送失败或未确认，本轮不重试、不补发文字，不能声称已发送；若持续失败请检查QQ/NapCat支持情况。"}
