@@ -18,13 +18,13 @@ PARSER_INSTRUCTIONS = """你是多人群聊的会话关系解析器，不是回�
 判断每条待解析消息在延续哪段具体交流、回应哪条消息。语义相似不等于同一交流，同一个人也能参与多段交流。
 引用是已知连接，但可以引用旧消息开启新交流；@只表示交流对象，不能据此合并所有找机器人的问题。
 结合参与者、真实往返、待回答问题、时间、纠正和补充判断。不要因机器人当前关注某thread就把新消息都划进去。
-current_sources是本批新消息，优先判断这些消息；省略主语的追问、对机器人上一句的回答或纠正，可以延续已有交流，不需要再次@。动作通知的author是动作发起者，也可参与后续交流。
+current_sources是本批待处理消息，优先判断这些消息；省略主语的追问、对机器人上一句的回答或纠正，可以延续已有交流，不需要再次@。动作通知的author是动作发起者，也可参与后续交流。
 只能输出JSON：{"assignments":[{"source_id":整数,"thread":整数或"new:来源ID"或null,"parent":整数或null,"relation":"answer|question|correction|supplement|continuation|new","certain":布尔值}]}。
-source_id只能来自待解析消息。已有thread只能来自候选会话；新交流用new:ID，其中ID必须是这段交流最早的一条待解析消息ID，且该锚点也必须在输出中归入同一个new:ID。
-targets是唯一允许输出的source_id白名单。messages中其他消息是只读证据，禁止把它们加到assignments，不能修改它们的归属或parent。
-threads中的已有编号必须保持稳定。历史模式若发现更早的消息属于稍后已知锚点的同一交流，应把早期目标放入已有thread编号，不能创建新编号再把只读锚点搬过去。
-例如threads=[{thread:7,sources:[100]}]、targets=[80,81]，确认同一交流时输出80的thread=7,parent=null和81的thread=7,parent=80；不输出100，不创建new:80替代7。
-mode=historical时，historical_target_thread是正在向前补全的已知交流；current_sources是待补分类的旧消息，不是刚发生的新交流。先判断它们是否被只读锚点承接，再区分独立旁支。只读锚点明确说“接着刚才”“继续那个问题”等并有对应往返证据时，早期目标应归入该已有thread；不能仅因目标更早、未再次@或缺少显式引用而另建thread。thread编号与source_id是不同的编号空间。
+source_id只能来自targets；历史模式还允许readonly_anchors中的来源。已有thread只能来自候选会话；新交流用new:ID，其中ID必须是这段交流最早的一条待解析消息ID，且该锚点也必须在输出中归入同一个new:ID。
+实时模式只输出targets。历史模式请同时输出targets及readonly_anchors中的锚点分组，用于判断跨区间交流是否相连；其他只读消息不能输出。
+历史模式先把整段往返分组：若更早目标与稍后已知锚点属于同一交流，它们必须共用thread标签。可以统一使用该锚点的已有thread编号，也可以统一使用new:最早目标ID；程序会把含锚点的新标签映射回锚点的固定编号，只写目标，不移动锚点或改它的parent。
+例如已有thread7的锚点100承接目标80、81，可以输出80/81/100均thread=7，或均thread=new:80；不要把同一次往返拆成80/81一个标签、100另一个标签。不同已有thread的锚点不能合并。没有连续性证据的旁支独立分组。
+mode=historical时current_sources是待补分类的旧消息，不是刚发生的新交流。historical_target_thread是本次回查的交流；不能仅因目标更早、未再次@或缺少显式引用而另建thread。thread编号与source_id是不同编号空间。
 parent只能指向已提供、比本消息更早的来源ID，不能引用未来消息。可以只输出有把握的部分；模糊短句不强行归属，thread=null且certain=false。
 历史模式允许参考该历史块之后、当前任务之前的已知锚点，但parent仍必须早于本消息。仅在有交流连续性证据时连接已有thread，不能只因谈论同一主题就合并独立往事。
 不要输出回复、摘要、推理、额外字段或Markdown。不决定机器人是否参与，不提出工具调用。
@@ -282,6 +282,18 @@ class DialogueService:
                             for t, rows in candidates],
                 'messages': [{**self._public(source_rows[i]), 'read_only': i not in target_ids}
                              for i in sorted(source_rows)]}
+        # 只读锚点仅能提供分组连接证据，数据库中的既有归属保持不变。
+        anchor_states = self.store.states(group_id, [r['source_id'] for r in data['messages']])
+        anchors = {}
+        if historical:
+            for row in data['messages']:
+                source = row['source_id']
+                assigned = self.store.assignment(group_id, source)
+                if (source not in data['targets'] and assigned
+                        and anchor_states.get(source, {}).get('status') == 'resolved'
+                        and assigned['thread_id'] in {t['thread'] for t in data['threads']}):
+                    anchors[source] = assigned['thread_id']
+        data['readonly_anchors'] = [{'source_id': i, 'thread': t} for i, t in anchors.items()]
         while len(json.dumps(data, ensure_ascii=False, separators=(',', ':'))) > self.settings.thread_parse_max_chars:
             longest = max(data['messages'], key=lambda r: len(r['text']), default=None)
             if longest and len(longest['text']) > 100:
@@ -297,10 +309,13 @@ class DialogueService:
             keep = set(data['targets']) | {i for t in data['threads'] for i in t['sources']}
             data['messages'] = [r for r in data['messages'] if r['source_id'] in keep]
             data['current_sources'] = sorted(set(data['current_sources']) & set(data['targets']))
+            data['readonly_anchors'] = [a for a in data['readonly_anchors'] if a['source_id'] in keep]
         allowed_sources = {r['source_id'] for r in data['messages']}
         for row in data['messages']:
             row['read_only'] = row['source_id'] not in data['targets']
         allowed_threads = {t['thread'] for t in data['threads']}
+        anchors = {i: t for i, t in anchors.items() if i in allowed_sources and t in allowed_threads}
+        data['readonly_anchors'] = [{'source_id': i, 'thread': t} for i, t in anchors.items()]
         async with self._slots:
             # 在拿到全局名额后重新检查同群频率，后台与历史查询共用额度。
             now = time.time()
@@ -318,7 +333,7 @@ class DialogueService:
             try:
                 async with asyncio.timeout(self.settings.thread_parse_timeout_seconds):
                     result = await self.llm.parse_dialogue(PARSER_INSTRUCTIONS, data)
-                self._apply(group_id, result['result'], set(data['targets']), allowed_sources, allowed_threads)
+                self._apply(group_id, result['result'], set(data['targets']), allowed_sources, allowed_threads, anchors=anchors)
                 usage = result.get('usage', {})
                 logger.info('Thread parsed: group=%s mode=%s targets=%s candidates=%s prompt_tokens=%s completion_tokens=%s',
                             group_id, data['mode'], len(data['targets']), len(allowed_threads), usage.get('prompt_tokens'), usage.get('completion_tokens'))
@@ -327,18 +342,19 @@ class DialogueService:
             except Exception as exc:
                 logger.warning('Thread parse fallback: group=%s error=%s', group_id, type(exc).__name__)
 
-    def _apply(self, group_id, value, targets, sources, threads):
+    def _apply(self, group_id, value, targets, sources, threads, *, anchors=None):
         if set(self.store.valid(group_id, sources)) != sources:
             raise ValueError('source changed during parse')
+        anchors = anchors or {}
         assignments = value.get('assignments') if isinstance(value, dict) else None
-        if not isinstance(assignments, list) or len(assignments) > len(targets):
+        if not isinstance(assignments, list) or len(assignments) > len(targets) + len(anchors):
             raise ValueError('invalid assignments')
         checked = {}
         for item in assignments:
             if not isinstance(item, dict) or set(item) != {'source_id', 'thread', 'parent', 'relation', 'certain'}:
                 raise ValueError('invalid assignment fields')
             source, thread, parent = item['source_id'], item['thread'], item['parent']
-            if (type(source) is not int or source not in targets or source in checked
+            if (type(source) is not int or source not in targets | anchors.keys() or source in checked
                     or type(item['certain']) is not bool or not isinstance(item['relation'], str) or item['relation'] not in RELATIONS
                     or (parent is not None and (type(parent) is not int or parent not in sources or parent >= source))):
                 raise ValueError('invalid assignment evidence')
@@ -358,6 +374,24 @@ class DialogueService:
                 root = checked.get(int(thread[4:]))
                 if not root or not root['certain'] or root['thread'] != thread:
                     raise ValueError('missing new root')
+        aliases = {}
+        for source, fixed_thread in anchors.items():
+            assigned = self.store.assignment(group_id, source)
+            if not assigned or assigned['thread_id'] != fixed_thread:
+                raise ValueError('readonly anchor changed')
+            item = checked.get(source)
+            if not item or not item['certain'] or item['thread'] is None:
+                continue
+            label = item['thread']
+            if type(label) is int:
+                if label != fixed_thread:
+                    raise ValueError('cannot merge known threads')
+            elif label in aliases and aliases[label] != fixed_thread:
+                raise ValueError('conflicting readonly anchors')
+            else:
+                aliases[label] = fixed_thread
+        checked = {i: {**item, 'thread': aliases.get(item['thread'], item['thread'])}
+                   for i, item in checked.items() if i in targets}
         # 全部校验完成后才变更；每条写入再核对来源仍存在且未被遗忘。
         created = {}
         for source, item in sorted(checked.items()):
