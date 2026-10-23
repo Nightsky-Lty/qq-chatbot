@@ -21,6 +21,10 @@ PARSER_INSTRUCTIONS = """你是多人群聊的会话关系解析器，不是回�
 current_sources是本批新消息，优先判断这些消息；省略主语的追问、对机器人上一句的回答或纠正，可以延续已有交流，不需要再次@。动作通知的author是动作发起者，也可参与后续交流。
 只能输出JSON：{"assignments":[{"source_id":整数,"thread":整数或"new:来源ID"或null,"parent":整数或null,"relation":"answer|question|correction|supplement|continuation|new","certain":布尔值}]}。
 source_id只能来自待解析消息。已有thread只能来自候选会话；新交流用new:ID，其中ID必须是这段交流最早的一条待解析消息ID，且该锚点也必须在输出中归入同一个new:ID。
+targets是唯一允许输出的source_id白名单。messages中其他消息是只读证据，禁止把它们加到assignments，不能修改它们的归属或parent。
+threads中的已有编号必须保持稳定。历史模式若发现更早的消息属于稍后已知锚点的同一交流，应把早期目标放入已有thread编号，不能创建新编号再把只读锚点搬过去。
+例如threads=[{thread:7,sources:[100]}]、targets=[80,81]，确认同一交流时输出80的thread=7,parent=null和81的thread=7,parent=80；不输出100，不创建new:80替代7。
+mode=historical时，historical_target_thread是正在向前补全的已知交流；current_sources是待补分类的旧消息，不是刚发生的新交流。先判断它们是否被只读锚点承接，再区分独立旁支。只读锚点明确说“接着刚才”“继续那个问题”等并有对应往返证据时，早期目标应归入该已有thread；不能仅因目标更早、未再次@或缺少显式引用而另建thread。thread编号与source_id是不同的编号空间。
 parent只能指向已提供、比本消息更早的来源ID，不能引用未来消息。可以只输出有把握的部分；模糊短句不强行归属，thread=null且certain=false。
 历史模式允许参考该历史块之后、当前任务之前的已知锚点，但parent仍必须早于本消息。仅在有交流连续性证据时连接已有thread，不能只因谈论同一主题就合并独立往事。
 不要输出回复、摘要、推理、额外字段或Markdown。不决定机器人是否参与，不提出工具调用。
@@ -269,13 +273,15 @@ class DialogueService:
             source_rows.update(incoming)
         source_rows.update({r['id']: r for r in targets})
         data = {'active_thread': history_thread if historical else self.store.attention(group_id)['active_thread_id'],
-                'mode': 'historical' if historical else 'live', 'bot_id': batch.entries[-1].self_id,
+                'mode': 'historical' if historical else 'live', 'historical_target_thread': history_thread,
+                'bot_id': batch.entries[-1].self_id,
                 'wake_sources': [e.storage_id for e in batch.entries if e.direct],
                 'current_sources': sorted(set(incoming) & target_ids), 'targets': sorted(target_ids),
                 'threads': [{'thread': t, 'sources': [r['id'] for r in rows],
                              'waiting_source': (self.store.state(group_id, t) or {}).get('waiting_source_id')}
                             for t, rows in candidates],
-                'messages': [self._public(source_rows[i]) for i in sorted(source_rows)]}
+                'messages': [{**self._public(source_rows[i]), 'read_only': i not in target_ids}
+                             for i in sorted(source_rows)]}
         while len(json.dumps(data, ensure_ascii=False, separators=(',', ':'))) > self.settings.thread_parse_max_chars:
             longest = max(data['messages'], key=lambda r: len(r['text']), default=None)
             if longest and len(longest['text']) > 100:
@@ -292,6 +298,8 @@ class DialogueService:
             data['messages'] = [r for r in data['messages'] if r['source_id'] in keep]
             data['current_sources'] = sorted(set(data['current_sources']) & set(data['targets']))
         allowed_sources = {r['source_id'] for r in data['messages']}
+        for row in data['messages']:
+            row['read_only'] = row['source_id'] not in data['targets']
         allowed_threads = {t['thread'] for t in data['threads']}
         async with self._slots:
             # 在拿到全局名额后重新检查同群频率，后台与历史查询共用额度。
