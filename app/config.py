@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     thread_dormant_seconds: int = Field(default=1800, ge=60, le=86400)
     thread_attention_hold_seconds: int = Field(default=20, ge=0, le=300)
     thread_invitation_ttl_seconds: int = Field(default=90, ge=10, le=600)
+    thread_history_read_max_calls: int = Field(default=3, ge=1, le=8)
+    thread_history_read_max_chars: int = Field(default=12000, ge=5000, le=40000)
+    thread_history_read_total_chars: int = Field(default=24000, ge=5000, le=100000)
     # OneBot 连接认证与额外管理员；群主、群管理员的权限在业务层判断。
     onebot_access_token: str = ""
     # 跳过环境变量来源的自动 JSON 解码，由下面的校验器兼容两种输入格式。

@@ -28,6 +28,7 @@ from app.memory import MemoryService
 from app.memory_capture import MemoryCapture
 from app.working_memory import WorkingMemoryManager
 from app.dialogue import DialogueService
+from app.thread_history import READ_THREAD_HISTORY_TOOL, ThreadHistorySession
 from app.memory_tools import register_memory_tools
 from app.group_context import addressing, build_group_history
 from app.prompting import ContextPacket, PromptBuilder, PromptScene
@@ -1037,6 +1038,17 @@ class BotService:
                 allowed_mentions.update({member["user_id"]: member["display_name"] for member in
                                          self.db.group_members(context_id, set(source_message.mentions))})
             bot_id = batch.focus.self_id if batch else (source_message.self_id if source_message else 0)
+            if (self.dialogue.enabled and batch is not None and batch.thread_id is not None
+                    and not private and not observe_only):
+                thread_history = ThreadHistorySession(
+                    self.settings, self.dialogue.store, context_id, batch.thread_id,
+                    before_id=min(entry.storage_id for entry in batch.entries), bot_id=bot_id,
+                    visible_source_ids=[row['本地记录ID'] for row in context.working.get('近期往返', [])],
+                    complete_source_ids=[row['本地记录ID'] for row in context.working.get('近期往返', [])
+                                         if not row.get('原文已截断')],
+                    current_source_ids=[entry.storage_id for entry in batch.entries])
+                registry.register(READ_THREAD_HISTORY_TOOL, thread_history.execute)
+                context.runtime['当前thread历史查询'] = thread_history.runtime()
             allowed_mentions = {qq: name for qq, name in allowed_mentions.items() if qq > 0 and qq != bot_id}
             preserve_layout = not private and (batch is not None or not automatic) and self._needs_multiline_layout(prompt)
             conversation = ("private", user_id) if private else ("group", context_id)

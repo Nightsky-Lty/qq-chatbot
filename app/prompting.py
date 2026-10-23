@@ -17,6 +17,7 @@ from app.reminders import REMINDER_INSTRUCTIONS
 from app.sticker_collect import COLLECT_INSTRUCTIONS
 from app.stickers import STICKER_INSTRUCTIONS
 from app.tools import ToolRegistry
+from app.thread_history import THREAD_HISTORY_INSTRUCTIONS
 from app.voice import VOICE_INSTRUCTIONS
 from app.web_search import WEB_INSTRUCTIONS
 
@@ -99,6 +100,7 @@ CAPABILITY_NOTES = (
     ("get_message_image", CHAT_IMAGE_INSTRUCTIONS),
     ("web_search", WEB_INSTRUCTIONS),
     ("memory_search", MEMORY_TOOL_INSTRUCTIONS),
+    ("read_thread_history", THREAD_HISTORY_INSTRUCTIONS),
     ("collect_sticker", COLLECT_INSTRUCTIONS),
     ("send_sticker", STICKER_INSTRUCTIONS),
     ("send_poke", POKE_TOOL_INSTRUCTIONS),
