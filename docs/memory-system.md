@@ -32,13 +32,15 @@
 | 工具 | 行为 |
 | --- | --- |
 | memory_add() | 本人本轮明确要求记住，将真实原话交给独立提取器；不接收自由编写的事实 |
-| memory_search(query, layer?, subject?, after?, before?, include_sources?) | 检索本会话，人物明确时可过滤，时间为Unix秒；默认紧凑摘要，必要时最多3条来源 |
+| memory_search(query, layer?, subject?, after?, before?, include_sources?) | 检索本会话长期记忆，layer为all/event/abstract/perceptual，人物明确时可过滤，时间为Unix秒；默认紧凑摘要，必要时最多3条来源 |
 | memory_update(memory_id, expected_version) | 本轮明确纠正，校验原版本并新增修订、保留旧版本；同键不同条件不自动覆盖 |
 | memory_delete(memory_id, expected_version) | 有明确请求时清除指定记录、修订正文及依赖的派生记忆，排队删除向量，阻断旧来源重建 |
 | memory_forget(memory_id, expected_version) | 停止使用，清空正文/来源/向量及修订正文，保留最小摘要指纹和来源ID阻断；不只是降权 |
 | memory_consolidate() | 声明任务结束时短期转长期；自动执行，不是任意合并/重写历史库 |
 
 空间、请求者由程序绑定，不接受模型提供namespace/路径/SQL。个人记忆只有本人可修改；共享群概念仅已验证的群管理者/配置管理员可显式管理，管理权限不延伸到任何私聊。普通后台整理器不拥有delete/forget权限。
+
+thread只接管工作记忆的交流划分与原文读取。旧`memory_search`的working分支已移除，群原文回查由`read_thread_history`负责；六个长期记忆工具、摘要/来源展开、原话FTS兜底、整合队列、版本与权限校验均保留。`memory_consolidate`是短期到长期的桥接，不随工作记忆查询退役；`WorkingMemoryManager`仍承担私聊/回退上下文、原文预算和归档，不属于废弃工具。
 
 删除/遗忘会阻断关联源消息进入后续原话回查和聊天上下文，可能保守地排除同一条消息中的其他信息。阻断依靠来源ID、正文摘要和带条件的语义键，并不能保证识别任意改写的全新发言；第一版不支持自动恢复已遗忘事实。原始QQ聊天与历史备份不因删除一条记忆自动擦除，SQLite空闲页/既已发给模型的数据也不能承诺安全擦除。完整个人资料清除仍使用现有数据清除功能，并按部署者备份保留策略处理历史备份。
 
@@ -72,7 +74,7 @@ SELECT id,version FROM memory_records;
 
 ## 验证
 
-`python3 -m unittest discover -s tests -q`覆盖新库初始化、现有数据重启保持、跨空间/跨人物、超过300条旧事件、中文词条、日期、概念候选、条件共存、版本/权限、原话兜底与遗忘、任务交接/重启、Qdrant协议和旧索引删除、感知检索与保留。
+`python3 -m unittest discover -s tests -p 'test_memory_system.py' -q`覆盖跨空间/跨人物、超过300条旧事件、中文词条、日期、概念候选、条件共存、版本/权限、原话兜底与遗忘、任务交接/重启、Qdrant协议和旧索引删除、感知检索与保留。`test_memory_schema.py`另覆盖初始化和重启保持；旧工作记忆接口的退役断言不属于当前长期工具约定。
 
 `scripts/verify_memory_system.py`在临时数据库和独立临时collection中验证真实BGE/Qdrant；`--live`额外调用一次真实记忆LLM，输入仅合成对话，不读真实聊天、不发送QQ。临时collection由脚本清理。
 

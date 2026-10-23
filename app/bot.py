@@ -1139,18 +1139,10 @@ class BotService:
                         image_session.sources[image_id] = self.image_cache.describe(row)
                     if batch is not None and collection_jobs is not None:
                         collection_jobs[image_id] = CollectionJob(namespace, row["user_id"], bot_id, row["message_id"], ref, send_message)
-                def working_search(query, arguments):
-                    thread_sources = (self.dialogue.context_ids(namespace, batch.thread_id,
-                        max(workspace.source_ids, default=0) + 1, query)
-                        if batch is not None and batch.thread_id else None)
-                    return self.working_memory.snapshot(namespace, before_id=max(workspace.source_ids, default=0) + 1,
-                        query=query, roots=[e.reply_to for e in batch.entries if e.reply_to] if batch else [],
-                        bot_id=bot_id, source_ids=thread_sources)
                 async def working_consolidate():
                     return await self.working_memory.archive(namespace, max(workspace.source_ids, default=0) + 1)
                 register_memory_tools(registry, self.memory_capture, namespace, user_id, source_rows,
                     workspace=workspace, media_grant=grant_memory_image,
-                    working_search=working_search if self.settings.working_memory_enabled else None,
                     working_consolidate=working_consolidate)
                 for item in injected_memories:
                     if type(item.get("media_ref_id")) is int:
