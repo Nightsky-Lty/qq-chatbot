@@ -181,6 +181,9 @@ class DialogueService:
                     break
                 entries = queue[:self.settings.thread_parse_batch_messages]
                 del queue[:len(entries)]
+                entries = [e for e in entries if time.monotonic() - e.received_at < self.settings.chat_queue_wait_seconds]
+                if not entries:
+                    continue
                 async with self._locks[group_id]:
                     retry = await self._parse(group_id, GroupBatch(entries), max(e.storage_id for e in entries))
                 if retry and self.is_active(group_id):
@@ -317,6 +320,8 @@ class DialogueService:
         anchors = {i: t for i, t in anchors.items() if i in allowed_sources and t in allowed_threads}
         data['readonly_anchors'] = [{'source_id': i, 'thread': t} for i, t in anchors.items()]
         async with self._slots:
+            if not historical and all(time.monotonic() - e.received_at >= self.settings.chat_queue_wait_seconds for e in batch.entries):
+                return
             # 在拿到全局名额后重新检查同群频率，后台与历史查询共用额度。
             now = time.time()
             attention = self.store.attention(group_id)
