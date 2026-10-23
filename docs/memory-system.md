@@ -76,6 +76,6 @@ SELECT id,version FROM memory_records;
 
 `python3 -m unittest discover -s tests -p 'test_memory_system.py' -q`覆盖跨空间/跨人物、超过300条旧事件、中文词条、日期、概念候选、条件共存、版本/权限、原话兜底与遗忘、任务交接/重启、Qdrant协议和旧索引删除、感知检索与保留。`test_memory_schema.py`另覆盖初始化和重启保持；旧工作记忆接口的退役断言不属于当前长期工具约定。
 
-`scripts/verify_memory_system.py`在临时数据库和独立临时collection中验证真实BGE/Qdrant；`--live`额外调用一次真实记忆LLM，输入仅合成对话，不读真实聊天、不发送QQ。临时collection由脚本清理。
+真实BGE/Qdrant和记忆LLM的额外验证使用项目外的一次性脚本、临时数据库和独立临时collection，输入仅合成对话，不读真实聊天、不发送QQ。验证后清理脚本和临时资源；真实API验证会消耗调用额度。
 
 当前限制：仍是单实例/单进程；语义抽取、群梗推断不是事实核验；复杂事件时间和多人归属可能需要追问。没有自动图推理、音视频处理、视觉embedding或专用重排模型。

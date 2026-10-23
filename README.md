@@ -64,7 +64,7 @@
 
 `Agent finished` 日志记录实际模型轮次及API返回的 `prompt_tokens`、`completion_tokens`、`reasoning_tokens`、`cache_hit_tokens` 和 `usage_requests`。后者表示提供完整输入/输出计数的请求数；服务不报告的计数不能视为真实零消耗。推理token通常已包含在completion内，不重复相加；缓存命中影响计费，不能直接把总输入token降幅当成账单降幅。日志不包含正文或推理内容。
 
-可运行 `PYTHONPATH=. python scripts/benchmark_agent_efficiency.py` 对比基线历史大小；加 `--live` 会调用真实API回放合成群聊和提醒任务，使用临时数据库和本地发送回调，不向QQ发消息。真实API回放仍会消耗所配置服务的调用额度。
+此前合成回放和上下文大小对比见[效率验证记录](docs/agent-efficiency-results.md)。一次性测量脚本不再保留在项目中。
 
 ## 群聊QQ AI语音
 
@@ -91,8 +91,6 @@
 API请求只发往固定DeepSeek官方HTTPS地址，不跟随重定向、不继承环境代理，Key不随网页URL发送。网页URL仍限制为标准端口、无凭证的HTTP/HTTPS，拒绝字面内网/本机/特殊地址；Fetch只接受本轮搜索结果或当前用户消息中的链接，不从历史/记忆/网页正文扩大范围。目标网站的DNS、跳转与访问安全由DeepSeek远端抓取服务处理，本机不再直接访问或逐跳解析目标网页。网页资料仍是不可信数据，不执行其中指令；查询词和待抓取URL会发给DeepSeek，提示模型不外发完整聊天、QQ号、私密记忆或凭证，但不是自动脱敏保证。检索结果不单独落库，最终回复仍按原聊天历史规则保存；日志只记数量、状态，不记Key、查询、URL或正文，不回显API原始错误体。鉴权失败、余额不足、限流或网页受限时如实返回，不切回Bing或假装成功。
 
 Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结果另产生输入token费用；直接调用不套用其他产品临时免费政策，费用以[官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)为准。配置项：`WEB_SEARCH_ENABLED`、`WEB_SEARCH_MAX_RESULTS`、`WEB_SEARCH_MAX_CALLS`、`WEB_SEARCH_NEED_CONTENT`、`WEB_SEARCH_CONTENT_MAX_CHARS`、`WEB_FETCH_MAX_CALLS`、`WEB_TIMEOUT_SECONDS`、`WEB_MAX_RESPONSE_BYTES`、`WEB_FETCH_MAX_CHARS`，重建容器后生效。旧 `WEB_SEARCH_AUTO_FETCH_PAGES` 已移除，不再自动读两页。
-
-离线回归：`python3 -m unittest discover -s tests -v`。真实接口验证：`PYTHONPATH=. python3 scripts/verify_web_search.py --verify-fetch`，默认搜索Python公开文档，并独立Fetch官方文档，复用现有Key并按次计费；不调用聊天LLM、不写数据库、不发送QQ，仅输出状态与长度。验证Search至少返回1页正文、缓存命中零Fetch请求，以及独立Fetch读取成功。
 
 ## 聊天人设
 
@@ -139,8 +137,6 @@ Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结
 **隐私和费用变化：即使未@机器人，接收到的普通图片也会下载到服务器，并发送给图片概要模型进行视觉分析，产生存储和视觉API费用；聊天模型再读取概要也会产生输入token。** 私聊也适用，但不与群聊互通。概要提示词要求不抄录密钥、证件号等敏感信息，但不保证自动脱敏。缓存与聊天数据库均未额外加密，应限制服务器访问；涉及敏感图片时可关闭此功能。
 
 配置 `IMAGE_CACHE_ENABLED`、`IMAGE_CACHE_RETENTION_DAYS`、`IMAGE_CACHE_MAX_FILES`、`IMAGE_CACHE_MAX_BYTES`、`IMAGE_CACHE_QUEUE_LIMIT`、`IMAGE_CACHE_CONTEXT_LIMIT`；`IMAGE_LLM_MODEL/BASE_URL/THINKING_ENABLED` 独立控制概要模型，留空复用聊天连接，Key用 `IMAGE_LLM_API_KEY` 或回退 `DEEPSEEK_API_KEY`，默认不开思考。缓存目录通过Compose固定为持久卷目录，原生运行可设 `IMAGE_CACHE_DIRECTORY`。`CHAT_IMAGE_ENABLED=false` 只关闭聊天看原图，不关闭缓存/概要；要停后台图片上传必须设置 `IMAGE_CACHE_ENABLED=false`。关闭缓存时恢复旧的当前批次按需下载路径。不支持视觉时还需关闭/更换图片概要模型以及表情审核相关配置。
-
-离线测试：`python3 -m unittest discover -s tests -v`。真实概要验证脚本 `scripts/verify_image_cache.py` 使用临时数据库和合成图片，默认不发QQ、不触碰真实图片库，增加 `--live` 才进行1次真实视觉概要请求。
 
 ## 收藏群友表情：工具与概率
 
