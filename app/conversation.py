@@ -42,6 +42,7 @@ class GroupMessage:
 @dataclass(slots=True)
 class GroupBatch:
     entries: list[GroupMessage]
+    thread_id: int | None = None
 
     @property
     def candidates(self) -> list[GroupMessage]:

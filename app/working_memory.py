@@ -108,7 +108,7 @@ class WorkingMemoryManager:
         return item
 
     def snapshot(self, namespace: int, *, before_id: int, query: str = "", roots=(), bot_id: int = 0,
-                 image_lookup=None) -> dict[str, Any]:
+                 image_lookup=None, source_ids=None) -> dict[str, Any]:
         """最近80条（可配置）结构化原文＋显式引用；当前请求另外注入，不生成摘要。"""
         from app.embeddings import tokens
         from app.group_context import addressing
@@ -117,7 +117,8 @@ class WorkingMemoryManager:
             return result
         state = self._ensure(namespace)
         state.rows = self._valid(namespace, set(state.rows))
-        pool = self._window(namespace, before_id)
+        pool = (self._window(namespace, before_id) if source_ids is None else
+                {i: r for i, r in self._valid(namespace, set(source_ids)).items() if i < before_id})
         state.rows.update(pool)
         self._trim(state)
         root_ids, pending = set(), list(roots)

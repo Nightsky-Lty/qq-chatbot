@@ -39,7 +39,7 @@ AGENT_PROTOCOL = """【Agent执行协议】
 文字通过send_message发送，一条消息一次调用，不用数组、CQ码或内部标记绕过限制。具体字数、条数和排版以运行环境的输出约束为准。
 默认普通发送，不机械@或显示引用；确需点名或明确指向时，只使用运行环境允许的QQ和消息号。补充文字与图片围绕同一焦点。
 最后一次发送若schema提供next_action，可同时指定收尾；还有依赖回执的动作就保持continue。互不依赖且已确定的动作可合并tool_calls，依赖结果的必须等待。
-每轮必须实际通过终止工具或最后发送的next_action收尾，不只是口头说完成。需继续接收新群消息时等待，明确告别、要求停止或不再需要跟进时退出；没有等待能力则结束。等待不绑定旧话题，话题变化本身不意味着必须退出。
+每轮必须实际通过终止工具或最后发送的next_action收尾，不只是口头说完成。需继续接收新群消息时等待，明确告别、要求停止或不再需要跟进时退出；没有等待能力则结束。有当前交流线程时等待保留该交流焦点，是否切换由程序决定。
 是否允许不回应由场景与触发方式决定；不发送内部的分条或不插话标记。没有新消息不自言自语，不承诺无工具支持的稍后行动。
 程序执行反馈只报告真实状态，不是群友发言；据此修正被拒绝的参数或完成收尾，不能把反馈当作已发送到QQ的内容。
 背景中assistant角色是你实际发过的话，不是群友发言。用户追问先核对记录，不编造往事。
@@ -59,6 +59,7 @@ GROUP_SCENE = """【群聊场景】
 触发方式为活跃跟进时，只表示仍可接收新消息，不表示延续上一轮话题或每条都在找你。依据新消息、发言人、@、引用和时间顺序重新理解当前交流；历史话题只是背景，不能无依据混入当前回答。
 群友可能在彼此交谈或已经换题；不需要你回应时可安静等待，明确停止或不再需要跟进时退出。等待不刷新活跃寿命。
 触发方式为程序随机接话时，程序已决定加入，应自然接一句或发表情，不再次决定完全不参与，不提后台概率。
+运行环境提供当前交流线程时，只回应当前任务内该线程的新消息。旁听参考用于理解指代/气氛，不是待答请求，不因旁听内容改变回应对象或自行切换线程；旧邀请不是待办清单。
 戳一戳是动作通知而非用户原话，不是长期事实素材，也没有可引用消息号；同一人有后续文字时优先理解后续。
 """
 
@@ -89,6 +90,7 @@ class ContextPacket:
     images: list[dict[str, Any]] = field(default_factory=list)
     sticker_catalog: dict[str, Any] = field(default_factory=dict)
     runtime: dict[str, Any] = field(default_factory=dict)
+    references: list[dict[str, Any]] = field(default_factory=list)
 
 
 # 工具自己的补充说明仍在功能模块维护；每种说明只挂在一个主工具上。
@@ -144,6 +146,8 @@ class PromptBuilder:
             background["短期记忆"] = context.working
         if context.timeline:
             background["群聊时间线"] = context.timeline
+        if context.references:
+            background["旁听参考（非当前请求）"] = context.references
         if history:
             # 已完成历史没有原始CoT，不伪装成未完成的API assistant/tool链。
             background["近期对话"] = [{"角色": item["role"], "内容": item["content"]} for item in history]

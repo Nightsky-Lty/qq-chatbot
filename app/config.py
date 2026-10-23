@@ -37,6 +37,23 @@ class Settings(BaseSettings):
     image_llm_base_url: str = ""
     image_llm_api_key: str = ""
     image_llm_thinking_enabled: bool = False
+    # 会话解析独立于回复Agent；无工具，默认不启用思考。
+    thread_llm_model: str = ""
+    thread_llm_base_url: str = ""
+    thread_llm_api_key: str = ""
+    thread_llm_thinking_enabled: bool = False
+    thread_enabled: bool = True
+    thread_history_limit: int = Field(default=12, ge=2, le=80)
+    thread_reference_limit: int = Field(default=3, ge=0, le=8)
+    thread_candidate_limit: int = Field(default=5, ge=1, le=10)
+    thread_parse_max_messages: int = Field(default=30, ge=5, le=60)
+    thread_parse_max_chars: int = Field(default=14000, ge=2000, le=40000)
+    thread_parse_timeout_seconds: float = Field(default=15, ge=1, le=45)
+    thread_parse_min_interval_seconds: float = Field(default=15, ge=0, le=300)
+    thread_parse_calls_per_minute: int = Field(default=3, ge=1, le=20)
+    thread_dormant_seconds: int = Field(default=1800, ge=60, le=86400)
+    thread_attention_hold_seconds: int = Field(default=20, ge=0, le=300)
+    thread_invitation_ttl_seconds: int = Field(default=90, ge=10, le=600)
     # OneBot 连接认证与额外管理员；群主、群管理员的权限在业务层判断。
     onebot_access_token: str = ""
     # 跳过环境变量来源的自动 JSON 解码，由下面的校验器兼容两种输入格式。

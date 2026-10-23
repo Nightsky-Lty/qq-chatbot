@@ -48,7 +48,7 @@ class ToolRegistry:
         properties = definition["function"]["parameters"]["properties"]
         actions = ["continue"] + (["finish"] if "finish" in self.bindings else []) + (["wait"] if "wait_for_messages" in self.bindings else [])
         properties["next_action"] = {"type": "string", "enum": actions,
-            "description": "最后一次发送用finish退出跟进，或wait等待新群消息（不绑定话题）；成功后程序直接收尾。省略/continue仍需后续决策。"}
+            "description": "最后一次发送用finish退出跟进，或wait保持当前交流焦点等待新群消息；成功后程序直接收尾。省略/continue仍需后续决策。"}
         return definition
 
     async def execute(self, name: str, arguments: Any) -> dict[str, Any]:
@@ -103,6 +103,6 @@ FINISH_TOOL = {"type": "function", "function": {
 }}
 
 WAIT_FOR_MESSAGES_TOOL = {"type": "function", "function": {
-    "name": "wait_for_messages", "description": "本批处理完成，保持群活跃跟进，等待新消息而不立即请求模型。不绑定旧话题，新消息到来后重新理解；明确停止或不再需要跟进时finish。无新消息不发言。",
+    "name": "wait_for_messages", "description": "本批处理完成，保持当前交流焦点，等待新消息而不立即请求模型。线程切换和活跃超时由程序决定；明确停止或不再需要跟进时finish。无新消息不发言。",
     "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 }}

@@ -27,6 +27,7 @@ from app.poking import PokeService, PokeSession, SendPoke, SEND_POKE_TOOL
 from app.memory import MemoryService
 from app.memory_capture import MemoryCapture
 from app.working_memory import WorkingMemoryManager
+from app.dialogue import DialogueService
 from app.memory_tools import register_memory_tools
 from app.group_context import addressing, build_group_history
 from app.prompting import ContextPacket, PromptBuilder, PromptScene
@@ -107,6 +108,10 @@ class BotService:
         self.sticker_llm = DeepSeekClient(settings, purpose="sticker")
         self.memory_llm = DeepSeekClient(settings, purpose="memory")
         self.image_llm = DeepSeekClient(settings, purpose="image")
+        self.thread_llm = DeepSeekClient(settings, purpose="thread")
+        self.dialogue = DialogueService(settings, database, self.thread_llm)
+        # 活跃焦点不跨进程恢复；持久消息归属和线程状态保留。
+        self.dialogue.release()
         self.image_cache = ImageCache(settings, database, self.image_llm)
         self.reminders = reminders
         self.chat_images = ChatImageService(settings)
@@ -127,7 +132,10 @@ class BotService:
         self.working_memory = WorkingMemoryManager(settings, database, self.memory_capture)
         self.working_memory.media_lookup = lambda ns, ids: [self.image_cache.describe(r)
             for r in self.image_cache.rows(ns, max(ids, default=0), set(ids)) if r["source_id"] in ids]
-        self.db.message_listener = self.working_memory.receive
+        def receive_message(namespace, source_id):
+            self.working_memory.receive(namespace, source_id)
+            self.dialogue.observe(namespace, source_id)
+        self.db.message_listener = receive_message
         self.pokes = PokeService(settings)
         self.voices = VoiceService(settings)
         self._confirmed_senders: dict[SendMessage, SendMessage] = {}
@@ -157,9 +165,14 @@ class BotService:
                 sender=confirmed or send_message, group_id=key[1] if key is not None else None,
             )
         if key is None:
+            groups = [group for group, state in self.conversations.states.items()
+                      if send_message is None or state.sender == send_message]
             await self.conversations.cancel(sender=send_message)
+            for group in groups:
+                self.dialogue.release(group)
         elif key[0] in {"group", "auto", "image"}:
             await self.conversations.cancel(group_id=key[1])
+            self.dialogue.release(key[1])
         tasks = [
             task for task, (sender, task_key) in self._ai_tasks.items()
             if (send_message is None or sender in {send_message, confirmed})
@@ -207,6 +220,7 @@ class BotService:
         await self.sticker_llm.close()
         await self.memory_llm.close()
         await self.image_llm.close()
+        await self.thread_llm.close()
         await self.web_search.close()
         self._confirmed_senders.clear()
         self._poke_senders.clear()
@@ -307,7 +321,8 @@ class BotService:
             mentions=view.mentions, reply_to=view.reply_to,
             images=(view.images if self.image_cache.enabled else
                     (view.images[:3] if self.settings.chat_image_enabled or self.sticker_collector.enabled else [])),
-            direct=bool(self_id and self_id in view.mentions),
+            direct=bool((self_id and self_id in view.mentions)
+                        or (view.reply_to and self.db.is_bot_message(group_id, view.reply_to))),
             eligible=(not view.mentions or self_id in view.mentions)
                      and (not view.reply_to or self.db.is_bot_message(group_id, view.reply_to)),
             random_eligible=(isinstance(event.get("time"), (int, float))
@@ -449,24 +464,35 @@ class BotService:
             state = self.conversations.states.get(group_id)
             if not batch.wakes_followup and (state is None or not state.active(time.monotonic())):
                 return None
+            selection = None
+            if self.dialogue.enabled:
+                if state is None or not state.active(time.monotonic()):
+                    self.dialogue.release(group_id)
+                selection = await self.dialogue.select(group_id, batch)
+                if selection is None:
+                    # 旁听/待切换不调用回复模型，也不把沉默当成退出当前交流。
+                    return AgentOutcome(0, 0, 0, wait_for_messages=True)
+                batch = selection.batch
             focus = batch.focus
-            boundary = max(entry.storage_id for entry in batch.entries)
+            boundary = selection.original_boundary if selection else max(entry.storage_id for entry in batch.entries)
             preferred = {entry.storage_id for entry in batch.entries}
             quoted_sources = set()
             for entry in batch.entries:
                 quoted = self.db.message_by_onebot_id(group_id, entry.reply_to) if entry.reply_to else None
                 if quoted is not None:
                     quoted_sources.add(quoted["id"])
-            cached_rows = self.image_cache.rows(group_id, boundary, quoted_sources or preferred)
+            image_preferred = preferred | quoted_sources | (selection.history_ids if selection else set())
+            cached_rows = self.image_cache.rows(group_id, boundary, image_preferred)
             by_source = defaultdict(list)
             for row in cached_rows:
                 by_source[row["source_id"]].append(self.image_cache.describe(row))
             short_context = {}
-            if self.settings.working_memory_enabled:
+            if self.settings.working_memory_enabled or selection:
                 short_context = self.working_memory.snapshot(
                     group_id, before_id=min(e.storage_id for e in batch.entries), query=focus.text,
                     roots=[e.reply_to for e in batch.entries if e.reply_to], bot_id=focus.self_id,
-                    image_lookup=lambda source: by_source.get(source, []))
+                    image_lookup=lambda source: by_source.get(source, []),
+                    source_ids=selection.history_ids if selection else None)
                 history_entries = short_context["近期往返"]
             else:
                 _, history_entries = build_group_history(self.db, self.settings, group_id, batch,
@@ -477,6 +503,13 @@ class BotService:
             stable_ids = []
             image_sources = {}
             timeline_sources = {row["本地记录ID"] for row in history_entries}
+            if selection:
+                # 旁听thread的图片不自动进入工具候选；显式引用的证据仍可访问。
+                allowed_sources = timeline_sources | preferred | quoted_sources
+                if any(word in focus.text for word in ('图', '这张', '那张', '表情')):
+                    # 当前请求显式谈及图片时，可把近期旁听图片作为有来源的参考候选。
+                    allowed_sources.update(row['id'] for row in selection.references)
+                cached_rows = [row for row in cached_rows if row['source_id'] in allowed_sources]
             if self.image_cache.enabled:
                 for row in cached_rows[:self.settings.image_cache_context_limit]:
                     image_id = f"media_{row['id']}"
@@ -573,19 +606,36 @@ class BotService:
                 runtime={"机器人身份": {"QQ": focus.self_id, "角色": "群内参与者，不是所有消息的收件人"},
                          "相关成员索引": list(member_index.values())},
             )
+            if selection:
+                context.runtime["当前交流线程"] = {"编号": batch.thread_id,
+                    "约束": "只回应本线程；其他交流仅供旁听，切换由程序决定"}
+                context.references = [{**self.working_memory._public(group_id, row, focus.self_id),
+                    "可回复": False, "说明": "旁听参考，不是本轮新请求", "内容": row['content'][:400]}
+                    for row in selection.references]
+                for item in context.references:
+                    resources = [image['图片编号'] for image in image_sources.values()
+                                 if image.get('本地记录ID') == item['本地记录ID']]
+                    if resources:
+                        item['图片资料（非原话）'] = [{'图片编号': resource, '概要位置': '图片目录'} for resource in resources]
+                context.working['说明'] = '当前线程必要原文；历史是背景，不是本轮新授权。旁听参考不属于当前请求。'
             logger.info("Group context: group=%s history=%s new=%s images=%s",
                         group_id, len(history_entries), len(current), len(images))
             try:
                 # 无@跟进不能因等待并发名额或模型耗时而越过活跃期时限。
                 timeout = None if batch.wakes_followup else max(0.01, min(state.idle_until, state.hard_until) - time.monotonic())
                 async with asyncio.timeout(timeout):
-                    return await self._run_ai_reply(
+                    outcome = await self._run_ai_reply(
                         group_id, focus.user_id, focus.text, self._confirmed_senders.get(sender, sender),
                         context=context, image_session=ChatImageSession(images, image_ids=stable_ids, sources=image_sources) if images and self.settings.chat_image_enabled else None,
                         automatic=not batch.wakes_followup, batch=batch, mention_targets=mention_targets,
                         collection_jobs=collection_jobs, recalled_memories=memories,
                     )
+                    if selection:
+                        self.dialogue.complete(group_id, batch.thread_id, outcome)
+                    return outcome
             except TimeoutError:
+                if selection:
+                    self.dialogue.complete(group_id, batch.thread_id, None)
                 return None
         finally:
             self._ai_slots.release()
@@ -1056,7 +1106,7 @@ class BotService:
                     if result.get("ok") is not True:
                         return result
                     registry.wait_for_messages = True
-                    return {"ok": True, "waiting": True, "note": "本批结束，等待新群消息，不绑定旧话题；程序控制超时。"}
+                    return {"ok": True, "waiting": True, "note": "本批结束，保持当前交流焦点等待新消息；切换与超时由程序控制。"}
                 registry.register(WAIT_FOR_MESSAGES_TOOL, wait_for_messages, terminal=True)
 
             if self.settings.memory_enabled and not observe_only and (batch is not None or private):
@@ -1078,8 +1128,12 @@ class BotService:
                     if batch is not None and collection_jobs is not None:
                         collection_jobs[image_id] = CollectionJob(namespace, row["user_id"], bot_id, row["message_id"], ref, send_message)
                 def working_search(query, arguments):
+                    thread_sources = (self.dialogue.context_ids(namespace, batch.thread_id,
+                        max(workspace.source_ids, default=0) + 1, query)
+                        if batch is not None and batch.thread_id else None)
                     return self.working_memory.snapshot(namespace, before_id=max(workspace.source_ids, default=0) + 1,
-                        query=query, roots=[e.reply_to for e in batch.entries if e.reply_to] if batch else [], bot_id=bot_id)
+                        query=query, roots=[e.reply_to for e in batch.entries if e.reply_to] if batch else [],
+                        bot_id=bot_id, source_ids=thread_sources)
                 async def working_consolidate():
                     return await self.working_memory.archive(namespace, max(workspace.source_ids, default=0) + 1)
                 register_memory_tools(registry, self.memory_capture, namespace, user_id, source_rows,

@@ -2,7 +2,7 @@
 
 ## 存储与边界
 
-- Working：默认最近80条结构化聊天原文，不做短期摘要；当前请求单独注入，保留多人身份、引用、图片资料，受24000字符预算约束。30分钟TTL只控制内存缓存，原文窗口可从SQLite恢复，不因单次finish清空；任务证据/查询缓存仍由`TaskEvidence`维护。详见[对话工作记忆](working-memory.md)。
+- Working：保留真实原文，不做短期摘要；群聊默认投影当前thread最近12条及必要旧证据，私聊/关闭thread使用80条窗口，受24000字符预算约束。30分钟TTL只控制内存缓存，原文可从SQLite恢复，不因单次finish清空；任务证据/查询缓存仍由`TaskEvidence`维护。详见[对话工作记忆](working-memory.md)及[会话解析](dialogue-threads.md)。
 - Event：SQLite `memory_records.layer='event'`，通过`memory_events`视图查看。event/episode/commitment保留参与来源、原话摘录、发生/记录时间、版本、有效期、陈述归属；共同经历/约定需要真实双方发言和群内回应关系，约定不是工具成功证明。
 - Abstract：`memory_records.layer='abstract'`与`memory_concepts`视图。profile/preference/relationship/explicit等子类型；group_meme保存条件、别名、含义、支持事件。明确解释或至少三个已提供事件支持可生效，其余为candidate，不自动注入。计数及模型自报置信度均不等于客观正确。
 - Perceptual：`image_cache_blobs/refs`仍是图片资源权威记录，文件在`/app/data/image_cache`按SHA-256去重。概要以`memory_records.layer='perceptual'`建立可检索引用，不把概要当发图人的发言/经历。只实现图片，未实现音频、视频或视觉embedding。
