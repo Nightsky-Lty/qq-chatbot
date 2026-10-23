@@ -211,7 +211,8 @@ class GroupConversations:
                             group_id, len(fresh), batch.direct, batch.random_trigger, active)
                 outcome = await self.runner(group_id, batch, state.sender)
                 now = time.monotonic()
-                state.next_run_at = now + self.settings.ai_cooldown_seconds
+                if outcome is None or outcome.retry_after <= 0:
+                    state.next_run_at = now + self.settings.ai_cooldown_seconds
                 if outcome is not None and not outcome.error and outcome.wait_for_messages:
                     # 沉默不续期；普通跟进不能跨过超时重新开启，明确唤醒可以。
                     still_active = state.active(now)
@@ -222,7 +223,8 @@ class GroupConversations:
                         state.idle_until = now + self.settings.chat_active_idle_seconds
                 else:
                     state.stop_followup()
-                if outcome is not None and not outcome.error and outcome.retry_after > 0 and state.active(now):
+                if (outcome is not None and not outcome.error and outcome.retry_after > 0
+                        and (state.active(now) or batch.wakes_followup)):
                     # 解析限流只推迟当前新消息，不丢弃，也不轮询回复模型。
                     pending_ids = {entry.storage_id for entry in state.pending}
                     deferred = [entry for entry in fresh if entry.storage_id not in pending_ids]

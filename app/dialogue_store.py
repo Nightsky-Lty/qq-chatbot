@@ -21,6 +21,14 @@ CREATE TABLE IF NOT EXISTS dialogue_assignments (
     invited INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_dialogue_assignments_thread ON dialogue_assignments(thread_id,source_id);
+CREATE INDEX IF NOT EXISTS idx_messages_group_source ON messages(group_id,id);
+CREATE TABLE IF NOT EXISTS dialogue_parse_state (
+    source_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0,
+    retry_at REAL NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS dialogue_attention (
     group_id INTEGER PRIMARY KEY,
     active_thread_id INTEGER REFERENCES dialogue_threads(id) ON DELETE SET NULL,
@@ -36,6 +44,43 @@ class ThreadStore:
         self.db = db
         with db._lock:
             db.connection.executescript(SCHEMA)
+            # 兼容已有归属；暂定关系不能冒充已经完成语义分类。
+            db.connection.execute('''INSERT OR IGNORE INTO dialogue_parse_state(source_id,status)
+                SELECT source_id,CASE WHEN method='uncertain' THEN 'uncertain' ELSE 'resolved' END
+                FROM dialogue_assignments WHERE method IN ('explicit','bot','llm','uncertain')''')
+            db.connection.commit()
+
+    def states(self, group_id, ids):
+        ids = list(self.valid(group_id, ids))
+        if not ids:
+            return {}
+        with self.db._lock:
+            rows = self.db.connection.execute(
+                f"SELECT * FROM dialogue_parse_state WHERE source_id IN ({','.join('?' for _ in ids)})", ids)
+            return {r['source_id']: dict(r) for r in rows}
+
+    def mark(self, group_id, ids, status, *, retry_at=0, attempt=False):
+        ids = list(self.valid(group_id, ids))
+        with self.db._lock, self.db.connection:
+            self.db.connection.executemany('''INSERT INTO dialogue_parse_state(source_id,status,attempts,updated_at,retry_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET status=excluded.status,
+                attempts=attempts+excluded.attempts,updated_at=excluded.updated_at,retry_at=excluded.retry_at''',
+                [(i, status, int(attempt), time.time(), retry_at) for i in ids])
+
+    def classified_before(self, group_id, upper, lower=0):
+        with self.db._lock:
+            return not self.db.connection.execute('''SELECT 1 FROM messages m
+                LEFT JOIN dialogue_parse_state p ON p.source_id=m.id
+                WHERE m.group_id=? AND m.id>=? AND m.id<? AND (p.status IS NULL OR p.status NOT IN ('resolved','uncertain')) LIMIT 1''',
+                (group_id, lower, upper)).fetchone()
+
+    def unclassified_before(self, group_id, upper):
+        with self.db._lock:
+            row = self.db.connection.execute('''SELECT m.id FROM messages m
+                LEFT JOIN dialogue_parse_state p ON p.source_id=m.id
+                WHERE m.group_id=? AND m.id<? AND (p.status IS NULL OR p.status NOT IN ('resolved','uncertain'))
+                ORDER BY m.id DESC LIMIT 1''', (group_id, upper)).fetchone()
+        return row[0] if row else None
 
     def valid(self, group_id: int, ids) -> dict[int, dict]:
         blocked = self.db.memories.blocked_sources(group_id)
@@ -56,6 +101,15 @@ class ThreadStore:
             result.extend(valid[i] for i in ids if i in valid)
             upper = ids[-1]
         return sorted(result[:limit], key=lambda r: r['id'])
+
+    def window(self, group_id, upper, limit):
+        """物理扫描也限量；遗忘/不可用记录不导致无限补足窗口。"""
+        with self.db._lock:
+            ids = [r[0] for r in self.db.connection.execute(
+                'SELECT id FROM messages WHERE group_id=? AND id<? ORDER BY id DESC LIMIT ?',
+                (group_id, upper, limit))]
+        valid = self.valid(group_id, ids)
+        return [valid[i] for i in reversed(ids) if i in valid], min(ids) if ids else None
 
     def assignment(self, group_id: int, source_id: int) -> dict | None:
         if source_id not in self.valid(group_id, [source_id]):
@@ -87,6 +141,13 @@ class ThreadStore:
                    method=excluded.method,relation=excluded.relation,
                    invited=max(invited,excluded.invited)''',
                 (source_id, thread_id, parent, method, relation, int(invited)))
+        if method in {'llm', 'bot', 'explicit', 'uncertain'}:
+            status = 'uncertain' if method == 'uncertain' else 'resolved'
+            if method == 'explicit' and parent:
+                state = self.states(group_id, [parent]).get(parent, {})
+                if state.get('status') not in {'resolved', 'uncertain'}:
+                    status = 'pending'
+            self.mark(group_id, [source_id], status)
         return thread_id
 
     def invite(self, group_id: int, source_id: int) -> None:

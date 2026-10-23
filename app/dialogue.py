@@ -7,7 +7,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
-from app.conversation import GroupBatch
+from app.conversation import GroupBatch, GroupMessage
 from app.dialogue_store import ThreadStore
 from app.embeddings import tokens
 
@@ -22,6 +22,7 @@ current_sources是本批新消息，优先判断这些消息；省略主语的�
 只能输出JSON：{"assignments":[{"source_id":整数,"thread":整数或"new:来源ID"或null,"parent":整数或null,"relation":"answer|question|correction|supplement|continuation|new","certain":布尔值}]}。
 source_id只能来自待解析消息。已有thread只能来自候选会话；新交流用new:ID，其中ID必须是这段交流最早的一条待解析消息ID，且该锚点也必须在输出中归入同一个new:ID。
 parent只能指向已提供、比本消息更早的来源ID，不能引用未来消息。可以只输出有把握的部分；模糊短句不强行归属，thread=null且certain=false。
+历史模式允许参考该历史块之后、当前任务之前的已知锚点，但parent仍必须早于本消息。仅在有交流连续性证据时连接已有thread，不能只因谈论同一主题就合并独立往事。
 不要输出回复、摘要、推理、额外字段或Markdown。不决定机器人是否参与，不提出工具调用。
 """
 
@@ -44,6 +45,12 @@ class DialogueService:
         self.settings, self.db, self.llm = settings, db, llm
         self.store = ThreadStore(db)
         self._calls: dict[int, deque] = defaultdict(deque)
+        self._locks = defaultdict(asyncio.Lock)
+        self._slots = asyncio.Semaphore(settings.thread_parse_concurrency)
+        self._pending = defaultdict(list)
+        self._workers = {}
+        self._signals = defaultdict(asyncio.Event)
+        self.is_active = lambda group: False
 
     @property
     def enabled(self):
@@ -52,9 +59,10 @@ class DialogueService:
     def observe(self, namespace: int, source_id: int):
         """消息提交回调；同步轻量规则，不启动模型/计时任务。"""
         if self.enabled and namespace > 0:
-            self._ensure(namespace, source_id)
+            self.store.mark(namespace, [source_id], 'pending')
+            self._ensure(namespace, source_id, provisional=False)
 
-    def _ensure(self, group_id: int, source_id: int, depth=0):
+    def _ensure(self, group_id: int, source_id: int, depth=0, *, provisional=True):
         assigned = self.store.assignment(group_id, source_id)
         if assigned:
             return assigned
@@ -63,10 +71,11 @@ class DialogueService:
             return None
         if row['content'].lstrip().startswith('/') and not row['content'].startswith(
                 (self.settings.chat_prefix, self.settings.evaluate_prefix)):
+            self.store.mark(group_id, [source_id], 'resolved')
             return None
         parent = self.db.group_context_message(group_id, row.get('reply_to_message_id', ''))
         parent = parent if parent and parent['id'] < source_id and parent['id'] in self.store.valid(group_id, [parent['id']]) else None
-        target = self._ensure(group_id, parent['id'], depth + 1) if parent else None
+        target = self._ensure(group_id, parent['id'], depth + 1, provisional=provisional) if parent else None
         switching = any(word in row['content'] for word in SWITCH_WORDS)
         if target and (row['role'] == 'assistant' or not switching):
             self.store.assign(group_id, source_id, target['thread_id'], parent=parent['id'],
@@ -74,6 +83,10 @@ class DialogueService:
                               relation='continuation')
         elif row['role'] == 'assistant':
             # 召集/后台公告不是当前聊天Agent的发言，不根据当前焦点强行归属。
+            if not provisional:
+                return None
+            self.store.assign(group_id, source_id, method='provisional', relation='new')
+        elif not provisional:
             return None
         else:
             recent = self.store.recent(group_id, source_id - 1, 1)
@@ -132,86 +145,179 @@ class DialogueService:
                 'mentions': json.loads(row.get('mentions_json', '[]')),
                 'quote': row.get('reply_to_message_id', '')}
 
-    async def _parse(self, group_id, batch, boundary):
-        attention = self.store.attention(group_id)
-        now = time.time()
-        calls = self._calls[group_id]
-        while calls and calls[0] < now - 60:
-            calls.popleft()
-        if attention['parsed_boundary'] >= boundary:
+    def enqueue(self, group_id, entry):
+        if not self.enabled:
             return
-        # 本批尚未解析的临时thread不能作为自己的历史候选。
-        candidates = self._candidate_rows(group_id, batch, min(e.storage_id for e in batch.entries) - 1)
-        # 优先本批，再补有限的近期未定消息；不扫描/补解析全部历史积压。
-        recent = self.store.recent(group_id, min(e.storage_id for e in batch.entries) - 1, 12)
+        self._ensure(group_id, entry.storage_id)
+        queue = self._pending[group_id]
+        if any(e.storage_id == entry.storage_id for e in queue):
+            return
+        if len(queue) >= self.settings.chat_batch_max_messages * 4:
+            logger.warning('Thread queue full: group=%s', group_id)
+            return
+        queue.append(entry)
+        if len(queue) >= self.settings.thread_parse_batch_messages:
+            self._signals[group_id].set()
+        if group_id not in self._workers or self._workers[group_id].done():
+            self._workers[group_id] = asyncio.create_task(self._work(group_id), name=f'thread-parser-{group_id}')
+
+    async def _work(self, group_id):
+        try:
+            while self._pending[group_id] and self.is_active(group_id):
+                queue = self._pending[group_id]
+                signal = self._signals[group_id]
+                signal.clear()
+                delay = max(0, queue[0].received_at + self.settings.thread_parse_batch_seconds - time.monotonic())
+                if len(queue) < self.settings.thread_parse_batch_messages and delay:
+                    try:
+                        await asyncio.wait_for(signal.wait(), delay)
+                    except TimeoutError:
+                        pass
+                if not self.is_active(group_id):
+                    break
+                entries = queue[:self.settings.thread_parse_batch_messages]
+                del queue[:len(entries)]
+                async with self._locks[group_id]:
+                    retry = await self._parse(group_id, GroupBatch(entries), max(e.storage_id for e in entries))
+                if retry and self.is_active(group_id):
+                    queue[:0] = entries
+                    await asyncio.sleep(min(retry, 60))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning('Thread worker failed: group=%s error=%s', group_id, type(exc).__name__)
+        finally:
+            self._pending.pop(group_id, None)
+            self._workers.pop(group_id, None)
+            self._signals.pop(group_id, None)
+
+    async def cancel(self, group_id=None):
+        keys = [group_id] if group_id is not None else list(self._workers)
+        tasks = []
+        for group in keys:
+            task = self._workers.get(group)
+            if task is not None:
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def prepare(self, group_id, batch):
+        # 不占用回复Agent名额；后台解析与这里共享同群锁，状态持久化去重。
+        async with self._locks[group_id]:
+            return await self._parse(group_id, batch, max(e.storage_id for e in batch.entries))
+
+    async def classify_history(self, group_id, rows, thread_id, boundary, bot_id):
+        entries = [GroupMessage(r['id'], r.get('message_id', ''), r['user_id'],
+                    r.get('nickname', ''), r['content'], bot_id) for r in rows]
+        async with self._locks[group_id]:
+            return await self._parse(group_id, GroupBatch(entries), max(r['id'] for r in rows),
+                                     historical=True, history_thread=thread_id, evidence_boundary=boundary - 1)
+
+    async def _parse(self, group_id, batch, boundary, *, historical=False, history_thread=None, evidence_boundary=None):
+        now = time.time()
+        evidence_boundary = boundary if evidence_boundary is None else evidence_boundary
         incoming = self.store.valid(group_id, [e.storage_id for e in batch.entries])
+        incoming_states = self.store.states(group_id, incoming)
+        if incoming and all(incoming_states.get(i, {}).get('status') in {'resolved', 'uncertain'} for i in incoming):
+            return
+        # 首次唤醒补有限的邻近前文；活跃批次不反复解析已完成的历史。
+        recent = self.store.recent(group_id, min(incoming, default=boundary) - 1, 12) if not historical else []
         pool = {r['id']: r for r in recent}
         pool.update(incoming)
+        states = self.store.states(group_id, pool)
         targets = []
         for source in sorted(pool, key=lambda i: (i in incoming, i), reverse=True):
-            assigned = self._ensure(group_id, source)
-            if not assigned or assigned['method'] not in {'provisional', 'rule', 'uncertain'}:
+            self._ensure(group_id, source)
+            state = self.store.states(group_id, [source]).get(source, states.get(source, {}))
+            if state.get('status') in {'resolved', 'uncertain'}:
                 continue
-            # 已参与回复的线程不回写旧归属，避免改写真实互动的依据。
+            if state.get('status') == 'failed' and (state.get('retry_at', 0) > now or state.get('attempts', 0) >= 3):
+                continue
+            assigned = self.store.assignment(group_id, source)
+            if not assigned or assigned['method'] not in {'provisional', 'rule', 'uncertain', 'explicit'}:
+                continue
             if any(r['role'] == 'assistant' and r['id'] > source
-                   for r in self.store.rows(group_id, assigned['thread_id'], boundary, 80)):
+                   for r in self.store.rows(group_id, assigned['thread_id'], evidence_boundary, 80)):
+                self.store.mark(group_id, [source], 'resolved')
                 continue
             targets.append(pool[source])
             if len(targets) >= self.settings.thread_parse_max_messages:
                 break
-        if not targets or (not candidates and len(targets) == 1):
+        if not targets:
             return
-        if all((self.store.assignment(group_id, i) or {}).get('method') in {'explicit', 'llm', 'bot'} for i in incoming):
-            return
-        retry_after = max(0, attention['last_parse_at'] + self.settings.thread_parse_min_interval_seconds - now,
-                          calls[0] + 60 - now if len(calls) >= self.settings.thread_parse_calls_per_minute else 0)
-        if retry_after:
-            return retry_after
+        first_pending = min((r['id'] for r in targets if r['id'] in incoming), default=min(incoming, default=boundary))
+        candidates = self._candidate_rows(group_id, batch, first_pending - 1)
+        if history_thread is not None:
+            rows = self.store.rows(group_id, history_thread, evidence_boundary, 6)
+            anchor = self.store.anchor(group_id, history_thread, evidence_boundary)
+            if anchor:
+                rows = sorted({r['id']: r for r in [anchor, *rows]}.values(), key=lambda r: r['id'])
+            candidates = [(history_thread, rows), *[(t, rs) for t, rs in candidates if t != history_thread]][:self.settings.thread_candidate_limit]
+            present = {t for t, _ in candidates}
+            for source in incoming:
+                assigned = self.store.assignment(group_id, source)
+                if (assigned and assigned['thread_id'] not in present
+                        and len(candidates) < self.settings.thread_candidate_limit):
+                    thread = assigned['thread_id']
+                    if self.store.states(group_id, [source]).get(source, {}).get('status') == 'resolved':
+                        candidates.append((thread, self.store.rows(group_id, thread, evidence_boundary, 6)))
+                        present.add(thread)
         target_ids = {r['id'] for r in targets}
-        # 原文可以在一个位置出现一次，其他地方只连接来源ID。
         source_rows = {r['id']: r for _, rows in candidates for r in rows}
+        if historical:
+            source_rows.update(incoming)
         source_rows.update({r['id']: r for r in targets})
-        if len(source_rows) == 1:
-            return
-        data = {'active_thread': attention['active_thread_id'], 'bot_id': batch.focus.self_id,
+        data = {'active_thread': history_thread if historical else self.store.attention(group_id)['active_thread_id'],
+                'mode': 'historical' if historical else 'live', 'bot_id': batch.entries[-1].self_id,
                 'wake_sources': [e.storage_id for e in batch.entries if e.direct],
                 'current_sources': sorted(set(incoming) & target_ids), 'targets': sorted(target_ids),
                 'threads': [{'thread': t, 'sources': [r['id'] for r in rows],
                              'waiting_source': (self.store.state(group_id, t) or {}).get('waiting_source_id')}
                             for t, rows in candidates],
                 'messages': [self._public(source_rows[i]) for i in sorted(source_rows)]}
-        # 超限先缩短原文，再移除历史待定项/低排名候选，绝不发送无界输入。
         while len(json.dumps(data, ensure_ascii=False, separators=(',', ':'))) > self.settings.thread_parse_max_chars:
             longest = max(data['messages'], key=lambda r: len(r['text']), default=None)
             if longest and len(longest['text']) > 100:
                 longest['text'] = longest['text'][:max(100, len(longest['text']) // 2)]
                 longest['truncated'] = True
+                continue
+            if len(data['threads']) > 1:
+                data['threads'].pop()
+            elif len(data['targets']) > 1:
+                data['targets'].pop(0)
             else:
-                removable = next((i for i in data['targets'] if i not in incoming), None)
-                if removable is not None:
-                    data['targets'].remove(removable)
-                elif data['threads']:
-                    data['threads'].pop()
-                else:
-                    logger.info('Thread parse skipped: group=%s reason=input_budget', group_id)
-                    return
-                keep = set(data['targets']) | {i for t in data['threads'] for i in t['sources']}
-                data['messages'] = [r for r in data['messages'] if r['source_id'] in keep]
+                return
+            keep = set(data['targets']) | {i for t in data['threads'] for i in t['sources']}
+            data['messages'] = [r for r in data['messages'] if r['source_id'] in keep]
+            data['current_sources'] = sorted(set(data['current_sources']) & set(data['targets']))
         allowed_sources = {r['source_id'] for r in data['messages']}
         allowed_threads = {t['thread'] for t in data['threads']}
-        calls.append(now)
-        self.store.parsed(group_id, boundary)
-        try:
-            async with asyncio.timeout(self.settings.thread_parse_timeout_seconds):
-                result = await self.llm.parse_dialogue(PARSER_INSTRUCTIONS, data)
-            self._apply(group_id, result['result'], set(data['targets']), allowed_sources, allowed_threads)
-            usage = result.get('usage', {})
-            logger.info('Thread parsed: group=%s targets=%s candidates=%s prompt_tokens=%s completion_tokens=%s',
-                        group_id, len(data['targets']), len(allowed_threads), usage.get('prompt_tokens'), usage.get('completion_tokens'))
-        except (asyncio.CancelledError,):
-            raise
-        except Exception as exc:
-            logger.warning('Thread parse fallback: group=%s error=%s', group_id, type(exc).__name__)
+        async with self._slots:
+            # 在拿到全局名额后重新检查同群频率，后台与历史查询共用额度。
+            now = time.time()
+            attention = self.store.attention(group_id)
+            calls = self._calls[group_id]
+            while calls and calls[0] <= now - 60:
+                calls.popleft()
+            retry = max(0, attention['last_parse_at'] + self.settings.thread_parse_min_interval_seconds - now,
+                        calls[0] + 60 - now if len(calls) >= self.settings.thread_parse_calls_per_minute else 0)
+            if retry:
+                return retry
+            calls.append(now)
+            self.store.parsed(group_id, boundary)
+            self.store.mark(group_id, data['targets'], 'failed', retry_at=now + 30, attempt=True)
+            try:
+                async with asyncio.timeout(self.settings.thread_parse_timeout_seconds):
+                    result = await self.llm.parse_dialogue(PARSER_INSTRUCTIONS, data)
+                self._apply(group_id, result['result'], set(data['targets']), allowed_sources, allowed_threads)
+                usage = result.get('usage', {})
+                logger.info('Thread parsed: group=%s mode=%s targets=%s candidates=%s prompt_tokens=%s completion_tokens=%s',
+                            group_id, data['mode'], len(data['targets']), len(allowed_threads), usage.get('prompt_tokens'), usage.get('completion_tokens'))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('Thread parse fallback: group=%s error=%s', group_id, type(exc).__name__)
 
     def _apply(self, group_id, value, targets, sources, threads):
         if set(self.store.valid(group_id, sources)) != sources:
@@ -248,7 +354,7 @@ class DialogueService:
         created = {}
         for source, item in sorted(checked.items()):
             previous = self.store.assignment(group_id, source)
-            if not previous or previous['method'] not in {'provisional', 'rule', 'uncertain'}:
+            if not previous or previous['method'] not in {'provisional', 'rule', 'uncertain', 'explicit'}:
                 continue
             if not item['certain'] or item['thread'] is None:
                 rows = self.store.rows(group_id, previous['thread_id'], max(sources), 2)
@@ -263,6 +369,11 @@ class DialogueService:
                 thread = created[thread]
             self.store.assign(group_id, source, thread, parent=item['parent'], method='llm',
                               relation=item['relation'], invited=previous['invited'])
+        for source in targets - checked.keys():
+            previous = self.store.assignment(group_id, source)
+            if previous:
+                self.store.assign(group_id, source, method='uncertain', invited=previous['invited'])
+        self.store.mark(group_id, targets - {i for i, item in checked.items() if item['certain'] and item['thread'] is not None}, 'uncertain')
         # 根的暂定归属被修正时，同步未参与回复的显式引用后继，保留真实引用连接。
         for source in sorted(sources):
             assigned = self.store.assignment(group_id, source)
@@ -277,9 +388,6 @@ class DialogueService:
         """在群串行锁内执行；只返回一个thread，不产生历史问题的补答队列。"""
         boundary = max(e.storage_id for e in batch.entries)
         self.store.prune(group_id)
-        # 首次唤醒只初始化最近原文的关系索引，不必完整语义划分80条。
-        for row in self.store.recent(group_id, boundary, self.settings.context_message_limit):
-            self._ensure(group_id, row['id'])
         for entry in batch.entries:
             self._ensure(group_id, entry.storage_id)
             if entry.direct:
@@ -292,11 +400,13 @@ class DialogueService:
                 active_rows and time.time() - active_rows[-1]['created_at'] > self.settings.thread_dormant_seconds):
             active = None
             self.store.activate(group_id, None)
-        participants = {r['user_id'] for r in active_rows if r['role'] in {'user', 'notice'}}
-        # 只有明确唤醒，或当前交流参与者的可回复新话，才值得语义消歧。
-        relevant = batch.wakes_followup or any(e.eligible and e.user_id in participants for e in batch.entries)
-        retry_after = (await self._parse(group_id, batch, boundary) or 0) if relevant else 0
+        retry_after = await self.prepare(group_id, batch) or 0
         assignments = {e.storage_id: self.store.assignment(group_id, e.storage_id) for e in batch.entries}
+        states = self.store.states(group_id, assignments)
+        if retry_after and any((e.direct or e.eligible) and states.get(e.storage_id, {}).get('status')
+                               not in {'resolved', 'uncertain'} for e in batch.entries):
+            logger.info('Thread deferred: group=%s retry_after=%.2f messages=%s', group_id, retry_after, len(batch.entries))
+            return ThreadDeferral(retry_after)
         grouped = defaultdict(list)
         for entry in batch.entries:
             assigned = assignments[entry.storage_id]
@@ -327,12 +437,6 @@ class DialogueService:
                     chosen = thread
                     break
         if chosen is None:
-            if retry_after and active is not None and any(
-                    e.eligible and e.user_id in participants and assignments[e.storage_id]
-                    and assignments[e.storage_id]['method'] in {'provisional', 'rule', 'uncertain'}
-                    for e in batch.entries):
-                logger.info('Thread deferred: group=%s retry_after=%.2f messages=%s', group_id, retry_after, len(batch.entries))
-                return ThreadDeferral(retry_after)
             logger.info('Thread attention: group=%s active=%s action=wait', group_id, active)
             return None
         entries = [e for e in grouped[chosen] if e.direct or assignments[e.storage_id]['method'] != 'uncertain']
@@ -382,14 +486,15 @@ class DialogueService:
         self.store.finish(group_id, thread_id, waiting=bool(outcome and not outcome.error and outcome.wait_for_messages))
         if not outcome or outcome.error or not outcome.wait_for_messages:
             self.store.activate(group_id, None)
+            worker = self._workers.get(group_id)
+            if worker is not None:
+                worker.cancel()
 
     def release(self, group_id=None):
         if group_id is not None:
             self.store.activate(group_id, None)
-            self._calls.pop(group_id, None)
         else:
             with self.db._lock:
                 groups = [r[0] for r in self.db.connection.execute('SELECT group_id FROM dialogue_attention')]
             for group in groups:
                 self.store.activate(group, None)
-            self._calls.clear()

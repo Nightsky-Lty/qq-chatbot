@@ -29,7 +29,7 @@
 
 ## ReAct Agent架构
 
-群聊路径为：OneBot事件 → 原文入库/轻量归属 → GroupConversations聚批/排队 → DialogueService按需解析/选择唯一thread → BotService绑定该thread任务 → ReactAgent决策 → ToolRegistry执行工具 → 将回执/图片作为观察交回模型 → 再决策，直到 `wait_for_messages` 或 `finish`。前者保留当前交流焦点，后者退出跟进；其他thread只维护状态，不并发启动回复。详见[会话解析业务层](docs/dialogue-threads.md)。这是ReAct风格的函数调用Agent，不是前端React框架；决策、动作和环境观察交替，思路见[ReAct论文](https://arxiv.org/abs/2210.03629)。
+群聊路径为：OneBot事件 → 原文入库/解析状态登记 → 活跃消息独立短聚批解析 → GroupConversations排队/DialogueService选择唯一thread → BotService绑定该thread任务 → ReactAgent决策 → ToolRegistry执行工具 → 将回执/图片作为观察交回模型 → 再决策，直到 `wait_for_messages` 或 `finish`。前者保留当前交流焦点，后者退出跟进；其他thread只维护状态，不并发启动回复。详见[会话解析业务层](docs/dialogue-threads.md)。这是ReAct风格的函数调用Agent，不是前端React框架；决策、动作和环境观察交替，思路见[ReAct论文](https://arxiv.org/abs/2210.03629)。
 
 | 模块 | 职责 |
 | --- | --- |
@@ -106,11 +106,11 @@ Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结
 
 聊天、锐评和模仿在后台执行，不阻塞消息接收、名单管理或关键词召集。群话题每群一个运行，运行期间的新消息排入下一批；最多32个等待/活跃群、每批最多30条等待消息，等待超过120秒的明确提问提示重新@。群话题、私聊和模仿共用默认3个并发模型运行；群话题在冷却/名额不足时等待，私聊和模仿保留已有的冷却/忙碌提示。断线、关闭服务或群内删除数据时取消相关话题及本地排队任务，不保证撤销提供商已处理的请求或费用。
 
-群聊默认启用thread业务层，80条是近期候选窗口，回复上下文按当前thread最近12条加发起消息、待回答问题、相关纠正和必要祖先组装，其他交流最多3条旁听参考。归属持久化，滑出80条不删除thread；显式引用仍可找回更早的可访问来源。私聊和`THREAD_ENABLED=false`继续使用最近80条原文。当前消息单独放入任务，下一批不能提前进入本轮；默认短期预算24000字符，必要时标记截断。详见[会话解析](docs/dialogue-threads.md)和[对话工作记忆](docs/working-memory.md)。
+群聊默认启用thread业务层，回复上下文按当前thread最近12条加发起消息、待回答问题、相关纠正和必要祖先组装，其他交流最多3条旁听参考。归属持久化，离开近期候选不删除thread；显式引用仍可找回更早的可访问来源。私聊和`THREAD_ENABLED=false`继续使用最近80条原文。当前消息单独放入任务，下一批不能提前进入本轮；默认短期预算24000字符，必要时标记截断。详见[会话解析](docs/dialogue-threads.md)和[对话工作记忆](docs/working-memory.md)。
 
-消息归属先用引用/@与连续补充规则，必要时调用独立无工具解析LLM；普通旁听、无新消息、已知引用不持续解析。默认同群解析至少间隔15秒、每分钟最多3次、15秒超时，失败保守降级。配置`THREAD_LLM_MODEL/BASE_URL/THINKING_ENABLED`与可选`THREAD_LLM_API_KEY`，留空继承聊天连接，默认不思考。短期摘要仍不启用，长期记忆流程独立；新增解析与裁剪后的输入需合计评估费用。关闭`THREAD_ENABLED`可恢复原有群上下文路径；同时关闭`WORKING_MEMORY_ENABLED`才使用旧历史组装。30分钟工作记忆TTL只淘汰内存缓存，原话保留/遗忘边界不变。
+非活跃群消息只保存原文和未解析状态，有确定引用时登记关系，不逐条创建临时thread。活跃期间，包括回复生成和等待跟进，新群消息进入独立解析队列，默认1秒聚批、满20条提交；同群串行，全局解析并发2，最短间隔1秒、每分钟最多60次，15秒超时。回复仍只参与一个thread，8秒回复冷却独立控制。解析状态存入`bot.db`，确定、不确定、失败与未处理分别记录；没有待处理消息不请求解析模型。`THREAD_LLM_MODEL/BASE_URL/THINKING_ENABLED`与可选`THREAD_LLM_API_KEY`控制独立连接，默认继承聊天连接且关闭思考。长期记忆流程独立。
 
-群Agent可用`read_thread_history({})`按需向前翻阅当前thread原文，默认10条、最多20条；继续读取时传回`next_before_source_id`作为`before_source_id`。默认每轮最多3次，每页12000字符、合计24000字符，返回完整消息，受预算限制可能少于请求条数。仅查询已划入当前thread、当前批次之前且仍可访问的记录，不额外调用解析模型、不跨thread，也不扩大旧消息的操作授权。详见[主动历史回查](docs/dialogue-threads.md#agent主动向前翻阅原文)。
+群Agent使用`read_thread_history({})`向前读当前thread原文，默认10条、最多20条，续读把`next_cursor`传入`cursor`。已分类区间直接查询，未分类历史按最多50条一块补解析，每次最多2块/2次解析/15秒；解析结果跨查询和重启复用。空页也可能有续读游标，`has_more=null`表示尚不能确认读完；遇到失败或预算不足不跳过空洞。每轮最多3次工具调用，每页12000字符、合计24000字符；原文不截断，群/thread/遗忘与本批时间边界均由程序核验。历史补解析会产生解析API费用，不扩大历史消息的操作授权。详见[历史回查](docs/dialogue-threads.md#agent主动向前翻阅原文)。
 
 当前thread原文通过`read_thread_history`回查。`memory_search`检索长期记忆，支持`all/event/abstract/perceptual`、人物/时间过滤、来源摘录和原话检索兜底；长期记忆还提供新增、更新、删除、遗忘和短期转长期整合接口。私聊上下文自动注入近期原文。
 

@@ -156,6 +156,10 @@ class BotService:
         self._status_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
         self._pending_status_users: set[AIKey] = set()
         self.conversations = GroupConversations(settings, self._run_group_batch)
+        def parser_active(group_id):
+            state = self.conversations.states.get(group_id)
+            return bool(state and (state.active(time.monotonic()) or (state.worker and not state.worker.done())))
+        self.dialogue.is_active = parser_active
         self._closed = False
 
     async def cancel_pending(self, send_message: SendMessage | None = None, *, key: AIKey | None = None) -> None:
@@ -170,9 +174,11 @@ class BotService:
                       if send_message is None or state.sender == send_message]
             await self.conversations.cancel(sender=send_message)
             for group in groups:
+                await self.dialogue.cancel(group)
                 self.dialogue.release(group)
         elif key[0] in {"group", "auto", "image"}:
             await self.conversations.cancel(group_id=key[1])
+            await self.dialogue.cancel(key[1])
             self.dialogue.release(key[1])
         tasks = [
             task for task, (sender, task_key) in self._ai_tasks.items()
@@ -210,6 +216,7 @@ class BotService:
         """阻止接受新请求并取消所有后台任务，在关闭模型客户端前调用。"""
         self._closed = True
         await self.conversations.close()
+        await self.dialogue.cancel()
         await self.cancel_pending()
         await self.sticker_collector.close()
         await self.image_cache.close()
@@ -441,6 +448,8 @@ class BotService:
 
     async def _queue_group(self, group_id: int, entry: GroupMessage, sender: SendGroup) -> None:
         status = await self.conversations.submit(group_id, entry, sender)
+        if status == "accepted":
+            self.dialogue.enqueue(group_id, entry)
         if status == "full" and entry.direct:
             await self._send_text(sender, group_id, "现在排队的消息有点多，请稍后再@我。")
 
@@ -455,6 +464,23 @@ class BotService:
             if batch.direct:
                 await self._send_text(sender, group_id, "这次排队太久了，请重新@我。")
             return None
+        state = self.conversations.states.get(group_id)
+        if not batch.wakes_followup and (state is None or not state.active(time.monotonic())):
+            return None
+        selection = None
+        if self.dialogue.enabled:
+            if state is None or not state.active(time.monotonic()):
+                self.dialogue.release(group_id)
+            selection = await self.dialogue.select(group_id, batch)
+            if isinstance(selection, ThreadDeferral):
+                return AgentOutcome(0, 0, 0, wait_for_messages=True, retry_after=selection.retry_after)
+            if selection is None:
+                # 旁听/待切换不调用回复模型，也不把沉默当成退出当前交流。
+                return AgentOutcome(0, 0, 0, wait_for_messages=True)
+            batch = selection.batch
+        remaining = self.settings.chat_queue_wait_seconds - (time.monotonic() - batch.entries[0].received_at)
+        if remaining <= 0:
+            return None
         try:
             await asyncio.wait_for(self._ai_slots.acquire(), timeout=max(0.01, remaining))
         except TimeoutError:
@@ -462,20 +488,6 @@ class BotService:
                 await self._send_text(sender, group_id, "这次排队太久了，请重新@我。")
             return None
         try:
-            state = self.conversations.states.get(group_id)
-            if not batch.wakes_followup and (state is None or not state.active(time.monotonic())):
-                return None
-            selection = None
-            if self.dialogue.enabled:
-                if state is None or not state.active(time.monotonic()):
-                    self.dialogue.release(group_id)
-                selection = await self.dialogue.select(group_id, batch)
-                if isinstance(selection, ThreadDeferral):
-                    return AgentOutcome(0, 0, 0, wait_for_messages=True, retry_after=selection.retry_after)
-                if selection is None:
-                    # 旁听/待切换不调用回复模型，也不把沉默当成退出当前交流。
-                    return AgentOutcome(0, 0, 0, wait_for_messages=True)
-                batch = selection.batch
             focus = batch.focus
             boundary = selection.original_boundary if selection else max(entry.storage_id for entry in batch.entries)
             preferred = {entry.storage_id for entry in batch.entries}
@@ -1048,7 +1060,7 @@ class BotService:
                     visible_source_ids=[row['本地记录ID'] for row in context.working.get('近期往返', [])],
                     complete_source_ids=[row['本地记录ID'] for row in context.working.get('近期往返', [])
                                          if not row.get('原文已截断')],
-                    current_source_ids=[entry.storage_id for entry in batch.entries])
+                    current_source_ids=[entry.storage_id for entry in batch.entries], dialogue=self.dialogue)
                 registry.register(READ_THREAD_HISTORY_TOOL, thread_history.execute)
                 context.runtime['当前thread历史查询'] = thread_history.runtime()
             allowed_mentions = {qq: name for qq, name in allowed_mentions.items() if qq > 0 and qq != bot_id}
@@ -1062,6 +1074,7 @@ class BotService:
                     parent = next((entry for entry in batch.entries if reply_to and entry.message_id == reply_to), batch.focus)
                     self.dialogue.store.assign(context_id, source_id, batch.thread_id,
                                                parent=parent.storage_id, method='bot')
+                    self.dialogue.store.mark(context_id, [parent.storage_id], 'resolved')
             messages = MessageSession(
                 registry, self.db, send_message, context_id, private=private,
                 automatic=automatic, preserve_layout=preserve_layout,
