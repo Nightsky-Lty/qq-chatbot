@@ -1016,6 +1016,7 @@ class BotService:
         registry.allow_silent = automatic
         registry.batch_completion_enabled = self.settings.agent_batch_completion_enabled
         workspace = None
+        sticker_session = None
         injected_memories = list(recalled_memories or [])
         if self.settings.memory_enabled and not observe_only and (batch is not None or private):
             namespace = -user_id if private else context_id
@@ -1066,7 +1067,6 @@ class BotService:
             allowed_mentions = {qq: name for qq, name in allowed_mentions.items() if qq > 0 and qq != bot_id}
             preserve_layout = not private and (batch is not None or not automatic) and self._needs_multiline_layout(prompt)
             conversation = ("private", user_id) if private else ("group", context_id)
-            sticker_session = None
             sticker_context = {}
             def record_thread_reply(source_id: int, reply_to: str) -> None:
                 if self.dialogue.enabled and batch is not None and batch.thread_id is not None:
@@ -1131,6 +1131,10 @@ class BotService:
             async def finish(arguments: dict[str, Any]) -> dict[str, Any]:
                 if not automatic and not registry.output_attempted:
                     return {"ok": False, "error": "请先通过发送工具回应当前用户，再finish；不要只在内部口头回答。"}
+                if (sticker_session is not None and sticker_session.cadence_due
+                        and not sticker_session.cadence_decided and not sticker_session.sent
+                        and messages.count > 0 and not registry.delivery_uncertain):
+                    return {"ok": False, "error": "本轮已到表情间隔，请选贴切图片send_sticker再收尾；无合适候选或语境不宜时调用skip_scheduled_sticker说明原因。不要重复发送文字。"}
                 registry.wait_for_messages = False
                 return {"ok": True, "finished": True, "active": False}
             registry.register(FINISH_TOOL, finish, terminal=True)
@@ -1195,6 +1199,21 @@ class BotService:
 
             if self.settings.sticker_enabled and not observe_only and (system is None or private or automatic):
                 sticker_session = StickerSession(conversation)
+                cadence = self.stickers.reply_cadence(sticker_session)
+                if cadence:
+                    context.runtime["表情发送节奏"] = cadence
+                if sticker_session.cadence_due:
+                    async def skip_scheduled_sticker(arguments: dict[str, Any]) -> dict[str, Any]:
+                        if not arguments["reason"].strip():
+                            return {"ok": False, "error": "请说明本轮没有适合表情的原因。"}
+                        sticker_session.cadence_decided = True
+                        return {"ok": True, "skipped": True, "note": "本轮延后，下次实际回复时仍优先选图；不需要发送额外解释。"}
+                    registry.register({"type": "function", "function": {
+                        "name": "skip_scheduled_sticker", "description": "定期表情到点，但语境不适合或没有合适可用图片时延后；不向QQ发送内容。",
+                        "parameters": {"type": "object", "properties": {
+                            "reason": {"type": "string", "minLength": 1, "maxLength": 120}},
+                            "required": ["reason"], "additionalProperties": False},
+                    }}, skip_scheduled_sticker)
                 sticker_context = await self.stickers.context_catalog(
                     sticker_session, query=batch.focus.text if batch is not None else prompt[:80],
                 )
@@ -1214,6 +1233,7 @@ class BotService:
                     except ValueError as exc:
                         return {"ok": False, "error": str(exc)}
                     sticker_args = {key: value for key, value in arguments.items() if key != "reply_to_message_id"}
+                    sticker_session.cadence_decided = True
                     result = await self.stickers.execute_tool(sticker_session, name, sticker_args)
                     if result.get("ok") is not True:
                         return result
@@ -1300,6 +1320,8 @@ class BotService:
         except Exception:
             logger.exception("Background agent failed: scope=%s context=%s user=%s", scope, context_id, user_id)
         finally:
+            if sticker_session is not None:
+                self.stickers.finish_reply(sticker_session, replied=messages.count > 0)
             if workspace is not None:
                 try:
                     self.memory_capture.close_workspace(workspace)

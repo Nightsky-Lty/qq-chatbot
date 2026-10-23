@@ -107,6 +107,8 @@ STICKER_TOOLS = [
 
 
 STICKER_INSTRUCTIONS = """\n\n【本地表情包工具】
+运行环境若有“表情发送节奏”，按程序提供的轮数执行：到点且决定正常回应时，选一张贴切表情，通过send_sticker发送后再收尾；最后文字不要先携带next_action结束。没有贴切图片、严肃语境不适合或图库/冷却受限时，可调用本轮提供的skip_scheduled_sticker说明原因后正常收尾，下次实际回复再尝试。不得为了凑轮数打断安静监听。
+轮数只是定期提醒，不撤销你的自主选图和发送能力：用户要求或语境贴切时仍可提前调用send_sticker；成功发图后程序重新计数。关闭计数时完全按语境自主决定。
 本次提供 search_stickers、list_stickers 和 send_sticker，可在闲聊、害羞、开心、无语、晚安或接梗时选择合适的表情。
 如果工具列表还提供 get_sticker_image，可按需查看原图。查目录、看图和发送均自行判断，不需要每次都调用。
 接梗、害羞、无语、得意、认输、安慰和晚安时，积极考虑贴切表情，不要习惯性只发文字；不硬配、不刷屏。
@@ -136,6 +138,10 @@ class StickerSession:
     selected_id: str | None = None
     selected_image: dict[str, Any] | None = None
     selected_key: str | None = None
+    cadence_due: bool = False
+    cadence_decided: bool = False
+    sent: bool = False
+    round_recorded: bool = False
 
 
 class StickerService:
@@ -146,9 +152,33 @@ class StickerService:
         self._last_sent: dict[Conversation, float] = {}
         self._recent: dict[Conversation, dict[str, float]] = {}
         self._use_counts: dict[str, int] = {}
+        self._reply_rounds: dict[Conversation, tuple[int, int]] = {}
         self._send_lock = asyncio.Lock()
         # 索引任务在事件循环内替换快照，目录读取线程不修改此字典。
         self.annotations: dict[str, dict[str, Any]] = {}
+
+    def reply_cadence(self, session: StickerSession) -> dict[str, Any]:
+        if not self.settings.sticker_reply_cadence_enabled:
+            return {}
+        if session.conversation not in self._reply_rounds:
+            self._reply_rounds[session.conversation] = (0, self._next_reply_interval())
+        count, target = self._reply_rounds[session.conversation]
+        session.cadence_due = count + 1 >= target
+        return {"已回复轮数": count, "本次间隔轮数": target,
+                "本轮正常回应时应发表情": session.cadence_due,
+                "计数口径": "成功文字或语音回复算一轮；同轮多条算一轮，安静监听和单独戳一戳不计；成功发图重新计数"}
+
+    def _next_reply_interval(self) -> int:
+        return random.randint(self.settings.sticker_reply_min_rounds, self.settings.sticker_reply_max_rounds)
+
+    def finish_reply(self, session: StickerSession, *, replied: bool) -> None:
+        if session.round_recorded:
+            return
+        session.round_recorded = True
+        if not self.settings.sticker_reply_cadence_enabled or session.sent or not replied:
+            return
+        count, target = self._reply_rounds[session.conversation]
+        self._reply_rounds[session.conversation] = (count + 1, target)
 
     @property
     def auto_index_enabled(self) -> bool:
@@ -409,6 +439,9 @@ class StickerService:
             if self._blocked(session.conversation, session.selected_key):
                 return False
             await sender(target, [session.selected_image])
+            session.sent = True
+            if self.settings.sticker_reply_cadence_enabled:
+                self._reply_rounds[session.conversation] = (0, self._next_reply_interval())
             session.selected_image = None  # 即使关闭冷却，同一个请求也不能再次提交。
             now = monotonic()
             self._last_sent[session.conversation] = now

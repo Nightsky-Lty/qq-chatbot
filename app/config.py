@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -177,6 +177,9 @@ class Settings(BaseSettings):
     image_cache_context_limit: int = Field(default=12, ge=1, le=20)
     # 表情包仅从本地目录读取；每次回复最多一张，发送限制按群或私聊会话计算。
     sticker_enabled: bool = True
+    sticker_reply_cadence_enabled: bool = True
+    sticker_reply_min_rounds: int = Field(default=5, ge=1, le=1000)
+    sticker_reply_max_rounds: int = Field(default=7, ge=1, le=1000)
     sticker_vision_enabled: bool = True
     # 入库识别在独立后台任务中执行；关闭视觉时同时停用自动识别。
     sticker_auto_index_enabled: bool = True
@@ -206,6 +209,12 @@ class Settings(BaseSettings):
     style_sample_limit: int = 60
     # 保留期单位为天，过期消息在服务启动时清理；非正数表示不自动清理。
     message_retention_days: int = 30
+
+    @model_validator(mode="after")
+    def validate_sticker_reply_rounds(self):
+        if self.sticker_reply_max_rounds < self.sticker_reply_min_rounds:
+            raise ValueError("STICKER_REPLY_MAX_ROUNDS不能小于STICKER_REPLY_MIN_ROUNDS")
+        return self
 
     @field_validator("admin_qq_ids", mode="before")
     @classmethod
