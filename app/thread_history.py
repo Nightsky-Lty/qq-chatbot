@@ -20,7 +20,7 @@ READ_THREAD_HISTORY_TOOL = {"type": "function", "function": {
     "description": "按游标向前读取当前thread的原始聊天记录。首次可传{}，继续使用返回的next_before_source_id。只读取已保存且可访问的历史，不跨thread。",
     "parameters": {"type": "object", "properties": {
         "before_source_id": {"type": "integer", "minimum": 1,
-            "description": "读取此本地记录ID之前的原文（不含该条）。只接受本轮当前thread已提供的来源ID或返回的游标；省略从默认起点读取。不是QQ消息号。"},
+            "description": "读取此本地记录ID之前的原文（不含该条）。使用已知的当前thread来源ID或返回的游标，不猜测；服务端核对归属。省略从默认起点读取，不是QQ消息号。"},
         "limit": {"type": "integer", "minimum": 1, "maximum": 20,
             "description": "期望条数，默认10，最多20；字符预算不足时返回较少完整消息，可沿游标继续。"},
     }, "required": [], "additionalProperties": False},
@@ -69,7 +69,11 @@ class ThreadHistorySession:
             return {'ok': False, 'error': '历史查询参数无效。'}
         cursor = arguments.get('before_source_id', self.default_before)
         if cursor not in self.cursors:
-            return {'ok': False, 'error': '只能使用本轮当前thread已提供的来源ID或上一页返回的游标。'}
+            # 记忆检索也可能在本轮刚提供一个更早来源；允许以它定位，但不能跨thread或读未来。
+            assigned = self.store.assignment(self.group_id, cursor) if cursor < self.boundary else None
+            if not assigned or assigned['thread_id'] != self.thread_id:
+                return {'ok': False, 'error': '游标必须属于当前thread的可访问历史，或是本轮已返回的游标。'}
+            self.cursors.add(cursor)
         if (self.calls >= self.settings.thread_history_read_max_calls
                 or self.spent >= self.settings.thread_history_read_total_chars):
             return {'ok': False, 'budget_exhausted': True, 'error': '本轮历史读取额度已用完；不代表没有更早记录。'}
