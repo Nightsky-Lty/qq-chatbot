@@ -100,7 +100,7 @@ Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结
 
 普通聊天、私聊和 `/锐评` 使用“DeepSeek 小鲸鱼”群友角色：明确知道自己是 AI，聪明、真诚温柔、亲切耐心，偶尔害羞、俏皮、接梗和摸鱼。玩笑以双方乐意为前提，遇到调侃自然化解，受到持续冒犯时平静表达边界；有不同意见时就事论事，出错坦然改正。常用“你”或群友昵称，不刻意安慰或亲昵。日常偏好简短口语、一条一个意思，少用客服套话、括号内心戏；具体字数、条数和排版以本轮发送约束为准。事实问题不乱编，确有必要时可展开。
 
-角色卡位于 [app/persona.py](app/persona.py) 的 `PERSONA_PROMPT`（保留 `SYSTEM_PROMPT` 导入别名），只维护身份气质、形象、语气、习惯和少量回复示例，不再维护工具操作手册。虚拟形象是蓝白配色、蓝色长发和鲸鱼尾巴，不会自动修改 QQ 昵称、头像或发送自拍。[app/prompting.py](app/prompting.py) 统一组装基础规则、人设、Agent执行协议、场景和实际注册能力的补充说明；[app/bot.py](app/bot.py) 只提供结构化任务、背景和运行环境，不再追加覆盖旧规则。当前时间、成员白名单、图片编号、发送限制与工具预算不混进system。群历史、记忆、图片和表情目录明确区分来源；随机接话与允许安静的活跃跟进分别处理。完整结构和维护方式见[提示词与上下文说明](docs/prompt-context.md)。
+角色卡位于 [app/persona.py](app/persona.py)：`CORE_PERSONA`/`SYSTEM_PROMPT`为常驻性格与边界，`DETAILS`为外貌、互动及生活小梗，`PERSONA_PROMPT`为完整维护视图。普通聊天按当前请求和必要往返选择最多两个细节片段，本次Agent内固定；规则优先，BGE保守补召回，超时/哈希回退仅保留核心，不调用额外LLM。`PERSONA_DETAILS_ENABLED=false`关闭细节加载；专用模仿风格不受影响。虚拟形象是蓝白配色、蓝色长发和鲸鱼尾巴，不会自动修改 QQ 昵称、头像或发送自拍。[app/prompting.py](app/prompting.py) 统一组装规则、人设、协议、场景和已加载能力说明；[app/bot.py](app/bot.py) 提供结构化任务、背景和运行环境。时间、成员白名单、图片编号、发送限制与工具预算不混进system。完整格式见[提示词与上下文说明](docs/prompt-context.md)。
 
 常驻提示词保持简短：人设保留身份形象与温柔口语，各能力仅说明必要的使用语义；共同的权限、资料信任和成功回执规则集中表达。工具参数由schema提供，发送字数和动态预算读取运行环境，执行器负责实际校验。
 
@@ -468,6 +468,8 @@ Linux Compose部署只读挂载宿主机`/proc/stat`、`/proc/meminfo`、`/proc/
 | `MEMORY_SEARCH_ROUTE_LIMIT` | `20` | 每路召回候选数 |
 | `MEMORY_CONTEXT_MAX_CHARS` | `5000` | 单次记忆检索返回的总字符预算 |
 | `MEMORY_SOURCE_SEARCH_ENABLED` | `true` | 明确回忆且结果不足时补查允许的原话 |
+| `MEMORY_CONTEXT_QUERY_ENABLED` | `true` | 含糊追问使用本轮直接往返补充自动检索；日期等条件仍从原请求判断，不改变memory_search接口 |
+| `PERSONA_DETAILS_ENABLED` | `true` | 按当前话题加载外貌/互动/生活细节；false仅保留核心性格和身份边界 |
 | `MEMORY_JOB_MAX_ATTEMPTS` | `5` | 整理失败转failed前最多尝试次数 |
 | `IMAGE_MEMORY_RETENTION_DAYS` | `90` | 有效事件引用图片的延长保留天数，仍受配额限制 |
 | `MEMORY_USER_HISTORY_LIMIT` | `12` | 除群近期历史外，补充当前发言人的个人历史条数；0关闭 |
@@ -603,6 +605,8 @@ app/
 ├── tool_search.py # 复用本地embedding的top-k工具检索与会话内按需加载
 ├── messaging.py  # 当前会话的send_message工具、限量和确认状态
 ├── persona.py    # 小鲸鱼身份、性格、形象和表达风格
+├── focus_context.py # 已核验当前往返的检索/人设线索，不读取旁听或后到消息
+├── memory_view.py # 自动召回记忆的紧凑模型视图，工具和数据库保留完整结构
 ├── prompting.py  # 稳定规则/场景/能力说明与结构化动态上下文的唯一组装入口
 ├── chat_transcript.py # 原文快照转紧凑聊天行、成员表与回应关系索引
 ├── working_memory.py # 最近80条结构化原文工作记忆与真实来源归档

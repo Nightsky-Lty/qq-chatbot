@@ -90,32 +90,9 @@ class HybridRetriever:
                 rows = self.db.connection.execute(f"SELECT * FROM memory_records m WHERE {where} AND m.id>? ORDER BY m.id LIMIT 256", (*args, cursor)).fetchall()
         return sorted(heap, reverse=True)
 
-    async def search(self, namespace, query, *, user_ids=(), limit=None, layer=None, subject=None,
-                     after=None, before=None, boundary=None, include_sources=False):
-        if not self.settings.memory_enabled or not query.strip():
-            return []
-        if layer not in {None, "event", "abstract", "perceptual"}:
-            raise ValueError("记忆类型无效")
-        if layer is None and re.search(r"什么意思|什么梗|指什么|怎么理解|词义", query) and not re.search(r"图片|照片|截图|表情|那张|这张", query):
-            layer = "abstract"
-        if namespace < 0 and subject is not None and subject != -namespace:
-            return []
-        if after is None and before is None and layer != "abstract":
-            after, before = time_range(query)
-        if after is not None and before is not None and after > before:
-            raise ValueError("时间范围无效")
-        where, args = self.filters(namespace, layer, subject, after, before)
-        route_limit = self.settings.memory_search_route_limit
-        fts_query = match_query(query)
-        with self.db._lock:
-            lexical = list(self.db.connection.execute(
-                f"SELECT m.id,bm25(memory_fts) AS score FROM memory_fts JOIN memory_records m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? AND {where} ORDER BY score LIMIT ?",
-                (fts_query, *args, route_limit))) if fts_query else []
-            concepts = list(self.db.connection.execute(f"SELECT m.* FROM memory_records m WHERE {where} AND m.layer='abstract' AND m.fact_key!=''", args))
-        exact = [r["id"] for r in concepts if any(k and k.casefold() in query.casefold()
-                  for k in [r["fact_key"], *json.loads(r["metadata_json"]).get("aliases", [])]) and self.eligible(r, boundary)][:route_limit]
-        expansion = " ".join(json.loads(r["metadata_json"]).get("meaning", "")[:100] for r in concepts if r["id"] in exact[:2])
-        effective_query = query[:600] + (" " + expansion if expansion else "")
+    async def vector_route(self, namespace, effective_query, where, args, route_limit,
+                           layer, subject, after, before):
+        """同一路由统一处理向量索引、待同步补查和本地降级。"""
         dense = None
         provider, index = self.memory.provider, self.memory.index
         if provider.available and provider.model_id != HASH_MODEL_ID:
@@ -149,11 +126,59 @@ class HybridRetriever:
         for score, item_id in local:
             scores[item_id] = score
         semantic = sorted(set(semantic) | {i for _, i in local}, key=lambda i: scores[i], reverse=True)[:route_limit]
+        threshold = self.settings.embedding_min_similarity if dense else 0.08
+        return semantic, scores, threshold
+
+    async def search(self, namespace, query, *, user_ids=(), limit=None, layer=None, subject=None,
+                     after=None, before=None, boundary=None, include_sources=False, context_query=""):
+        if not self.settings.memory_enabled or not query.strip():
+            return []
+        if layer not in {None, "event", "abstract", "perceptual"}:
+            raise ValueError("记忆类型无效")
+        if layer is None and re.search(r"什么意思|什么梗|指什么|怎么理解|词义", query) and not re.search(r"图片|照片|截图|表情|那张|这张", query):
+            layer = "abstract"
+        if namespace < 0 and subject is not None and subject != -namespace:
+            return []
+        if after is None and before is None and layer != "abstract":
+            after, before = time_range(query)
+        if after is not None and before is not None and after > before:
+            raise ValueError("时间范围无效")
+        where, args = self.filters(namespace, layer, subject, after, before)
+        route_limit = self.settings.memory_search_route_limit
+        fts_query = match_query(query)
+        with self.db._lock:
+            lexical = list(self.db.connection.execute(
+                f"SELECT m.id,bm25(memory_fts) AS score FROM memory_fts JOIN memory_records m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? AND {where} ORDER BY score LIMIT ?",
+                (fts_query, *args, route_limit))) if fts_query else []
+            concepts = list(self.db.connection.execute(f"SELECT m.* FROM memory_records m WHERE {where} AND m.layer='abstract' AND m.fact_key!=''", args))
+        exact = [r["id"] for r in concepts if any(k and k.casefold() in query.casefold()
+                  for k in [r["fact_key"], *json.loads(r["metadata_json"]).get("aliases", [])]) and self.eligible(r, boundary)][:route_limit]
+        expansion = " ".join(json.loads(r["metadata_json"]).get("meaning", "")[:100] for r in concepts if r["id"] in exact[:2])
+        effective_query = query[:600] + (" " + expansion if expansion else "")
+        semantic, scores, threshold = await self.vector_route(
+            namespace, effective_query, where, args, route_limit, layer, subject, after, before)
+        extra_routes = []
+        hits = set(exact) | {r["id"] for r in lexical} | {i for i, score in scores.items() if score >= threshold}
+        if context_query and context_query != query:
+            # 日期、层和回忆触发仍从原始query推导；上下文仅增加匹配路径。
+            context_fts = match_query(context_query)
+            with self.db._lock:
+                context_lexical = [r[0] for r in self.db.connection.execute(
+                    f"SELECT m.id FROM memory_fts JOIN memory_records m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? AND {where} ORDER BY bm25(memory_fts) LIMIT ?",
+                    (context_fts, *args, route_limit))] if context_fts else []
+            context_exact = [r["id"] for r in concepts if any(k and k.casefold() in context_query.casefold()
+                for k in [r["fact_key"], *json.loads(r["metadata_json"]).get("aliases", [])]) and self.eligible(r, boundary)][:route_limit]
+            context_semantic, context_scores, context_threshold = await self.vector_route(
+                namespace, context_query[:960], where, args, route_limit, layer, subject, after, before)
+            hits.update(context_exact)
+            hits.update(context_lexical)
+            hits.update(i for i, score in context_scores.items() if score >= context_threshold)
+            extra_routes = [context_exact, context_lexical, context_semantic]
         routes = [exact, [r["id"] for r in lexical], semantic]
         ranks = {}
-        for route in routes:
+        for route, weight in [(r, 1.0) for r in routes] + [(r, .8) for r in extra_routes]:
             for rank, item_id in enumerate(route):
-                ranks[item_id] = ranks.get(item_id, 0) + 1 / (60 + rank + 1)
+                ranks[item_id] = ranks.get(item_id, 0) + weight / (60 + rank + 1)
         selected = []
         related = set(user_ids)
         for item_id, score in ranks.items():
@@ -166,8 +191,7 @@ class HybridRetriever:
                 continue
             if (after is not None and row["occurred_at"] < after) or (before is not None and row["occurred_at"] > before):
                 continue
-            lexical_hit = item_id in routes[1] or item_id in exact
-            if not lexical_hit and scores.get(item_id, 0) < (self.settings.embedding_min_similarity if dense else 0.08):
+            if item_id not in hits:
                 continue
             if row["user_id"] in related:
                 score += 0.001
@@ -196,7 +220,8 @@ class HybridRetriever:
                 spent += size
         # 只在明确回忆且结果不足时补查原话；不能从原话绕过遗忘/删除。
         if len(result) < min(3, max_items) and self.settings.memory_source_search_enabled and re.search(r"之前|以前|上次|说过|记得|回忆|昨天|前天", query):
-            result.extend(self.raw_sources(namespace, fts_query, subject, after, before, boundary,
+            source_query = match_query(context_query) if context_query else fts_query
+            result.extend(self.raw_sources(namespace, source_query, subject, after, before, boundary,
                                            max_items - len(result), self.settings.memory_context_max_chars - spent))
         self.db.touch_memories([r["记忆编号"] for r in result if type(r.get("记忆编号")) is int])
         logger.info("Memory retrieved: exact=%s lexical=%s semantic=%s selected=%s", len(exact), len(lexical), len(semantic), len(result))

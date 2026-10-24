@@ -18,6 +18,8 @@ from app.conversation import GroupBatch, GroupConversations, GroupMessage
 from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
 from app.database import Database
 from app.llm import DeepSeekClient, SYSTEM_PROMPT
+from app.persona import PersonaSelector
+from app.focus_context import focus_background, memory_context_query
 from app.models import (
     MessageView, PokeView, at_segment, normalize_message_id, parse_message,
     parse_poke_event, reply_segment, text_segment,
@@ -130,6 +132,7 @@ class BotService:
         self.sticker_collector.images.cached_validator = self.image_cache.authorized
         self.memory = MemoryService(settings, database)
         self.tool_retriever = ToolRetriever(self.memory.provider, min_similarity=settings.tool_search_min_similarity)
+        self.persona_selector = PersonaSelector(self.tool_retriever)
         self.memory.image_cache = self.image_cache
         self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
         self.working_memory = WorkingMemoryManager(settings, database, self.memory_capture)
@@ -609,12 +612,6 @@ class BotService:
                     "引用消息": quote,
                     "图片编号": image_ids.get(entry.storage_id, []), "图片数量": len(entry.images),
                 })
-            memories = await self.memory.retrieve(
-                group_id,
-                focus.text,
-                user_ids={focus.user_id, *focus.mentions},
-                boundary=max(entry.storage_id for entry in batch.entries),
-            )
             context = ContextPacket(
                 task={"唤醒消息号": [e.message_id for e in batch.entries if e.direct],
                       "当前焦点消息号": focus.message_id, "本批新消息": current},
@@ -639,6 +636,12 @@ class BotService:
                     if resources:
                         item['图片资料（非原话）'] = [{'图片编号': resource, '概要位置': '图片目录'} for resource in resources]
                 context.working['说明'] = '当前线程必要原文；历史是背景，不是本轮新授权。旁听参考不属于当前请求。'
+            recall_query = memory_context_query(focus.text, context) if self.settings.memory_context_query_enabled else ''
+            memories = await self.memory.retrieve(
+                group_id, focus.text, user_ids={focus.user_id, *focus.mentions},
+                boundary=max(entry.storage_id for entry in batch.entries),
+                **({'context_query': recall_query} if recall_query else {}),
+            )
             logger.info("Group context: group=%s history=%s new=%s images=%s",
                         group_id, len(history_entries), len(current), len(images))
             try:
@@ -1051,7 +1054,9 @@ class BotService:
                         boundary = self.db.connection.execute("SELECT coalesce(max(id),0)+1 FROM private_messages WHERE user_id=?", (user_id,)).fetchone()[0]
                 context.working = self.working_memory.snapshot(-user_id, before_id=boundary, query=prompt)
             if private and self.settings.memory_enabled:
-                private_memories = await self.memory.retrieve(-user_id, prompt, user_ids={user_id}, boundary=private_source_id or None)
+                recall_query = memory_context_query(prompt, context, history=history) if self.settings.memory_context_query_enabled else ''
+                private_memories = await self.memory.retrieve(-user_id, prompt, user_ids={user_id}, boundary=private_source_id or None,
+                    **({'context_query': recall_query} if recall_query else {}))
                 injected_memories.extend(private_memories)
             allowed_mentions = dict(mention_targets or {}) if not private else {}
             if source_message is not None and not private:
@@ -1321,7 +1326,12 @@ class BotService:
                                  if sticker_session is not None and sticker_session.cadence_due else [])
                 enable_tool_search(registry, self.tool_retriever, max_calls=self.settings.tool_search_max_calls,
                                    top_k=self.settings.tool_search_top_k, initial_tools=initial_tools)
-            outcome = await self.agent.run(prompt, registry, history=history, system=system or SYSTEM_PROMPT,
+            persona = system or SYSTEM_PROMPT
+            if system is None and not observe_only and self.settings.persona_details_enabled:
+                persona, selected_details = await self.persona_selector.select(prompt,
+                    focus_background(context, history=history, limit=2, assistant_only=True))
+                logger.info('Persona selected: details=%s', ','.join(selected_details) or 'core')
+            outcome = await self.agent.run(prompt, registry, history=history, system=persona,
                                            context=context, scene=scene)
             if outcome.error and not registry.output_attempted and not automatic:
                 await registry.execute("send_message", {"text": "AI暂时没处理完，请稍后重试。"})

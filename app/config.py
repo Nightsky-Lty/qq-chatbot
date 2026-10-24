@@ -128,6 +128,7 @@ class Settings(BaseSettings):
     memory_search_route_limit: int = Field(default=20, ge=5, le=100)
     memory_context_max_chars: int = Field(default=5000, ge=500, le=20000)
     memory_source_search_enabled: bool = True
+    memory_context_query_enabled: bool = True
     memory_job_max_attempts: int = Field(default=5, ge=1, le=10)
     image_memory_retention_days: int = Field(default=90, ge=7, le=365)
     # bge_onnx 使用只读挂载的本地 INT8 模型；加载或推理失败时自动退回哈希向量。
@@ -138,6 +139,8 @@ class Settings(BaseSettings):
     embedding_threads: int = Field(default=2, ge=1, le=4)
     embedding_backfill_batch_size: int = Field(default=16, ge=1, le=64)
     embedding_min_similarity: float = Field(default=0.35, ge=0, le=1)
+    # 可选人设只改变表达资料，不影响身份权限和工具授权。
+    persona_details_enabled: bool = True
     embedding_query_prefix: str = "为这个句子生成表示以用于检索相关文章："
     chat_batch_seconds: float = Field(default=3, ge=0, le=10)
     chat_batch_max_messages: int = Field(default=30, ge=3, le=100)
