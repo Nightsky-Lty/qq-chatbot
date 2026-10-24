@@ -105,7 +105,7 @@ rsync -av models/bge-small-zh-v1.5-int8/ 用户名@服务器IP:~/qq-chatbot/mode
 
 模型目录缺失或推理失败不会阻止启动，程序会自动退回特征哈希；模型就绪并重启机器人后会后台升级旧记忆向量。
 
-聊天、表情包入库标记与长期记忆提取使用独立LLM客户端。后台默认关闭思考，模型和地址留空继承聊天设置；可在 `config.env` 设置 `STICKER_LLM_MODEL` / `STICKER_LLM_BASE_URL`、`MEMORY_LLM_MODEL` / `MEMORY_LLM_BASE_URL`，独立凭证填服务器 `.env` 的 `STICKER_LLM_API_KEY`、`MEMORY_LLM_API_KEY`（留空继承聊天Key）。表情服务需支持视觉输入，记忆服务需支持JSON输出。群聊默认开启thread解析，必要时使用独立无工具LLM判断会话归属；通过 `THREAD_LLM_MODEL` / `THREAD_LLM_BASE_URL` 和可选的 `THREAD_LLM_API_KEY` 配置，默认继承聊天连接且关闭思考。调用条件和限额见[会话解析](dialogue-threads.md)。
+聊天、表情包入库标记与长期记忆提取使用独立LLM客户端。后台默认关闭思考，模型和地址留空继承聊天设置；可在 `config.env` 设置 `STICKER_LLM_MODEL` / `STICKER_LLM_BASE_URL`、`MEMORY_LLM_MODEL` / `MEMORY_LLM_BASE_URL`，独立凭证填服务器 `.env` 的 `STICKER_LLM_API_KEY`、`MEMORY_LLM_API_KEY`（留空继承聊天Key）。表情服务需支持视觉输入，记忆服务需支持JSON输出。群聊使用连续原文窗口，历史查询不调用额外解析模型。详见[工作记忆](working-memory.md)。
 
 后台记忆默认合并30秒、每批最多40条新消息，也会处理未唤醒Agent的普通群文字及私聊，产生独立API费用。可用 `MEMORY_AUTO_CAPTURE_ENABLED=false` 关闭后台提取，仍可显式记住/忘掉；`MEMORY_ENABLED=false` 同时关闭相关工具和召回。首次启用只从新消息开始，不回扫全部旧聊天；失败任务及游标持久保存，重启后续跑。当前版本支持现行`memory_records`结构或全新数据库；其他结构的历史数据库需要在部署前单独处理。运行数据应定期备份。详见[存储说明](memory-system.md)。
 
@@ -200,7 +200,7 @@ Python 日志出现 `OneBot reverse WebSocket connected` 表示 NapCat 已连接
 
 更新代码后重建bot，SQLite自动新增缓存表，不删除聊天或提醒数据。Compose将图库只读挂载，缓存写在数据库中，无需改NapCat配置。机器人UID 10001需读取图片及访问目录。模型可自行按场景检索、必要时看图并决定发不发；群友来图仍未接入识图。可用 `/问 发个开心的表情包` 或私聊验证；详细配置见 [本地表情包](../README.md#本地表情包)。后续添加图片不必重建，但需等待入库；只更新bot可执行 `sudo docker compose up -d --build --no-deps bot`，无需重启NapCat。
 
-新版默认开启 `high` 强度思考，推理只在当前Agent内存中用于工具续接，不发QQ、不写聊天数据库；思考及多步工具可能增加API费用和耗时。AI在后台执行，不阻塞关键词和管理命令。`DEEPSEEK_THINKING_ENABLED=true`、`DEEPSEEK_REASONING_EFFORT=high`、`DEEPSEEK_THINKING_MAX_TOKENS=4096`、`CONTEXT_MESSAGE_LIMIT=40`、`AI_MAX_CONCURRENCY=3` 等普通参数位于 `config.env`，会随代码更新；拉取后重新创建机器人容器即可生效。满额时提示稍后重试，不建立长队列；如需关闭思考可设 `DEEPSEEK_THINKING_ENABLED=false`。
+新版默认开启 `high` 强度思考，推理只在当前Agent内存中用于工具续接，不发QQ、不写聊天数据库；思考及多步工具可能增加API费用和耗时。AI在后台执行，不阻塞关键词和管理命令。`DEEPSEEK_THINKING_ENABLED=true`、`DEEPSEEK_REASONING_EFFORT=high`、`DEEPSEEK_THINKING_MAX_TOKENS=4096`、`CONTEXT_MESSAGE_LIMIT=30`、`AI_MAX_CONCURRENCY=3` 等普通参数位于 `config.env`，会随代码更新；拉取后重新创建机器人容器即可生效。满额时提示稍后重试，不建立长队列；如需关闭思考可设 `DEEPSEEK_THINKING_ENABLED=false`。
 
 ```bash
 # 修改 .env 密钥或 config.env 普通参数后，重新创建容器使配置生效

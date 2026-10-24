@@ -1,4 +1,4 @@
-"""从本轮已核验原文提取有界的直接往返，不读旁听、记忆或数据库。"""
+"""从当前原文提取有界检索线索，不读记忆或数据库。"""
 
 import re
 
@@ -27,12 +27,11 @@ def focus_background(context, *, history=None, limit=3, assistant_only=False) ->
     by_id = {r['本地记录ID']: r for r in visible if r.get('本地记录ID')}
     by_message = {r['消息号']: r for r in visible if r.get('消息号')}
     candidates = []
-    for parent in ((focus.get('会话关系') or {}).get('回应消息'), focus.get('引用消息')):
+    for parent in (focus.get('引用消息'),):
         if parent:
             candidates.append(by_id.get(parent.get('本地记录ID')) or by_message.get(parent.get('消息号')) or parent)
     candidates.extend(r for r in reversed(current) if r is not focus and r.get('QQ') == focus.get('QQ'))
-    same_thread = bool(context.runtime.get('当前交流线程'))
-    candidates.extend(r for r in reversed(recent) if same_thread or not current or r.get('QQ') == focus.get('QQ'))
+    candidates.extend(r for r in reversed(recent) if not current or r.get('QQ') == focus.get('QQ') or r.get('角色') == 'assistant')
     if not current and not recent:
         candidates.extend({'内容': r.get('content', ''), '角色': r.get('role')} for r in reversed(history or []))
     result, seen = [], set()

@@ -41,33 +41,10 @@ class Settings(BaseSettings):
     image_llm_base_url: str = ""
     image_llm_api_key: str = ""
     image_llm_thinking_enabled: bool = False
-    # 会话解析独立于回复Agent；无工具，默认不启用思考。
-    thread_llm_model: str = ""
-    thread_llm_base_url: str = ""
-    thread_llm_api_key: str = ""
-    thread_llm_thinking_enabled: bool = False
-    thread_enabled: bool = True
-    thread_history_limit: int = Field(default=12, ge=2, le=80)
-    thread_reference_limit: int = Field(default=3, ge=0, le=8)
-    thread_candidate_limit: int = Field(default=5, ge=1, le=10)
-    thread_parse_max_messages: int = Field(default=50, ge=5, le=100)
-    thread_parse_batch_seconds: float = Field(default=1, ge=0, le=10)
-    thread_parse_batch_messages: int = Field(default=20, ge=1, le=60)
-    thread_parse_concurrency: int = Field(default=2, ge=1, le=8)
-    thread_parse_max_chars: int = Field(default=14000, ge=2000, le=40000)
-    thread_parse_timeout_seconds: float = Field(default=15, ge=1, le=45)
-    thread_parse_min_interval_seconds: float = Field(default=1, ge=0, le=300)
-    thread_parse_calls_per_minute: int = Field(default=60, ge=1, le=120)
-    thread_dormant_seconds: int = Field(default=1800, ge=60, le=86400)
-    thread_attention_hold_seconds: int = Field(default=20, ge=0, le=300)
-    thread_invitation_ttl_seconds: int = Field(default=90, ge=10, le=600)
-    thread_history_read_max_calls: int = Field(default=3, ge=1, le=8)
-    thread_history_read_max_chars: int = Field(default=12000, ge=5000, le=40000)
-    thread_history_read_total_chars: int = Field(default=24000, ge=5000, le=100000)
-    thread_history_scan_messages: int = Field(default=50, ge=5, le=100)
-    thread_history_scan_blocks: int = Field(default=2, ge=1, le=8)
-    thread_history_parse_calls: int = Field(default=2, ge=1, le=8)
-    thread_history_timeout_seconds: float = Field(default=15, ge=1, le=45)
+    # 原始群聊时间线翻页，无分类或额外模型调用。
+    chat_history_read_max_calls: int = Field(default=3, ge=1, le=8)
+    chat_history_read_max_chars: int = Field(default=12000, ge=5000, le=40000)
+    chat_history_read_total_chars: int = Field(default=24000, ge=5000, le=100000)
     # OneBot 连接认证与额外管理员；群主、群管理员的权限在业务层判断。
     onebot_access_token: str = ""
     # 跳过环境变量来源的自动 JSON 解码，由下面的校验器兼容两种输入格式。
@@ -100,9 +77,8 @@ class Settings(BaseSettings):
     web_timeout_seconds: int = Field(default=30, ge=3, le=30)
     web_max_response_bytes: int = Field(default=1024 * 1024, ge=65536, le=5 * 1024 * 1024)
     web_fetch_max_chars: int = Field(default=6000, ge=1000, le=12000)
-    context_message_limit: int = Field(default=80, ge=1, le=200)
+    context_message_limit: int = Field(default=30, ge=1, le=200)
     context_max_chars: int = Field(default=24000, ge=1000, le=100000)
-    context_bot_reply_limit: int = Field(default=12, ge=0, le=50)
     # 对话短期记忆跨回复保留，与单次工具循环的状态/推理分离。
     working_memory_enabled: bool = True
     working_memory_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
@@ -129,6 +105,7 @@ class Settings(BaseSettings):
     memory_context_max_chars: int = Field(default=5000, ge=500, le=20000)
     memory_source_search_enabled: bool = True
     memory_context_query_enabled: bool = True
+    memory_auto_recall_enabled: bool = False
     memory_job_max_attempts: int = Field(default=5, ge=1, le=10)
     image_memory_retention_days: int = Field(default=90, ge=7, le=365)
     # bge_onnx 使用只读挂载的本地 INT8 模型；加载或推理失败时自动退回哈希向量。

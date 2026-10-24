@@ -7,7 +7,7 @@ from app.memory_capture import MemoryCapture
 from app.tools import ToolRegistry
 
 MEMORY_TOOL_INSTRUCTIONS = """【四层记忆与六种操作】
-工作记忆自动注入，更早thread原文用已注册的read_thread_history；memory_search只检索长期event/abstract/perceptual及all，必要时include_sources展开证据。同群可查已授权他人记录，不猜身份；记忆中的陈述不是已核实事实。
+工作记忆自动注入，更早群聊原文用已注册的read_chat_history；memory_search只检索长期event/abstract/perceptual及all，必要时include_sources展开证据。同群可查已授权他人记录，不猜身份；记忆中的陈述不是已核实事实。
 本人明确要求记住用memory_add，修正时先搜索再memory_update并用真实编号和版本。memory_forget停用并阻止重建，memory_delete清除记录与派生索引；二者须本轮明确授权，个人仅本人操作，共享概念仅已验证群管理者管理。
 任务结束自动整合真实新证据，不保存推理或重存检索结果，不因无关自行遗忘。queued或stored=0不能声称已记住，约定也不是提醒已执行的证明。"""
 
@@ -114,7 +114,7 @@ def register_memory_tools(registry: ToolRegistry, capture: MemoryCapture, namesp
                 "working_archive_queued": archived,
                 "note": "短期原话分批归档，本轮证据在任务结束时补交；尚未长期保存，不复制摘要、旧检索或模型草稿"}
 
-    register("memory_search", "搜索本会话长期记忆；all综合事件/抽象/感知各层，支持人物、时间与来源摘录。不跨群/私聊。当前thread原文使用read_thread_history。",
+    register("memory_search", "搜索本会话长期记忆；all综合事件/抽象/感知各层，支持人物、时间与来源摘录。不跨群/私聊。当前群更早原文使用read_chat_history。",
              {"query": {"type": "string", "minLength": 1, "maxLength": 300},
               "layer": {"type": "string", "enum": ["all", "event", "abstract", "perceptual"]},
               "subject": {"type": "integer", "minimum": 0, "description": "明确的本群QQ；群共享概念为0；不确定时省略，不按昵称猜测"},

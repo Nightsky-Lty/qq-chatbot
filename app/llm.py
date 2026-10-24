@@ -22,7 +22,7 @@ class DeepSeekClient:
 
     def __init__(self, settings: Settings, *, purpose: str = "chat"):
         """保存配置并创建请求超时为 45 秒的 HTTP 客户端。"""
-        if purpose not in {"chat", "sticker", "memory", "image", "thread"}:
+        if purpose not in {"chat", "sticker", "memory", "image"}:
             raise ValueError("unknown LLM purpose")
         if purpose != "chat":
             settings = settings.model_copy(update={
@@ -33,32 +33,6 @@ class DeepSeekClient:
             })
         self.settings = settings
         self.client = httpx.AsyncClient(timeout=45)
-
-    async def parse_dialogue(self, instructions: str, data: dict[str, Any]) -> dict[str, Any]:
-        """有界JSON解析；不注入聊天人设，不注册工具，不记录正文或错误响应。"""
-        if not self.settings.deepseek_api_key:
-            raise LLMUnavailable("会话解析未配置API Key")
-        try:
-            response = await self.client.post(
-                f"{self.settings.deepseek_base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
-                json={"model": self.settings.deepseek_model, "stream": False,
-                      **self._generation_options(0, 3000),
-                      "response_format": {"type": "json_object"},
-                      "messages": [{"role": "system", "content": instructions},
-                                   {"role": "user", "content": json.dumps(data, ensure_ascii=False, separators=(",", ":"))}]},
-            )
-            response.raise_for_status()
-            result = response.json()
-            value = json.loads(result["choices"][0]["message"]["content"])
-            if not isinstance(value, dict):
-                raise ValueError("expected object")
-            usage = result.get("usage") or {}
-            usage = usage if isinstance(usage, dict) else {}
-            return {"result": value, "usage": {k: v for k, v in usage.items()
-                    if k in {"prompt_tokens", "completion_tokens"} and type(v) is int and v >= 0}}
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
-            raise LLMUnavailable("会话解析请求失败或输出无效") from exc
 
     async def extract_memories(self, instructions: str, data: dict[str, Any]) -> dict[str, Any]:
         """独立、无工具、JSON约束的记忆提取；不使用聊天人设。"""

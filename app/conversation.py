@@ -37,12 +37,12 @@ class GroupMessage:
     poke: bool = False
     # 仅入口确认时间足够新的普通群图片可供主动收藏，不从历史补收。
     collectible: bool = False
+    parts: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class GroupBatch:
     entries: list[GroupMessage]
-    thread_id: int | None = None
 
     @property
     def candidates(self) -> list[GroupMessage]:
@@ -211,8 +211,7 @@ class GroupConversations:
                             group_id, len(fresh), batch.direct, batch.random_trigger, active)
                 outcome = await self.runner(group_id, batch, state.sender)
                 now = time.monotonic()
-                if outcome is None or outcome.retry_after <= 0:
-                    state.next_run_at = now + self.settings.ai_cooldown_seconds
+                state.next_run_at = now + self.settings.ai_cooldown_seconds
                 if outcome is not None and not outcome.error and outcome.wait_for_messages:
                     # 沉默不续期；普通跟进不能跨过超时重新开启，明确唤醒可以。
                     still_active = state.active(now)
@@ -223,14 +222,6 @@ class GroupConversations:
                         state.idle_until = now + self.settings.chat_active_idle_seconds
                 else:
                     state.stop_followup()
-                if (outcome is not None and not outcome.error and outcome.retry_after > 0
-                        and (state.active(now) or batch.wakes_followup)):
-                    # 解析限流只推迟当前新消息，不丢弃，也不轮询回复模型。
-                    pending_ids = {entry.storage_id for entry in state.pending}
-                    deferred = [entry for entry in fresh if entry.storage_id not in pending_ids]
-                    room = max(0, self.settings.chat_batch_max_messages - len(state.pending))
-                    state.pending[:0] = deferred[-room:] if room else []
-                    state.next_run_at = max(state.next_run_at, now + outcome.retry_after)
                 logger.info("Group conversation state: group=%s active=%s", group_id, state.active(now))
         except asyncio.CancelledError:
             raise

@@ -1,6 +1,7 @@
 """解析 OneBot 消息、戳一戳通知和当前图片引用，并构造发出的消息段。"""
 
 from dataclasses import dataclass, field
+import json
 from typing import Any
 
 
@@ -13,6 +14,7 @@ class MessageView:
     # 只保留当前事件的图片引用，不下载、不保存图片内容。
     images: list[dict[str, str]] = field(default_factory=list)
     reply_to: str = ""
+    parts: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +50,7 @@ def parse_poke_event(event: dict[str, Any]) -> PokeView | None:
 
 
 def parse_message(message: object, *, image_limit: int | None = 3) -> MessageView:
-    """解析数组消息中的文本、@ 和图片；纯字符串仅作文本，不解析 CQ 码。"""
+    """保留安全消息段的原顺序；附件地址只留给下载器，不进入文本视图。"""
     if isinstance(message, str):
         return MessageView(text=message.strip())
     if not isinstance(message, list):
@@ -57,6 +59,8 @@ def parse_message(message: object, *, image_limit: int | None = 3) -> MessageVie
     text_parts: list[str] = []
     mentions: list[int] = []
     images: list[dict[str, str]] = []
+    parts: list[dict] = []
+    text_budget = 4000
     reply_to = ""
     for segment in message:
         if not isinstance(segment, dict):
@@ -66,23 +70,45 @@ def parse_message(message: object, *, image_limit: int | None = 3) -> MessageVie
         if not isinstance(data, dict):
             continue
         if kind == "text":
-            text_parts.append(str(data.get("text", "")))
+            text = str(data.get("text", ""))[:text_budget]
+            text_budget -= len(text)
+            text_parts.append(text)
+            parts.append({'type': 'text', 'text': text})
         elif kind == "at":
             qq = str(data.get("qq", ""))
             # 只提取具体用户的数字 QQ 号，忽略 @全体成员等非数字目标。
             if qq.isdigit():
                 mentions.append(int(qq))
                 text_parts.append(f"@{qq}")
+                parts.append({'type': 'at', 'qq': int(qq)})
         elif kind == "image" and (image_limit is None or len(images) < image_limit):
             # 不将带签名的下载地址、文件路径或不可信 summary 暴露给模型。
             images.append({
                 "url": data.get("url", "")[:8193] if isinstance(data.get("url"), str) else "",
                 "file_size": str(data.get("file_size", ""))[:20],
             })
+            parts.append({'type': 'image', 'index': len(images) - 1})
         elif kind == "reply":
             reply_to = normalize_message_id(data.get("id"))
-        # 语音、视频等其他消息段暂不参与解析。
-    return MessageView(text="".join(text_parts).strip(), mentions=mentions, images=images, reply_to=reply_to)
+        elif kind in {'record', 'video'}:
+            label = 'audio' if kind == 'record' else 'video'
+            parts.append({'type': label})
+            text_parts.append(f'[{"语音" if label == "audio" else "视频"}，内容未解析]')
+        elif kind == 'json':
+            try:
+                raw = data.get('data', '')
+                card = json.loads(raw) if isinstance(raw, str) and len(raw) <= 65536 else {}
+                meta = card.get('meta', {}) if isinstance(card, dict) else {}
+                detail = next((v for v in meta.values() if isinstance(v, dict) and ('title' in v or 'desc' in v)), {}) if isinstance(meta, dict) else {}
+                app = detail.get('source', '')
+                platform = app.get('name', '') if isinstance(app, dict) else app
+                part = {'type': 'card', 'platform': str(platform)[:60],
+                        'title': str(detail.get('title', ''))[:200], 'description': str(detail.get('desc', ''))[:200]}
+            except (ValueError, TypeError):
+                part = {'type': 'card'}
+            parts.append(part)
+            text_parts.append('[分享卡片，正文未读取] ' + part.get('title', '') + ' ' + part.get('description', ''))
+    return MessageView(text="".join(text_parts).strip(), mentions=mentions, images=images, reply_to=reply_to, parts=parts)
 
 
 def normalize_message_id(value: object) -> str:

@@ -22,14 +22,14 @@
 | 群表情收藏 | 程序保留概率抽签，LLM也可调用 `collect_sticker` 收藏本轮授权的当前/近期同群图片；共用SHA-256去重、视觉审核和容量限制 |
 | 内容锐评 | 使用 `/锐评` 主动提交要评价的文本 |
 | 发言风格模仿 | 直接 `/模仿 @某人 主题`，使用目标用户在本群的普通文字发言，无需授权 |
-| 长期成员记忆 | 按群号和 QQ 号保存别名及稳定事实，使用本地 BGE/哈希混合 RAG 自动召回，不增加群命令 |
+| 长期成员记忆 | 按群号和 QQ 号保存别名及稳定事实，提供本地 BGE/哈希混合 RAG 按需检索，不增加群命令 |
 | 数据持久化 | SQLite 保存名单、关键词、群消息、成员记忆、独立的私聊记录及提醒 |
 
 模仿功能使用样本提示词，不训练或微调模型。机器人处理文本、@、QQ引用、戳一戳通知和本批新消息中的图片，支持发送群AI语音，但收到的语音和视频暂不识别。低活跃期普通群消息先保存历史，随机唤醒机制保留但当前概率为0；@、戳一戳或聊天命令直接唤醒，话题活跃期间无需每条@。私聊的普通文字、图片或戳一戳会调用AI。
 
 ## ReAct Agent架构
 
-群聊路径为：OneBot事件 → 原文入库/解析状态登记 → 活跃消息独立短聚批解析 → GroupConversations排队/DialogueService选择唯一thread → BotService绑定该thread任务 → ReactAgent决策 → ToolRegistry执行工具 → 将回执/图片作为观察交回模型 → 再决策，直到 `wait_for_messages` 或 `finish`。前者保留当前交流焦点，后者退出跟进；其他thread只维护状态，不并发启动回复。详见[会话解析业务层](docs/dialogue-threads.md)。这是ReAct风格的函数调用Agent，不是前端React框架；决策、动作和环境观察交替，思路见[ReAct论文](https://arxiv.org/abs/2210.03629)。
+群聊路径为：OneBot事件 → 原文和安全消息段入库 → GroupConversations聚批并按群串行处理 → BotService读取连续历史 → ReactAgent决策 → ToolRegistry执行工具，直到 `wait_for_messages` 或 `finish`。活跃期可以自然跟随新话题；普通群聊继续使用现有概率接话，明确@、引用和命令保持直接唤醒。这是ReAct风格的函数调用Agent。更早原文通过[群聊历史查询](docs/chat-history.md)按时间向前读取。
 
 | 模块 | 职责 |
 | --- | --- |
@@ -64,7 +64,7 @@
 
 无工具调用的最终文本通过原发送器成功提交后，由程序直接收尾：群聊默认保持当前交流焦点等待新消息，私聊结束；需要明确告别时模型可通过发送工具指定finish。所有发送预算、目标、冷却及失败不重发约束不变。一次工具批次中收尾成功后，后面的动作不再执行。
 
-SQLite保留完整聊天原文、身份、QQ引用和thread关系；模型上下文由`app/chat_transcript.py`转换为紧凑聊天行，成员资料集中列出。行内保留作者、编号、时间、原话和必要的@/引用/回应/图片标记，省略空字段和重复说明。QQ显式引用、解析LLM推断与程序回应分别标注；已出现的父消息只保留索引，外部父消息原文集中去重补充。原话转义保留多行和引号，未加载或已截断的原文明确标记。历史选取、字符限制和思考强度保持原配置，格式见[提示词与上下文说明](docs/prompt-context.md)。
+SQLite保存聊天原文、作者、真实引用和安全消息段。上下文默认读取最近30条连续原文，不按语义分类或关键词抽取；窗口外真实引用另行补充。图片自动概要和OCR按原顺序嵌入消息，来源和不确定性明确标注；原图仍可按需查看。语音、视频目前仅标记未解析，分享卡片可展示元数据，不代表读过正文。具体格式见[提示词与上下文说明](docs/prompt-context.md)。
 
 `Agent finished` 日志记录实际模型轮次及API返回的 `prompt_tokens`、`completion_tokens`、`reasoning_tokens`、`cache_hit_tokens` 和 `usage_requests`。后者表示提供完整输入/输出计数的请求数；服务不报告的计数不能视为真实零消耗。推理token通常已包含在completion内，不重复相加；缓存命中影响计费，不能直接把总输入token降幅当成账单降幅。日志不包含正文或推理内容。
 
@@ -112,15 +112,11 @@ Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结
 
 聊天、锐评和模仿在后台执行，不阻塞消息接收、名单管理或关键词召集。群话题每群一个运行，运行期间的新消息排入下一批；最多32个等待/活跃群、每批最多30条等待消息，等待超过120秒的明确提问提示重新@。群话题、私聊和模仿共用默认3个并发模型运行；群话题在冷却/名额不足时等待，私聊和模仿保留已有的冷却/忙碌提示。断线、关闭服务或群内删除数据时取消相关话题及本地排队任务，不保证撤销提供商已处理的请求或费用。
 
-群聊默认启用thread业务层，回复上下文按当前thread最近12条加发起消息、待回答问题、相关纠正和必要祖先组装，其他交流最多3条旁听参考。归属持久化，离开近期候选不删除thread；显式引用仍可找回更早的可访问来源。私聊和`THREAD_ENABLED=false`继续使用最近80条原文。当前消息单独放入任务，下一批不能提前进入本轮；默认短期预算24000字符，必要时标记截断。详见[会话解析](docs/dialogue-threads.md)和[对话工作记忆](docs/working-memory.md)。
+群聊与私聊默认使用最近30条连续历史，当前批次单独标明，后到消息不提前进入本轮。真实引用可补充窗口外原文，默认字符上限24000，超过时保留连续尾部并明确标记必要的截断。详见[对话工作记忆](docs/working-memory.md)。
 
-非活跃群消息只保存原文和未解析状态，有确定引用时登记关系，不逐条创建临时thread。活跃期间，包括回复生成和等待跟进，新群消息进入独立解析队列，默认1秒聚批、满20条提交；同群串行，全局解析并发2，最短间隔1秒、每分钟最多60次，15秒超时。回复仍只参与一个thread，8秒回复冷却独立控制。解析状态存入`bot.db`，确定、不确定、失败与未处理分别记录；没有待处理消息不请求解析模型。`THREAD_LLM_MODEL/BASE_URL/THINKING_ENABLED`与可选`THREAD_LLM_API_KEY`控制独立连接，默认继承聊天连接且关闭思考。长期记忆流程独立。
+群Agent按需调用`read_chat_history({})`向前读取当前群原文，默认10条、最多20条，后续原样传`next_cursor`为`cursor`。游标绑定本轮群和消息边界，每轮最多3次、每页12000字符、合计24000字符。每页重新检查删除/遗忘，原话不悄悄跳过或截断，不调用额外模型。详见[历史查询](docs/chat-history.md)。
 
-回复前等待确定归类，明确@也不直接回复临时thread；解析失败保留当前批次、按30秒退避最多尝试3次，受排队和活跃期限约束。不确定结果不触发回复，不反复解析。确定的引用关系可以连接到已解析来源。上下文同时传递解析器判断的父消息和关系类型，标明LLM推断与QQ显式引用的区别，辅助识别对机器人上一句的追问、评价或反讽。
-
-群Agent使用`read_thread_history({})`向前读当前thread原文，默认10条、最多20条，续读把`next_cursor`传入`cursor`。已分类区间直接查询，未分类历史按最多50条一块补解析，每次最多2块/2次解析/15秒；解析结果跨查询和重启复用。空页也可能有续读游标，`has_more=null`表示尚不能确认读完；遇到失败或预算不足不跳过空洞。每轮最多3次工具调用，每页12000字符、合计24000字符；原文不截断，群/thread/遗忘与本批时间边界均由程序核验。历史补解析会产生解析API费用，不扩大历史消息的操作授权。详见[历史回查](docs/dialogue-threads.md#agent主动向前翻阅原文)。
-
-当前thread原文通过`read_thread_history`回查。`memory_search`检索长期记忆，支持`all/event/abstract/perceptual`、人物/时间过滤、来源摘录和原话检索兜底；长期记忆还提供新增、更新、删除、遗忘和短期转长期整合接口。私聊上下文自动注入近期原文。
+长期记忆默认不自动注入（`MEMORY_AUTO_RECALL_ENABLED=false`），模型需要时使用`memory_search`，支持事件/抽象/图片、人物/时间过滤与来源展开。后台提取和新增、修改、遗忘、删除、整合接口继续工作。
 
 四层记忆：Working维护跨回复的短期对话；任务级证据和查询缓存由`TaskEvidence`保存并在单次Agent结束释放，内部推理/完整工具链仅在本轮执行状态，不进入对话记忆。事件、抽象概念以SQLite的`memory_records`为唯一权威记录，感知记忆目前仅支持图片缓存/概要，视图分层、关联表保存事件—概念—图片关系，不部署Neo4j。启动时幂等初始化当前存储结构；聊天原话、图片、队列和记忆使用同一个`bot.db`，以支持关联事务。正群号/负私聊QQ隔离，工具不接受自选空间。详情见[四层记忆说明](docs/memory-system.md)。
 
@@ -219,9 +215,9 @@ NapCat 的戳一戳通过 `post_type=notice`、`notice_type=notify`、`sub_type=
 
 是否启动随机接话由程序决定，抽中后通过工具完成一条短话或一张表情，模型不能直接静默退出；内容仍由模型生成。随机触发进入已有聚批/排队流程，直接@优先，沿用并发和消息上限。`RANDOM_CHAT_ENABLED=false`关闭随机唤醒，明确提问和已活跃话题不受影响。
 
-第一条触发消息开启固定3秒等待，后续消息只加入本批，不重置计时。运行期间的新消息进入下一批，同群串行；批次在冷却或等待全局名额时可能延后。启用thread时先选择唯一交流，再在其内部选回应焦点；其他thread不会自动排成必须补答的任务列表。引用机器人真实消息也可明确唤醒。
+第一条触发消息开启固定3秒聚批，后续消息不重置计时。生成回复期间的新消息留到下一批，同群串行，批次受冷却与全局并发约束。@、引用机器人或命令可明确唤醒，普通群聊沿用概率接话。
 
-回复后模型可调用无参数的 `wait_for_messages({})` 保持当前thread的活跃跟进，或 `finish` 退出。程序维护一个注意焦点，当前交流有新内容时优先保持；普通切换默认至少间隔20秒，明确“先别聊/换个话题/先帮我”优先。其他邀请默认90秒内有效，仅在该交流有新消息时考虑，不定时补答。thread休眠不删除原文/归属。活跃期间不重复概率抽签，旁听无需调用回复模型，也不刷新活跃寿命；退出后需重新明确唤醒。收图独立抽签。无新消息不循环调用模型或自言自语。关闭thread后保留原有不绑定语义话题的跟进路径。
+回复后模型可用`wait_for_messages({})`保持活跃跟进，或`finish`退出。活跃时结合新一批连续原文理解回应对象，可自然换题，无需再次@。不适合参与时可以安静等待，沉默不延长活跃寿命；没有新消息不循环调用回复模型。收图继续独立抽签。
 
 活跃状态只保存在内存。默认300秒（5分钟）无成功发言后退出，单个活跃期最多1800秒（30分钟）；模型不发言的等待不刷新寿命。上述是超时上限，模型调用finish仍能提前退出，并非强制驻留。重启、断线、删除群数据或Agent失败都会结束对应话题。可在config.env调整：
 
@@ -229,9 +225,8 @@ NapCat 的戳一戳通过 `post_type=notice`、`notice_type=notify`、`sub_type=
 CHAT_BATCH_SECONDS=3
 CHAT_ACTIVE_IDLE_SECONDS=300
 CHAT_ACTIVE_MAX_SECONDS=1800
-CONTEXT_MESSAGE_LIMIT=80
+CONTEXT_MESSAGE_LIMIT=30
 CONTEXT_MAX_CHARS=24000
-CONTEXT_BOT_REPLY_LIMIT=12
 GROUP_REPLY_MAX_CHARS=100
 RANDOM_CHAT_ENABLED=true
 RANDOM_CHAT_WINDOW_SECONDS=120
@@ -451,10 +446,12 @@ Linux Compose部署只读挂载宿主机`/proc/stat`、`/proc/meminfo`、`/proc/
 | `AGENT_MAX_TOOL_CALLS` | `16` | 一轮工具调用上限，范围4～32 |
 | `AGENT_TIMEOUT_SECONDS` | `120` | 包括下载、审核、发送在内的Agent整轮超时，范围20～300秒 |
 | `AGENT_BATCH_COMPLETION_ENABLED` | `true` | 发送成功后按next_action直接收尾，减少单独模型调用；关闭保留原分步流程 |
-| `CONTEXT_MESSAGE_LIMIT` | `80` | 群/私聊历史最多条数，不含本批用户消息，范围1～200 |
-| `CONTEXT_MAX_CHARS` | `24000` | 短期原文字符预算上限；超限优先引用和最近往返，截断会标记 |
+| `CHAT_HISTORY_READ_MAX_CALLS` | `3` | 每轮原文翻页次数 |
+| `CHAT_HISTORY_READ_MAX_CHARS` | `12000` | 每页原文字符上限 |
+| `CHAT_HISTORY_READ_TOTAL_CHARS` | `24000` | 每轮原文翻页字符总量 |
+| `CONTEXT_MESSAGE_LIMIT` | `30` | 群/私聊历史最多条数，不含本批用户消息，范围1～200 |
+| `CONTEXT_MAX_CHARS` | `24000` | 短期原文字符预算上限；超限保留连续尾部，必要截断会标记 |
 | `WORKING_MEMORY_CONTEXT_MAX_CHARS` | `24000` | 工作记忆独立预算，与CONTEXT_MAX_CHARS取较小值 |
-| `CONTEXT_BOT_REPLY_LIMIT` | `12` | 补充本群最近机器人回复及引用链，合并去重后共享历史预算；0关闭 |
 | `MEMORY_ENABLED` | `true` | 启用群聊/私聊隔离的长期记忆、回忆与显式操作 |
 | `MEMORY_AUTO_CAPTURE_ENABLED` | `true` | 开启任务结束整合及未唤醒消息后台整理；关闭后仍可显式添加/更新 |
 | `MEMORY_CAPTURE_DELAY_SECONDS` | `30` | 合并新消息等待时间，范围5～300秒 |
@@ -468,6 +465,7 @@ Linux Compose部署只读挂载宿主机`/proc/stat`、`/proc/meminfo`、`/proc/
 | `MEMORY_SEARCH_ROUTE_LIMIT` | `20` | 每路召回候选数 |
 | `MEMORY_CONTEXT_MAX_CHARS` | `5000` | 单次记忆检索返回的总字符预算 |
 | `MEMORY_SOURCE_SEARCH_ENABLED` | `true` | 明确回忆且结果不足时补查允许的原话 |
+| `MEMORY_AUTO_RECALL_ENABLED` | `false` | 自动注入长期检索结果；默认由模型按需调用memory_search，后台整理不受影响 |
 | `MEMORY_CONTEXT_QUERY_ENABLED` | `true` | 含糊追问使用本轮直接往返补充自动检索；日期等条件仍从原请求判断，不改变memory_search接口 |
 | `PERSONA_DETAILS_ENABLED` | `true` | 按当前话题加载外貌/互动/生活细节；false仅保留核心性格和身份边界 |
 | `MEMORY_JOB_MAX_ATTEMPTS` | `5` | 整理失败转failed前最多尝试次数 |
@@ -605,11 +603,13 @@ app/
 ├── tool_search.py # 复用本地embedding的top-k工具检索与会话内按需加载
 ├── messaging.py  # 当前会话的send_message工具、限量和确认状态
 ├── persona.py    # 小鲸鱼身份、性格、形象和表达风格
-├── focus_context.py # 已核验当前往返的检索/人设线索，不读取旁听或后到消息
+├── focus_context.py # 当前原文的有界检索/人设线索，不读取后到消息
 ├── memory_view.py # 自动召回记忆的紧凑模型视图，工具和数据库保留完整结构
 ├── prompting.py  # 稳定规则/场景/能力说明与结构化动态上下文的唯一组装入口
-├── chat_transcript.py # 原文快照转紧凑聊天行、成员表与回应关系索引
-├── working_memory.py # 最近80条结构化原文工作记忆与真实来源归档
+├── chat_history.py # 当前群原文游标翻页，不调用额外模型
+├── media_text.py # 安全消息段与媒体识别结果的文本视图
+├── chat_transcript.py # 原文快照转user/message为主体的简单JSON聊天数组
+├── working_memory.py # 最近30条结构化原文工作记忆与真实来源归档
 ├── task_evidence.py # 单次Agent证据范围和查询缓存，不保存推理
 ├── reminders.py  # 私聊提醒工具、时间校验、到期通知和失败重试
 ├── stickers.py   # 本地表情目录、视觉查看工具及发送限制

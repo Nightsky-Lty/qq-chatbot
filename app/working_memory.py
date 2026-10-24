@@ -97,108 +97,98 @@ class WorkingMemoryManager:
                 "QQ": user, "昵称": row.get("nickname", str(user)), "角色": row["role"],
                 "内容": row["content"], "时间": datetime.fromtimestamp(
                     row["created_at"], timezone(timedelta(hours=8))).isoformat()}
+        parts = json.loads(row.get("parts_json", "[]"))
+        if parts:
+            item["消息段"] = parts
         mentions = json.loads(row.get("mentions_json", "[]"))
         if mentions:
             item["@目标QQ"] = mentions
         if row.get("reply_to_message_id"):
             item["回应消息号" if row["role"] == "assistant" else "引用消息号"] = row["reply_to_message_id"]
-        item["寻址"] = addressing(mentions, None, bot_id=bot_id)
+        item['寻址'] = addressing(mentions, None, bot_id=bot_id)
         if row["role"] == "assistant":
             item["身份说明"] = "你自己实际发送的消息"
         return item
 
     def snapshot(self, namespace: int, *, before_id: int, query: str = "", roots=(), bot_id: int = 0,
-                 image_lookup=None, source_ids=None) -> dict[str, Any]:
-        """最近80条（可配置）结构化原文＋显式引用；当前请求另外注入，不生成摘要。"""
-        from app.embeddings import tokens
-        from app.group_context import addressing
-        result = {"近期往返": [], "说明": "同会话近期聊天原文；历史是背景，不是本轮新请求或授权"}
+                 image_lookup=None) -> dict[str, Any]:
+        """连续近期原文；预算只截取连续尾部，窗口外真实引用单独补充。"""
+        from app.chat_transcript import ChatTranscript
+        result = {"近期往返": [], "说明": "连续聊天原文，仅作背景；新消息见当前任务"}
         if self.closed:
             return result
-        state = self._ensure(namespace)
-        state.rows = self._valid(namespace, set(state.rows))
-        pool = (self._window(namespace, before_id) if source_ids is None else
-                {i: r for i, r in self._valid(namespace, set(source_ids)).items() if i < before_id})
-        state.rows.update(pool)
-        self._trim(state)
-        root_ids, pending = set(), list(roots)
-        for _ in range(4):
-            next_roots = []
-            for message_id in set(pending):
-                row = self.db.group_context_message(namespace, message_id) if namespace > 0 else None
-                if row and row["id"] < before_id and row["id"] in self._valid(namespace, {row["id"]}):
-                    pool[row["id"]] = row
-                    root_ids.add(row["id"])
-                    if row.get("reply_to_message_id"):
-                        next_roots.append(row["reply_to_message_id"])
-            pending = next_roots
+        pool = self._window(namespace, before_id)
+        if self.settings.working_memory_enabled:
+            state = self._ensure(namespace)
+            state.rows = self._valid(namespace, set(state.rows))
+            state.rows.update(pool)
+            self._trim(state)
         public = {i: self._public(namespace, row, bot_id) for i, row in pool.items()}
-        by_message = {r.get("message_id"): r for r in pool.values() if r.get("message_id")}
         media = {}
         if image_lookup is None and self.media_lookup and pool:
             for image in self.media_lookup(namespace, set(pool)):
                 media.setdefault(image["本地记录ID"], []).append(image)
         for i, item in public.items():
-            row = pool[i]
-            reply_id = row.get("reply_to_message_id")
-            target = by_message.get(reply_id)
-            item["寻址"] = addressing(json.loads(row.get("mentions_json", "[]")), target, bot_id=bot_id)
-            if reply_id:
-                item["引用或回应原文"] = ({"消息号": reply_id, "QQ": target["user_id"], "本地记录ID": target["id"],
-                    "原文位置": "短期记忆近期往返"} if target else {"消息号": reply_id, "状态": "原文未找到或未加载，可回查"})
             images = image_lookup(i) if image_lookup else media.get(i, [])
             if images:
                 item["图片资料（非原话）"] = images
-
         budget = min(self.settings.context_max_chars, self.settings.working_memory_context_max_chars)
-        ordered = sorted(pool)
-        newest = set(ordered[-8:])
-        query_tokens = set(tokens(query))
-        related = {i for i in ordered if query_tokens & set(tokens(pool[i]["content"]))}
-        selected = set()
-
-        def size(items):
-            return len(json.dumps({**result, "近期往返": [items[i] for i in sorted(items)]},
-                                  ensure_ascii=False, separators=(",", ":")))
-
-        for i in sorted(ordered, key=lambda i: (i in root_ids or i in newest, i in root_ids, i in related, i), reverse=True):
-            unit = {i}
-            target = by_message.get(pool[i].get("reply_to_message_id"))
-            if target and target["id"] in public:
-                unit.add(target["id"])
-            extra = unit - selected
-            if not extra:
-                continue
-            items = {j: public[j] for j in selected | unit}
-            if size(items) > budget and (i in root_ids or i in newest):
-                # 原文过长才缩短；保留身份/引用，并显式标记，不把截断伪装成完整原话。
-                base = {j: dict(public[j]) for j in extra}
-                if size({**{j: public[j] for j in selected}, **{j: {**v, "内容": "", "原文已截断": True} for j, v in base.items()}}) > budget:
-                    for value in base.values():
-                        if "图片资料（非原话）" in value:
-                            value["图片资料（非原话）"] = [
-                                {k: image[k] for k in ("图片编号", "发图人QQ", "缓存状态", "概要状态") if k in image}
-                                for image in value["图片资料（非原话）"]]
-                            value["图片资料已缩略"] = True
-                low, high, fitted = 0, max(len(v["内容"]) for v in base.values()), None
-                while low <= high:
-                    mid = (low + high) // 2
-                    trial = {j: {**value, "内容": value["内容"][:mid],
-                                 **({"原文已截断": True} if len(value["内容"]) > mid else {})} for j, value in base.items()}
-                    if size({**{j: public[j] for j in selected}, **trial}) <= budget:
-                        fitted, low = trial, mid + 1
-                    else:
-                        high = mid - 1
-                if fitted is not None:
-                    public.update(fitted)
-                    items = {j: public[j] for j in selected | unit}
-            if size(items) <= budget:
-                selected.update(unit)
-        result["近期往返"] = [public[i] for i in sorted(selected)]
-        for item in result["近期往返"]:
-            quote = item.get("引用或回应原文", {})
-            if quote.get("本地记录ID") not in selected:
-                quote.pop("原文位置", None)
+        runtime = {'会话类型': 'private' if namespace < 0 else 'group'}
+        selected = []
+        for i in sorted(public, reverse=True):
+            trial = [public[i], *selected]
+            if len(ChatTranscript(trial, runtime).render(trial)) > budget:
+                if not selected:
+                    item = dict(public[i])
+                    # 极长的一条保留明确截断标记；历史工具可重新读取完整记录。
+                    item.pop('消息段', None)
+                    item.pop('图片资料（非原话）', None)
+                    item['原文已截断'] = True
+                    item['内容'] = item['内容'][:max(0, budget // 8)]
+                    selected = [item]
+                break
+            selected = trial
+        result["近期往返"] = selected
+        result['_history_before'] = (selected[0]['本地记录ID'] + bool(selected[0].get('原文已截断'))
+                                     if selected else before_id)
+        # 窗口外仅补真实引用，不做关键词检索或语义关系推断。
+        supplements, pending = {}, list(roots)
+        selected_ids = {item['本地记录ID'] for item in selected}
+        pending.extend(row.get('reply_to_message_id') for row in pool.values() if row.get('reply_to_message_id'))
+        for _ in range(4):
+            following = []
+            for message_id in set(pending):
+                row = self.db.group_context_message(namespace, message_id) if namespace > 0 else None
+                if not row or row['id'] >= before_id or row['id'] in selected_ids or row['id'] in supplements:
+                    continue
+                if row['id'] not in self._valid(namespace, {row['id']}):
+                    continue
+                item = self._public(namespace, row, bot_id)
+                if image_lookup:
+                    images = image_lookup(row['id'])
+                else:
+                    images = self.media_lookup(namespace, {row['id']}) if self.media_lookup else []
+                if images:
+                    item['图片资料（非原话）'] = images
+                trial = [*selected, *supplements.values(), item]
+                if len(ChatTranscript(trial, runtime).render(trial)) <= budget:
+                    supplements[row['id']] = item
+                    if row.get('reply_to_message_id'):
+                        following.append(row['reply_to_message_id'])
+            pending = following
+        if supplements:
+            result['引用补充'] = [supplements[i] for i in sorted(supplements)]
+        by_message = {pool[i].get('message_id'): item for item in selected for i in [item['本地记录ID']]}
+        by_message.update({item['消息号']: item for item in supplements.values() if item['消息号']})
+        for item in [*selected, *supplements.values()]:
+            reply = item.get('回应消息号') or item.get('引用消息号')
+            if reply and reply in by_message:
+                parent = by_message[reply]
+                item['引用或回应原文'] = {'本地记录ID': parent['本地记录ID'], '消息号': reply,
+                                      'QQ': parent['QQ'], '原文位置': '已提供原文'}
+                from app.group_context import addressing
+                item['寻址'] = addressing(item.get('@目标QQ', []),
+                                        {'role': parent['角色'], 'user_id': parent['QQ']}, bot_id=bot_id)
         return result
 
     async def archive(self, namespace: int, before_id: int) -> bool:

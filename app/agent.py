@@ -27,8 +27,6 @@ class AgentOutcome:
     reasoning_tokens: int = 0
     cache_hit_tokens: int = 0
     usage_requests: int = 0
-    # 仅业务层等待解析额度时使用；不表示已调用或需要轮询回复模型。
-    retry_after: float = 0
 
 
 class ReactAgent:

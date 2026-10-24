@@ -139,6 +139,7 @@ class ImageCache:
     @staticmethod
     def describe(row: dict) -> dict:
         result = {"图片编号": f"media_{row['id']}", "本地记录ID": row["source_id"],
+                  "位置": row.get('position', 0),
                   "消息号": row["message_id"], "发图人QQ": row["user_id"],
                   "时间": datetime.fromtimestamp(row["created_at"], timezone(timedelta(hours=8))).isoformat(),
                   "缓存状态": row["status"], "概要状态": row.get("summary_state") or "pending"}

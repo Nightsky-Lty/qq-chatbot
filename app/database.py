@@ -144,6 +144,9 @@ class Database:
                     self.connection.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
             if "mentions_json" not in columns:
                 self.connection.execute("ALTER TABLE messages ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]'")
+            for table in ('messages', 'private_messages'):
+                if 'parts_json' not in {row['name'] for row in self.connection.execute(f'PRAGMA table_info({table})')}:
+                    self.connection.execute(f"ALTER TABLE {table} ADD COLUMN parts_json TEXT NOT NULL DEFAULT '[]'")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_onebot ON messages(group_id,message_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_group_role_id ON messages(group_id,role,id DESC)")
             # 旧库的授权表和样本资格字段不再读写，原样保留，避免为升级重建消息表。
@@ -430,17 +433,17 @@ class Database:
 
     def log_message(
         self, group_id: int, user_id: int, nickname: str, content: str, *, message_id: str = "",
-        role: str = "user", reply_to_message_id: str = "", mentions: list[int] | None = None,
+        role: str = "user", reply_to_message_id: str = "", mentions: list[int] | None = None, parts: list[dict] | None = None,
     ) -> int:
         """保存群文本；assistant的reply_to字段记录逻辑回应对象，不代表实际显示QQ引用。"""
         if not content:
             return 0
         with self._lock, self.connection:
             cursor = self.connection.execute(
-                """INSERT INTO messages(group_id,user_id,nickname,content,created_at,message_id,role,reply_to_message_id,mentions_json)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO messages(group_id,user_id,nickname,content,created_at,message_id,role,reply_to_message_id,mentions_json,parts_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (group_id, user_id, nickname, content[:4000], int(time.time()), message_id, role, reply_to_message_id,
-                 json.dumps(mentions or [])),
+                 json.dumps(mentions or []), json.dumps(parts or [], ensure_ascii=False)),
             )
             record_id = int(cursor.lastrowid)
             if role in {"user", "assistant"} and not content.lstrip().startswith(("/", "[戳一戳", "[表情包")):
@@ -610,14 +613,14 @@ class Database:
                 (group_id, message_id),
             ).fetchone() is not None
 
-    def log_private_message(self, user_id: int, role: str, content: str) -> int:
+    def log_private_message(self, user_id: int, role: str, content: str, *, parts: list[dict] | None = None) -> int:
         """保存私聊用户文本或已提交发送的机器人回复，每条最多 4000 字。"""
         if not content:
             return 0
         with self._lock, self.connection:
             cursor = self.connection.execute(
-                "INSERT INTO private_messages(user_id,role,content,created_at) VALUES(?,?,?,?)",
-                (user_id, role, content[:4000], int(time.time())),
+                "INSERT INTO private_messages(user_id,role,content,created_at,parts_json) VALUES(?,?,?,?,?)",
+                (user_id, role, content[:4000], int(time.time()), json.dumps(parts or [], ensure_ascii=False)),
             )
             if not content.lstrip().startswith(("/", "[戳一戳", "[表情包")):
                 self._queue_memory_capture(-user_id, int(cursor.lastrowid))

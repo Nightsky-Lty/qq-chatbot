@@ -28,8 +28,7 @@ class MessageSession:
                  *, private: bool, automatic: bool, preserve_layout: bool, lock: asyncio.Lock,
                  reply_targets: set[str] | None = None, default_reply: str = "", bot_id: int = 0,
                  max_chars: int = 100, max_messages: int | None = None,
-                 mention_targets: set[int] | None = None,
-                 on_group_reply: Callable[[int, str], None] | None = None):
+                 mention_targets: set[int] | None = None):
         self.registry = registry
         self.db = database
         self.sender = sender
@@ -49,14 +48,11 @@ class MessageSession:
         self.last_reply = default_reply
         self.selected_reply: str | None = None
         self.mention_targets = frozenset(mention_targets or ()) - {bot_id}
-        self.on_group_reply = on_group_reply
 
     def log_group_reply(self, content: str, *, message_id: str = "", reply_to: str = "",
                         mentions: list[int] | None = None) -> int:
         source_id = self.db.log_message(self.target, self.bot_id, "机器人", content, role="assistant",
                                         message_id=message_id, reply_to_message_id=reply_to, mentions=mentions)
-        if source_id and self.on_group_reply is not None:
-            self.on_group_reply(source_id, reply_to)
         return source_id
 
     def resolve_mentions(self, arguments: dict[str, Any]) -> list[int]:
