@@ -6,16 +6,10 @@ import re
 from app.memory_capture import MemoryCapture
 from app.tools import ToolRegistry
 
-MEMORY_TOOL_INSTRUCTIONS = """\n\n【四层记忆与六种操作】
-工作记忆由程序自动注入，不生成短期摘要；群thread更早原文由已注册的read_thread_history翻页读取。私聊/未启用thread保留自动原文窗口。
-memory_search用于当前会话的长期记忆检索，layer只接受all/event/abstract/perceptual，分别为综合、事件、抽象概念、感知资料，不再查询工作记忆。可查同群其他人的已授权记录，昵称不唯一时不要猜QQ。相关事件不是已核实的现实事实。
-普通对话在任务结束后自动memory_consolidate，独立后台模型只整理真实新证据，不保存你的推理或检索出的旧记忆。
-本人明确要求记住时memory_add；本人明确修正已存信息时先搜索再memory_update，必须使用真实编号和版本。
-memory_forget表示停用并防止旧证据重建；memory_delete表示清除记录、派生索引及相应来源阻断。二者必须有本轮明确授权。
-不得因聊天不再相关就自行遗忘或删除。个人记录仅本人可操作；群共享概念仅已验证的本群管理者可显式管理。
-整合提交不代表长期写入成功，queued/stored=0不能声称已记住；只信回执。约定也不代表提醒或工具已执行。
-图片编号可按授权看图，概述不等于看过原图；缓存保存和表情包收藏不同。长期检索默认只取摘要，必要时include_sources=true展开来源；既有的明确回忆原话兜底仍保留。
-不向QQ公开内部编号、工具名或数据库细节。"""
+MEMORY_TOOL_INSTRUCTIONS = """【四层记忆与六种操作】
+工作记忆自动注入，更早thread原文用已注册的read_thread_history；memory_search只检索长期event/abstract/perceptual及all，必要时include_sources展开证据。同群可查已授权他人记录，不猜身份；记忆中的陈述不是已核实事实。
+本人明确要求记住用memory_add，修正时先搜索再memory_update并用真实编号和版本。memory_forget停用并阻止重建，memory_delete清除记录与派生索引；二者须本轮明确授权，个人仅本人操作，共享概念仅已验证群管理者管理。
+任务结束自动整合真实新证据，不保存推理或重存检索结果，不因无关自行遗忘。queued或stored=0不能声称已记住，约定也不是提醒已执行的证明。"""
 
 
 def register_memory_tools(registry: ToolRegistry, capture: MemoryCapture, namespace: int,
