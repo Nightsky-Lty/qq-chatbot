@@ -22,6 +22,11 @@ SEND_MESSAGE_TOOL = {"type": "function", "function": {
 }}
 
 
+def single_line(text: str) -> str:
+    """兼容旧分条标记及Unicode换行，不丢失私聊正文或操作回执。"""
+    return " ".join(line.strip() for line in text.replace("[分条]", " ").splitlines() if line.strip())
+
+
 class MessageSession:
     def __init__(self, registry: ToolRegistry, database: Database,
                  sender: Callable[[int, list[dict[str, Any]]], Awaitable[Any]], target: int,
@@ -80,6 +85,8 @@ class MessageSession:
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         text = arguments["text"].strip()
+        if self.private:
+            text = single_line(text)
         if not text or "[CQ:" in text or "[不插话]" in text:
             return {"ok": False, "error": "请发送真实非空文字，不发送CQ码或内部标记。"}
         try:
@@ -93,7 +100,7 @@ class MessageSession:
                 return {"ok": False, "error": f"普通群回复最多{self.max_chars}字且不换行，只接一条新消息的一个话题；不要拆段总结历史。"}
         # 对旧模型输出的分条/换行仍作兼容，但所有文字都经过此发送工具。
         if self.private:
-            parts = [text.replace("[分条]", "\n").strip()]
+            parts = [text]
         else:
             chunks = re.split(r"(?m)^[ \t]*\[分条\][ \t]*\r?$", text)
             parts = [part.strip() for chunk in chunks
@@ -102,7 +109,8 @@ class MessageSession:
             return {"ok": False, "error": "没有可发送的文字，不要只传分条标记。"}
         if self.registry.receipt_error and self.registry.receipts:
             # 备忘动作有失败时只回真实回执，不能发送模型的错误“已全部保存”确认。
-            parts = ["\n".join(dict.fromkeys(self.registry.receipts))]
+            receipt_text = "\n".join(dict.fromkeys(self.registry.receipts))
+            parts = [single_line(receipt_text) if self.private else receipt_text]
         async with self.lock:
             if self.registry.delivery_uncertain:
                 return {"ok": False, "error": "上一条发送未确认，本轮不再发送，避免重复。"}
@@ -115,9 +123,13 @@ class MessageSession:
                 return {"ok": False, "error": "已达到本轮文字发送上限，请finish。"}
             parts = parts[:self.limit - self.count]
             if self.registry.receipts:
-                receipts = [receipt for receipt in dict.fromkeys(self.registry.receipts) if receipt not in parts[-1]]
+                receipts = [single_line(receipt) if self.private else receipt for receipt in self.registry.receipts]
+                receipts = [receipt for receipt in dict.fromkeys(receipts) if receipt and receipt not in parts[-1]]
                 if receipts:
                     parts[-1] += "\n\n" + "\n".join(receipts)
+            if self.private:
+                # 合并回执和失败兜底也经过单行收口，实际发送与入库保持一致。
+                parts = [single_line(part) for part in parts]
             self.registry.output_attempted = True  # 超时/取消前就占位，不能误重发。
             self.registry.delivery_uncertain = True
             self.selected_reply = reply_to

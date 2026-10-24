@@ -1046,6 +1046,7 @@ class BotService:
                 return await messages.execute(arguments)
             send_definition = copy.deepcopy(SEND_MESSAGE_TOOL)
             if private:
+                send_definition['function']['description'] = '向当前私聊发送一条单行文字，不换行、不分段，不@或引用；条数和长度遵守运行环境。'
                 send_definition["function"]["parameters"]["properties"].pop("at_user_ids")
                 send_definition["function"]["parameters"]["properties"].pop("reply_to_message_id")
             registry.register(send_definition, send_text)
