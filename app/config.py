@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     deepseek_reasoning_effort: Literal["low", "high", "max"] = "high"
     # 开启思考时包括推理与最终输出，避免旧500/1500上限截断工具调用。
     deepseek_thinking_max_tokens: int = Field(default=4096, ge=512, le=16384)
+    tool_search_enabled: bool = True
+    tool_search_max_calls: int = Field(default=3, ge=1, le=6)
+    tool_search_top_k: int = Field(default=3, ge=1, le=8)
+    tool_search_min_similarity: float = Field(default=0.35, ge=0, le=1)
     # 后台职责使用独立客户端；留空继承聊天连接，模型/思考可分别调整。
     sticker_llm_model: str = ""
     sticker_llm_base_url: str = ""

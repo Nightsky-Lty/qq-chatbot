@@ -39,6 +39,7 @@ from app.sticker_collect import (
     COLLECT_STICKER_TOOL, CollectionJob, CollectionSession, StickerCollector,
 )
 from app.tools import FINISH_TOOL, WAIT_FOR_MESSAGES_TOOL, ToolRegistry
+from app.tool_search import ToolRetriever, enable_tool_search
 from app.web_search import WEB_TOOLS, WebSearchService, WebSession, user_urls
 from app.voice import LIST_VOICE_CHARACTERS_TOOL, SEND_VOICE_TOOL, VoiceService, VoiceSession, VoiceTransport
 
@@ -128,6 +129,7 @@ class BotService:
         self.sticker_collector.images.cached_loader = self.image_cache.load
         self.sticker_collector.images.cached_validator = self.image_cache.authorized
         self.memory = MemoryService(settings, database)
+        self.tool_retriever = ToolRetriever(self.memory.provider, min_similarity=settings.tool_search_min_similarity)
         self.memory.image_cache = self.image_cache
         self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
         self.working_memory = WorkingMemoryManager(settings, database, self.memory_capture)
@@ -1314,6 +1316,11 @@ class BotService:
                     image_session.sources.get(image_id, {"图片编号": image_id})
                     for image_id in image_session.available if image_id not in known
                 )
+            if self.settings.tool_search_enabled and not observe_only and (system is None or private or automatic):
+                initial_tools = ([definition["function"]["name"] for definition in STICKER_TOOLS]
+                                 if sticker_session is not None and sticker_session.cadence_due else [])
+                enable_tool_search(registry, self.tool_retriever, max_calls=self.settings.tool_search_max_calls,
+                                   top_k=self.settings.tool_search_top_k, initial_tools=initial_tools)
             outcome = await self.agent.run(prompt, registry, history=history, system=system or SYSTEM_PROMPT,
                                            context=context, scene=scene)
             if outcome.error and not registry.output_attempted and not automatic:

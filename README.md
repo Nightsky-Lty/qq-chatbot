@@ -58,6 +58,10 @@
 
 默认开启 `AGENT_BATCH_COMPLETION_ENABLED=true`。最后一个发送工具（文字、表情、语音或戳一戳）可以携带 `next_action="finish"`，群聊继续跟进则携带 `next_action="wait"`。程序先执行原有校验、等待真实发送成功，再调用绑定的结束/等待处理器，不必额外请求模型只做收尾。例如 `send_message({"text":"九点见","next_action":"wait"})`。仍需观察工具结果、补充发送或继续操作时省略该字段，或使用 `continue`；有依赖的搜索/读取/提醒操作依旧先取得真实回执。原有结束工具保留。关掉配置可恢复逐步收尾。
 
+默认开启 `TOOL_SEARCH_ENABLED=true`。聊天Agent最初只接收当前会话已有的文字发送、等待、结束及 `search_tools`，到点的表情延后工具也保留；其他业务工具仍完成会话绑定，但schema和能力说明按需提供。运行环境列出简短能力目录，模型通过 `search_tools({"query":"打开这篇文章","top_k":3})` 检索后，下一次模型请求会包含匹配工具的真实schema与说明，原始思考和工具回执链保持完整。检索只加载，不执行实际业务；未加载工具调用会被拒绝。表情轮数到点时预载表情工具，模仿和后台观察不启用检索。
+
+工具检索复用长期记忆的本地embedding提供器，默认BGE ONNX；对短任务描述生成向量，按余弦相似度取达到阈值的top-k个工具，准确工具名直接定位，必要依赖单独补齐。只在本轮已注册工具中排名，群聊不能检索出私聊提醒等未注册能力；不使用Qdrant或额外聊天LLM。工具说明向量最多缓存256项，查询结果仅本轮缓存，重启重建；相同检索不重复扣本轮额度。默认每轮最多3次不同检索、top-k为3、BGE最低相似度0.35；单次检索最多5秒，受Agent总预算约束。embedding不可用时明确标为 `hash_fallback`，不宣称是语义检索；候选仍由Agent选择，可能误召回。修改 `TOOL_SEARCH_TOP_K`、`TOOL_SEARCH_MIN_SIMILARITY` 可调默认召回，调用参数top_k可覆盖为1～8；设开关为false恢复全量工具与说明。
+
 无工具调用的最终文本通过原发送器成功提交后，由程序直接收尾：群聊默认保持当前交流焦点等待新消息，私聊结束；需要明确告别时模型可通过发送工具指定finish。所有发送预算、目标、冷却及失败不重发约束不变。一次工具批次中收尾成功后，后面的动作不再执行。
 
 上下文JSON使用紧凑序列化，省略没有信息的空@/引用字段。同一历史时间线中已出现的引用原文只保留作者与记录索引，不重复附带正文；未在时间线内的已知引用仍保留原文，未找到的引用继续明确标注未知。人设、历史预算和思考强度保持原配置。
@@ -471,6 +475,10 @@ Linux Compose部署只读挂载宿主机`/proc/stat`、`/proc/meminfo`、`/proc/
 | `MEMORY_MAX_CHARS` | `200` | 单条长期记忆最大字数 |
 | `MEMORY_MIN_CONFIDENCE` | `0.8` | 模型自动写入长期记忆的最低置信度 |
 | `EMBEDDING_PROVIDER` | `bge_onnx` | `bge_onnx` 使用本地 BGE ONNX；`hash` 强制使用轻量哈希 |
+| `TOOL_SEARCH_ENABLED` | `true` | 业务工具schema和说明按需检索加载，false为全量提供 |
+| `TOOL_SEARCH_MAX_CALLS` | `3` | 每轮不同工具检索上限，1～6；缓存命中不扣次数 |
+| `TOOL_SEARCH_TOP_K` | `3` | 默认召回工具数，1～8；必要依赖不计入top-k |
+| `TOOL_SEARCH_MIN_SIMILARITY` | `0.35` | BGE余弦相似度阈值；哈希降级采用独立阈值 |
 | `EMBEDDING_MODEL_PATH` | `/app/models/bge-small-zh-v1.5` | 容器内模型和 tokenizer 目录 |
 | `EMBEDDING_MODEL_FILE` | `model_quantized.onnx` | 模型目录中的 ONNX 文件名 |
 | `EMBEDDING_MAX_LENGTH` | `128` | 单条记忆/查询的最大 token 长度 |
@@ -591,7 +599,8 @@ app/
 ├── llm.py        # DeepSeek API 调用和异常处理
 ├── agent.py      # ReAct循环、工具观察、预算及终止
 ├── conversation.py # 群聚批、串行有界队列和话题活跃状态
-├── tools.py      # 工具注册表、参数校验及finish定义
+├── tools.py      # 工具注册表、加载可见性、参数校验及finish定义
+├── tool_search.py # 复用本地embedding的top-k工具检索与会话内按需加载
 ├── messaging.py  # 当前会话的send_message工具、限量和确认状态
 ├── persona.py    # 小鲸鱼身份、性格、形象和表达风格
 ├── prompting.py  # 稳定规则/场景/能力说明与结构化动态上下文的唯一组装入口

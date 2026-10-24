@@ -17,6 +17,7 @@ from app.reminders import REMINDER_INSTRUCTIONS
 from app.sticker_collect import COLLECT_INSTRUCTIONS
 from app.stickers import STICKER_INSTRUCTIONS
 from app.tools import ToolRegistry
+from app.tool_search import TOOL_SEARCH_INSTRUCTIONS
 from app.thread_history import THREAD_HISTORY_INSTRUCTIONS
 from app.voice import VOICE_INSTRUCTIONS
 from app.web_search import WEB_INSTRUCTIONS
@@ -75,6 +76,7 @@ class ContextPacket:
 # 工具自己的补充说明仍在功能模块维护；每种说明只挂在一个主工具上。
 # 不按配置猜能力，而以本轮注册表为准；后台LLM不走此入口。
 CAPABILITY_NOTES = (
+    ("search_tools", TOOL_SEARCH_INSTRUCTIONS),
     ("get_message_image", CHAT_IMAGE_INSTRUCTIONS),
     ("web_search", WEB_INSTRUCTIONS),
     ("memory_search", MEMORY_TOOL_INSTRUCTIONS),
@@ -85,6 +87,15 @@ CAPABILITY_NOTES = (
     ("send_voice", VOICE_INSTRUCTIONS),
     ("create_reminder", REMINDER_INSTRUCTIONS),
 )
+
+# 同一能力可检索到其中任一工具，说明仍只注入一次，不为补说明而加载无关schema。
+CAPABILITY_TOOL_NAMES = {
+    "web_search": {"web_search", "web_fetch"},
+    "memory_search": {"memory_search", "memory_add", "memory_update", "memory_delete", "memory_forget", "memory_consolidate"},
+    "send_sticker": {"search_stickers", "list_stickers", "get_sticker_image", "send_sticker"},
+    "send_voice": {"list_voice_characters", "send_voice"},
+    "create_reminder": {"create_reminder", "list_reminders", "cancel_reminder"},
+}
 
 
 class PromptBuilder:
@@ -102,7 +113,8 @@ class PromptBuilder:
             parts.append("【观察场景】只处理资料，不向QQ发送消息。")
         else:
             parts.extend((GROUP_SCENE, GROUP_UNDERSTANDING))
-        parts.extend(note.strip() for name, note in CAPABILITY_NOTES if name in registry.bindings)
+        parts.extend(note.strip() for name, note in CAPABILITY_NOTES
+                     if CAPABILITY_TOOL_NAMES.get(name, {name}) & registry.visible_names)
         return "\n\n".join(parts)
 
     @classmethod
@@ -121,6 +133,9 @@ class PromptBuilder:
         runtime["当前星期"] = "星期" + "一二三四五六日"[now.weekday()]
         runtime["收尾能力"] = [name for name in ("finish", "wait_for_messages") if name in registry.bindings]
         runtime["合并发送与收尾"] = registry.batch_completion_enabled
+        if registry.tool_search is not None:
+            runtime["可检索工具能力"] = registry.tool_search.catalogue()
+            runtime["工具检索次数上限"] = registry.tool_search.max_calls
         background: dict[str, Any] = {}
         if context.working:
             background["短期记忆"] = context.working

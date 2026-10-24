@@ -30,6 +30,8 @@ class ToolRegistry:
         self.batch_completion_enabled = True
         self.terminated = False
         self.task_evidence = None
+        self._visible_names: set[str] | None = None
+        self.tool_search = None
 
     def register(self, definition: dict[str, Any], handler: Handler, *, terminal: bool = False) -> None:
         name = definition["function"]["name"]
@@ -39,7 +41,25 @@ class ToolRegistry:
 
     @property
     def definitions(self) -> list[dict[str, Any]]:
-        return [self._definition(binding) for binding in self.bindings.values()]
+        visible = self.visible_names
+        return [self._definition(binding) for name, binding in self.bindings.items() if name in visible]
+
+    @property
+    def visible_names(self) -> frozenset[str]:
+        return frozenset(self.bindings if self._visible_names is None else self._visible_names)
+
+    def defer_tools(self, keep: set[str]) -> None:
+        if not keep <= self.bindings.keys():
+            raise ValueError("cannot expose unregistered tools")
+        self._visible_names = set(keep)
+
+    def load_tools(self, names: set[str]) -> set[str]:
+        if not names <= self.bindings.keys():
+            raise ValueError("cannot load unregistered tools")
+        added = names - self.visible_names
+        if self._visible_names is not None:
+            self._visible_names.update(names)
+        return added
 
     def _definition(self, binding: ToolBinding) -> dict[str, Any]:
         if not self.batch_completion_enabled or binding.definition["function"]["name"] not in OUTPUT_TOOLS:
@@ -57,6 +77,8 @@ class ToolRegistry:
             return {"ok": False, "error": "本轮已结束，不再执行动作。"}
         if binding is None or not isinstance(arguments, dict):
             return {"ok": False, "error": "当前会话未注册该工具或参数不是对象。"}
+        if name not in self.visible_names:
+            return {"ok": False, "error": "该工具尚未加载，请先用search_tools按需求检索，再使用返回的工具。"}
         schema = self._definition(binding)["function"]["parameters"]
         properties = schema.get("properties", {})
         if (set(schema.get("required", [])) - arguments.keys()

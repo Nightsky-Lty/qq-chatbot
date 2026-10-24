@@ -41,6 +41,7 @@ class ReactAgent:
                   context: ContextPacket | None = None, scene: PromptScene | None = None) -> AgentOutcome:
         messages = PromptBuilder.messages(prompt, registry, persona=system, scene=scene,
                                           context=context, history=history)
+        advertised = registry.visible_names
         image_keys: set[str] = set()
         cached: dict[str, tuple[str, dict[str, Any]]] = {}
         steps = calls_used = 0
@@ -51,6 +52,10 @@ class ReactAgent:
             async with asyncio.timeout(self.settings.agent_timeout_seconds):
                 for step in range(self.settings.agent_max_steps):
                     steps = step + 1
+                    if registry.visible_names != advertised:
+                        # 只更新能力说明；完整保留本次assistant/tool链及原始reasoning_content。
+                        messages[0]["content"] = PromptBuilder.system(registry, scene or PromptScene(), system)
+                        advertised = registry.visible_names
                     message = await self.llm.request_message(messages, 0.8, registry.definitions)
                     observed_usage = message.get("_usage", {})
                     if isinstance(observed_usage, dict):
