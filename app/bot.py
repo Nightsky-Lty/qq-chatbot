@@ -265,6 +265,10 @@ class BotService:
             return
         # 群收图逐张抽签，不沿用聊天看图的前三张限制；模型上下文仍最多3张。
         view = parse_message(event.get("message"), image_limit=None)
+        received_at = time.monotonic()
+        if (event["message_type"] == "group" and isinstance(event.get("time"), (int, float))
+                and abs(time.time() - event["time"]) <= self.settings.random_chat_window_seconds):
+            self.conversations.note_activity(int(event["group_id"]), received_at)
         command = view.text.strip()
         if self_id and self_id in view.mentions:
             command = re.sub(rf"@{self_id}(?!\d)", "", command).strip()
@@ -311,6 +315,7 @@ class BotService:
             )
         entry = GroupMessage(
             storage_id, message_id, user_id, nickname, view.text, self_id,
+            received_at=received_at,
             mentions=view.mentions, reply_to=view.reply_to, parts=view.parts,
             images=(view.images if self.image_cache.enabled else
                     (view.images[:3] if self.settings.chat_image_enabled or self.sticker_collector.enabled else [])),
@@ -587,15 +592,20 @@ class BotService:
                         group_id, len(history_entries), len(current), len(images))
             try:
                 # 无@跟进不能因等待并发名额或模型耗时而越过活跃期时限。
-                timeout = None if batch.wakes_followup else max(0.01, min(state.idle_until, state.hard_until) - time.monotonic())
-                async with asyncio.timeout(timeout):
-                    outcome = await self._run_ai_reply(
-                        group_id, focus.user_id, focus.text, self._confirmed_senders.get(sender, sender),
-                        context=context, image_session=ChatImageSession(images, image_ids=stable_ids, sources=image_sources) if images and self.settings.chat_image_enabled else None,
-                        automatic=not batch.wakes_followup, batch=batch, mention_targets=mention_targets,
-                        collection_jobs=collection_jobs, recalled_memories=memories,
-                    )
-                    return outcome
+                deadline = None if batch.wakes_followup else min(state.idle_until, state.hard_until)
+                async with asyncio.timeout_at(deadline) as run_timeout:
+                    if not batch.wakes_followup:
+                        state.run_timeout = run_timeout
+                    try:
+                        return await self._run_ai_reply(
+                            group_id, focus.user_id, focus.text, self._confirmed_senders.get(sender, sender),
+                            context=context, image_session=ChatImageSession(images, image_ids=stable_ids, sources=image_sources) if images and self.settings.chat_image_enabled else None,
+                            automatic=not batch.wakes_followup, batch=batch, mention_targets=mention_targets,
+                            collection_jobs=collection_jobs, recalled_memories=memories,
+                        )
+                    finally:
+                        if state.run_timeout is run_timeout:
+                            state.run_timeout = None
             except TimeoutError:
                 return None
         finally:
@@ -911,8 +921,14 @@ class BotService:
             return
         # 单调时钟适合计算时间间隔，不受系统日期调整影响。
         now = time.monotonic()
-        cooldown = (self.settings.sticker_collect_observe_seconds if observe_only else
-                    (self.settings.auto_chat_cooldown_seconds if automatic else self.settings.ai_cooldown_seconds))
+        if observe_only:
+            cooldown = self.settings.sticker_collect_observe_seconds
+        elif automatic:
+            cooldown = self.settings.auto_chat_cooldown_seconds
+        elif private:
+            cooldown = self.settings.private_ai_cooldown_seconds
+        else:
+            cooldown = self.settings.ai_cooldown_seconds
         wait = cooldown - (now - self._last_ai_call.get(key, float("-inf")))
         if wait > 0:
             if not automatic:
@@ -1216,7 +1232,7 @@ class BotService:
                         messages.selected_reply = reply_to
                         quote_to = arguments.get("reply_to_message_id", "")
                         segments = ([reply_segment(quote_to)] if quote_to and not private else []) + segments
-                        sent_id = await send_message(target, segments)
+                        sent_id = await messages.sender(target, segments)
                         registry.delivery_uncertain = False
                         registry.outputs_sent += 1
                         messages.last_reply = reply_to

@@ -86,6 +86,9 @@ class ConversationState:
     idle_until: float = 0
     hard_until: float = 0
     next_run_at: float = 0
+    last_message_at: float = 0
+    expiry_handle: asyncio.TimerHandle | None = None
+    run_timeout: asyncio.Timeout | None = None
 
     def active(self, now: float) -> bool:
         if self.following and now < min(self.idle_until, self.hard_until):
@@ -96,6 +99,9 @@ class ConversationState:
     def stop_followup(self) -> None:
         self.following = False
         self.idle_until = self.hard_until = 0
+        if self.expiry_handle is not None:
+            self.expiry_handle.cancel()
+            self.expiry_handle = None
 
 
 Runner = Callable[[int, GroupBatch, Sender], Awaitable["AgentOutcome | None"]]
@@ -113,6 +119,35 @@ class GroupConversations:
         self.states: dict[int, ConversationState] = {}
         self.activity: dict[int, GroupActivity] = {}
         self.closed = False
+
+    def _arm_expiry(self, group_id: int, state: ConversationState) -> None:
+        if state.expiry_handle is not None:
+            state.expiry_handle.cancel()
+        deadline = min(state.idle_until, state.hard_until)
+        state.expiry_handle = asyncio.get_running_loop().call_later(
+            max(0, deadline - time.monotonic()), self._expire, group_id, state)
+
+    def _expire(self, group_id: int, state: ConversationState) -> None:
+        if self.states.get(group_id) is not state:
+            return
+        if state.active(time.monotonic()):
+            self._arm_expiry(group_id, state)
+        else:
+            logger.info("Group followup expired: group=%s", group_id)
+
+    def note_activity(self, group_id: int, received_at: float) -> None:
+        """新群消息续空闲期，包含群友互聊/命令；不靠机器人发言续期。"""
+        state = self.states.get(group_id)
+        if state is None:
+            return
+        now = time.monotonic()
+        active = state.active(now)
+        state.last_message_at = max(state.last_message_at, received_at)
+        if active:
+            state.idle_until = state.last_message_at + self.settings.chat_active_idle_seconds
+            self._arm_expiry(group_id, state)
+            if state.run_timeout is not None and not state.run_timeout.expired():
+                state.run_timeout.reschedule(min(state.idle_until, state.hard_until))
 
     def _record_activity(self, group_id: int, entry: GroupMessage, now: float) -> GroupActivity:
         cutoff = now - self.settings.random_chat_window_seconds
@@ -169,6 +204,8 @@ class GroupConversations:
             if len(self.states) >= self.settings.chat_max_pending_groups:
                 return "full"
             state = self.states[group_id] = ConversationState(sender)
+        if not entry.poke and entry.random_eligible:
+            self.note_activity(group_id, entry.received_at)
         if not (entry.direct or entry.random_trigger) and not state.active(now) and not state.pending and state.worker is None:
             return "ignored"
         if any(item.message_id == entry.message_id for item in state.pending) and entry.message_id:
@@ -213,13 +250,16 @@ class GroupConversations:
                 now = time.monotonic()
                 state.next_run_at = now + self.settings.ai_cooldown_seconds
                 if outcome is not None and not outcome.error and outcome.wait_for_messages:
-                    # 沉默不续期；普通跟进不能跨过超时重新开启，明确唤醒可以。
+                    # 普通跟进不能跨过超时重新开启，明确唤醒可以。
                     still_active = state.active(now)
                     if outcome.sent and (still_active or batch.wakes_followup):
                         if not still_active:
                             state.hard_until = now + self.settings.chat_active_max_seconds
+                            state.last_message_at = max(state.last_message_at, batch.entries[-1].received_at)
                         state.following = True
-                        state.idle_until = now + self.settings.chat_active_idle_seconds
+                        state.idle_until = state.last_message_at + self.settings.chat_active_idle_seconds
+                        if state.active(now):
+                            self._arm_expiry(group_id, state)
                 else:
                     state.stop_followup()
                 logger.info("Group conversation state: group=%s active=%s", group_id, state.active(now))

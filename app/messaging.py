@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import random
 import re
+import time
 from typing import Any, Awaitable, Callable
 
 from app.database import Database
@@ -94,6 +96,25 @@ def short_messages(text: str, max_chars: int = 20) -> list[str]:
     return parts
 
 
+class PacedMessageSender:
+    """同轮文字/表情共用节奏，首条立即发，后续间隔随机1～3秒。"""
+
+    def __init__(self, sender: Callable[[int, list[dict[str, Any]]], Awaitable[Any]]):
+        self.sender = sender
+        self.last_sent_at: float | None = None
+        self.lock = asyncio.Lock()
+
+    async def __call__(self, target: int, segments: list[dict[str, Any]]) -> Any:
+        async with self.lock:
+            if self.last_sent_at is not None:
+                delay = random.uniform(1, 3) - (time.monotonic() - self.last_sent_at)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            result = await self.sender(target, segments)
+            self.last_sent_at = time.monotonic()
+            return result
+
+
 class MessageSession:
     def __init__(self, registry: ToolRegistry, database: Database,
                  sender: Callable[[int, list[dict[str, Any]]], Awaitable[Any]], target: int,
@@ -103,7 +124,7 @@ class MessageSession:
                  mention_targets: set[int] | None = None):
         self.registry = registry
         self.db = database
-        self.sender = sender
+        self.sender = PacedMessageSender(sender)
         self.target = target
         self.private = private
         self.limit = max_messages if max_messages is not None else 6
