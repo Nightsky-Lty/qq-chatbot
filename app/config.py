@@ -125,7 +125,9 @@ class Settings(BaseSettings):
     chat_queue_wait_seconds: int = Field(default=120, ge=10, le=600)
     chat_active_idle_seconds: int = Field(default=300, ge=10, le=3600)
     chat_active_max_seconds: int = Field(default=1800, ge=30, le=7200)
-    group_reply_max_chars: int = Field(default=100, ge=10, le=500)
+    # 保留配置名兼容部署；聊天发送层始终不超过20字符，群聊和私聊共用。
+    group_reply_max_chars: int = Field(default=20, ge=1, le=500)
+    chat_reply_max_messages: int = Field(default=6, ge=1, le=12)
     # 主动戳一戳由LLM决定；每轮最多一次，同一群/私聊共用跨轮冷却。
     poke_enabled: bool = True
     poke_cooldown_seconds: int = Field(default=60, ge=1, le=3600)

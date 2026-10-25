@@ -87,7 +87,8 @@ class ReactAgent:
                             completion = await registry.execute(terminal, {})
                             if completion.get("ok") is True:
                                 break
-                        if text and "wait_for_messages" in registry.bindings:
+                        if text and ("wait_for_messages" in registry.bindings
+                                     or send_result is not None and send_result.get("ok") is False):
                             state = send_result if send_result is not None else {"note": "此前已有发送尝试，不再重复提交最终文字。"}
                             messages.append(program_feedback("兼容发送回执", state))
                             continue

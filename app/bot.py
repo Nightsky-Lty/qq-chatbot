@@ -1027,7 +1027,7 @@ class BotService:
                 registry.register(READ_CHAT_HISTORY_TOOL, chat_history.execute)
                 context.runtime['更早群聊查询'] = chat_history.runtime()
             allowed_mentions = {qq: name for qq, name in allowed_mentions.items() if qq > 0 and qq != bot_id}
-            preserve_layout = not private and (batch is not None or not automatic) and self._needs_multiline_layout(prompt)
+            preserve_layout = False
             conversation = ("private", user_id) if private else ("group", context_id)
             sticker_context = {}
             messages = MessageSession(
@@ -1038,7 +1038,7 @@ class BotService:
                 default_reply=batch.focus.message_id if batch else (source_message.message_id if source_message else ""),
                 bot_id=bot_id, mention_targets=set(allowed_mentions),
                 max_chars=self.settings.group_reply_max_chars,
-                max_messages=(2 if batch.direct else 1) if batch else None,
+                max_messages=self.settings.chat_reply_max_messages,
             )
             async def send_text(arguments: dict[str, Any]) -> dict[str, Any]:
                 if observe_only:
@@ -1046,7 +1046,7 @@ class BotService:
                 return await messages.execute(arguments)
             send_definition = copy.deepcopy(SEND_MESSAGE_TOOL)
             if private:
-                send_definition['function']['description'] = '向当前私聊发送一条单行文字，不换行、不分段，不@或引用；条数和长度遵守运行环境。'
+                send_definition['function']['description'] = '向当前私聊发送每条1～20字的口语短消息；text用换行分隔多条，程序逐条发送。整轮条数遵守运行环境，不@或引用。'
                 send_definition["function"]["parameters"]["properties"].pop("at_user_ids")
                 send_definition["function"]["parameters"]["properties"].pop("reply_to_message_id")
             registry.register(send_definition, send_text)
@@ -1066,7 +1066,7 @@ class BotService:
                 voice_session = VoiceSession(self.voices, messages, voice_transport)
                 registry.register(LIST_VOICE_CHARACTERS_TOOL, voice_session.list_characters)
                 registry.register(SEND_VOICE_TOOL, voice_session.execute)
-                context.runtime["语音约束"] = {"字数上限": min(self.settings.voice_max_chars, self.settings.group_reply_max_chars),
+                context.runtime["语音约束"] = {"字数上限": min(self.settings.voice_max_chars, messages.max_chars),
                                               "冷却秒数": self.settings.voice_cooldown_seconds}
 
             if self.settings.web_search_enabled and not observe_only and (batch is not None or private):
@@ -1249,7 +1249,7 @@ class BotService:
             scene = PromptScene(
                 kind="observe" if observe_only else ("private" if private else ("group_batch" if batch else "group")),
                 trigger=trigger, preserve_layout=preserve_layout,
-                max_chars=4000 if private or preserve_layout else messages.max_chars,
+                max_chars=messages.max_chars,
                 max_messages=0 if observe_only else messages.limit,
             )
             context.memories = injected_memories
@@ -1318,16 +1318,6 @@ class BotService:
         )
         result = await messages.execute({"text": text})
         logger.info("Sticker collection announcement: group=%s sent=%s", job.group_id, result.get("sent", 0))
-
-    @staticmethod
-    def _needs_multiline_layout(prompt: str) -> bool:
-        """根据当前请求决定是否保留排版，不让历史话题开启长文模式。"""
-        return bool(re.search(
-            r"详细|展开|长文|完整.{0,6}(代码|脚本|程序)|"
-            r"(?:写|给|生成|提供).{0,10}(代码|脚本|程序|诗|故事|作文|文章|歌词|列表|清单|表格)|"
-            r"作诗|多行|换行|分步骤|教程",
-            prompt, re.IGNORECASE,
-        ))
 
     @staticmethod
     async def _send_text(send_message: SendMessage, target_id: int, text: str) -> None:
