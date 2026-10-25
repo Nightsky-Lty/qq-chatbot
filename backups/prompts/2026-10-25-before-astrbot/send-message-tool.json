@@ -1,0 +1,37 @@
+{
+  "type": "function",
+  "function": {
+    "name": "send_message",
+    "description": "向当前会话发送口语短消息，普通文字每条1～20字；完整HTTP(S)网址单独一条，代码用完整代码块单独一条，二者允许超长且不拆内容。text中用换行分隔自然短句；整轮条数遵守运行环境，超额整次拒绝。只回应一个话题，默认不引用、不@；群聊引用/@仅用授权参数。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "description": "普通口语每条不超过运行环境上限，多条用换行分隔，通常1～3条即可。网址用完整http://或https://链接独占一行，不混说明或Markdown链接；代码用完整围栏代码块，保留换行缩进。网址/代码不受20字限制，但text合计最多4000字符。"
+        },
+        "reply_to_message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "description": "可选：显式显示QQ引用框。省略则普通发送，仍回应当前焦点；只在多人容易串话或需明确指向时填写，不要每条都引用。私聊不提供。"
+        },
+        "at_user_ids": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "可选：真实@的QQ号列表，最多3人，只能使用程序列出的本轮允许@成员。可围绕当前话题主动点名、邀请或提醒，不必等对方要求；不要每条回复都@，不能@全体、自己或猜测QQ号。私聊不提供。"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

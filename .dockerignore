@@ -5,3 +5,5 @@
 !uv.lock
 !app/
 !app/*.py
+!app/prompts/
+!app/prompts/*.txt

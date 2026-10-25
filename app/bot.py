@@ -18,8 +18,7 @@ from app.conversation import GroupBatch, GroupConversations, GroupMessage
 from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
 from app.database import Database
 from app.llm import DeepSeekClient, SYSTEM_PROMPT
-from app.persona import PersonaSelector
-from app.focus_context import focus_background, memory_context_query
+from app.focus_context import memory_context_query
 from app.models import (
     MessageView, PokeView, at_segment, normalize_message_id, parse_message,
     parse_poke_event, reply_segment, text_segment,
@@ -128,7 +127,6 @@ class BotService:
         self.sticker_collector.images.cached_validator = self.image_cache.authorized
         self.memory = MemoryService(settings, database)
         self.tool_retriever = ToolRetriever(self.memory.provider, min_similarity=settings.tool_search_min_similarity)
-        self.persona_selector = PersonaSelector(self.tool_retriever)
         self.memory.image_cache = self.image_cache
         self.memory_capture = MemoryCapture(settings, database, self.memory, self.memory_llm)
         self.working_memory = WorkingMemoryManager(settings, database, self.memory_capture)
@@ -1291,10 +1289,6 @@ class BotService:
                 enable_tool_search(registry, self.tool_retriever, max_calls=self.settings.tool_search_max_calls,
                                    top_k=self.settings.tool_search_top_k, initial_tools=initial_tools)
             persona = system or SYSTEM_PROMPT
-            if system is None and not observe_only and self.settings.persona_details_enabled:
-                persona, selected_details = await self.persona_selector.select(prompt,
-                    focus_background(context, history=history, limit=2, assistant_only=True))
-                logger.info('Persona selected: details=%s', ','.join(selected_details) or 'core')
             outcome = await self.agent.run(prompt, registry, history=history, system=persona,
                                            context=context, scene=scene)
             if outcome.error and not registry.output_attempted and not automatic:

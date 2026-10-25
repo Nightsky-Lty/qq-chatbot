@@ -116,8 +116,6 @@ class Settings(BaseSettings):
     embedding_threads: int = Field(default=2, ge=1, le=4)
     embedding_backfill_batch_size: int = Field(default=16, ge=1, le=64)
     embedding_min_similarity: float = Field(default=0.35, ge=0, le=1)
-    # 可选人设只改变表达资料，不影响身份权限和工具授权。
-    persona_details_enabled: bool = True
     embedding_query_prefix: str = "为这个句子生成表示以用于检索相关文章："
     chat_batch_seconds: float = Field(default=3, ge=0, le=10)
     chat_batch_max_messages: int = Field(default=30, ge=3, le=100)

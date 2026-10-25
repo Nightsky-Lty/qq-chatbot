@@ -1,0 +1,15 @@
+{
+  "source_commit": "1555a01b77adf923a4e4205cf95152049f38e1b1",
+  "scope": "Static persona source, prompt assembly source, rendered base system prompts without capability notes, all capability notes and send-message schema; no runtime chat data or secrets.",
+  "persona_details_enabled": true,
+  "files": {
+    "capability-notes.json": "00c98e1eb0bae0c14191fd067269729c6709f0c6e3c5da40466df186344594c2",
+    "persona-full.txt": "431bd1c3f5057e8472b0ec97bb13ea044bc62f69fc8951d90eaf81ccb3427b26",
+    "persona-sources.md": "79b241d548945d97e8c0e75b1ea136e71572a9c1b5ffe0fdfcf2a8580e5dd74d",
+    "persona.py.txt": "71b4c0ea42163a058ef4f4fb7e5d3d7740f705805126b0bdb2f2e0fda8e8344b",
+    "prompting.py.txt": "8268b6f053136fcb0812d3f64421c7c53b88e5926b31ce74259909be971220ed",
+    "send-message-tool.json": "ae91db0c0e997b022eaa274a21c699a610e0b3cd20cd00bcc4b6a54377b93004",
+    "system-group-base.txt": "230f25f2337c004e272077270ccc9d8deb9a598105cc2e3d2853c2bb126c88f9",
+    "system-private-base.txt": "178f15407a8eee9f3012c093f1d9da5c0c22737585ea324e37d82c1a222c58f4"
+  }
+}

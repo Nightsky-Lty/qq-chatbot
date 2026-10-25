@@ -1,29 +1,15 @@
-# 角色卡参考
+# 角色卡来源与加载
 
-当前角色卡位于 `app/persona.py`。常驻部分包含性格、偏好、相处方式、口语习惯与11组对话示例；外貌、亲近互动和生活细节仍可按话题补充。字数、条数、群聊参与规则由 `app/prompting.py` 和发送器负责。
+当前角色卡采用 [shirachino/astrbot-persona-prompts](https://github.com/shirachino/astrbot-persona-prompts) 的 DeepSeek 群友版本，内容适配在 `app/prompts/persona.txt`，由 `app/persona.py` 以UTF-8读取。`PERSONA_PROMPT`与`SYSTEM_PROMPT`为同一份完整文本，群聊、私聊和锐评每次固定注入；专用模仿使用自己的提示词。修改角色卡后重建bot容器生效。
 
-人物维度参考 [linsport/dsh-whale-persona 的中文详细角色卡](https://github.com/linsport/dsh-whale-persona/blob/main/人设原文.md)：温柔、好奇、贪吃、爱面子，以及通过具体处境表达情绪的思路。我们为QQ群聊重新编写正文和示例，保留AI身份、可信主人校验、真实记忆及工具权限边界；不导入其编码助手、插件、记忆文件或执行流程。此为社区二创形象，不代表DeepSeek官方设定。
+来源为 `deepseek/大肥鱼群友提示词 Beta.docx`，固定于提交 `869d6793b93a756a410f00da44852f8b774e48f1`。作者README说明可按需填写游戏和爱好，角色卡及仓库声明以作者发布内容为准。此为社区二创形象，不代表官方角色设定。
 
-参考项目的原创文字按 [MIT及其范围说明](https://github.com/linsport/dsh-whale-persona/blob/main/LICENSE) 授权；形象和社区灵感的权利遵循各自来源。其许可声明如下：
+当前人设偏普通群友、懂梗、偶尔吐槽和轻微傲娇；认真求助或情绪低落时简短认真。保留兴趣比例和7组对话示例，游戏占位符采用泛化兴趣；示例不提供虚构餐馆、交易或共同经历。AI身份如实说明，拟人经历、主观看法与真实事实区分，互动和权限遵守程序规则。
 
-```text
-MIT License
+发送字数、分条、网址/代码例外、工具调用、会话隔离、真实回执与群聊/私聊参与规则由 `app/prompting.py` 及实际执行器统一负责。角色卡不声明未注册的AstrBot插件或工具。
 
-Copyright (c) 2026 鲸鱼娘 DSH 预设 贡献者
+## 来源校验
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+- 源DOCX SHA-256：`63997ccd1c4e606162c61c1474df271de452ff0fbd0a9cae89cf13f41b4eda18`
+- 提取文本 SHA-256：`8532acbb228e9e99a25aba4c76f07d613d0a3651d1380fda65b56c1ed5a7e7fc`
+- 当前角色卡 SHA-256：`4c7dc54683e0c56602c572dd6999ebc68aae92e4b5c9c61ddb6e6dc13aa89b04`
