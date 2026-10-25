@@ -10,10 +10,10 @@ from app.models import at_segment, normalize_message_id, reply_segment, text_seg
 from app.tools import ToolRegistry
 
 SEND_MESSAGE_TOOL = {"type": "function", "function": {
-    "name": "send_message", "description": "向当前会话发送口语短消息，每条1～20字。text中用换行分隔几条自然短句，程序逐条发送；长句也会按标点和长度拆开。整轮条数遵守运行环境，超额整次拒绝，请精简重写。只回应一个话题，默认不引用、不@；群聊引用/@仅用授权参数。",
+    "name": "send_message", "description": "向当前会话发送口语短消息，普通文字每条1～20字；完整HTTP(S)网址单独一条，代码用完整代码块单独一条，二者允许超长且不拆内容。text中用换行分隔自然短句；整轮条数遵守运行环境，超额整次拒绝。只回应一个话题，默认不引用、不@；群聊引用/@仅用授权参数。",
     "parameters": {"type": "object", "properties": {
         "text": {"type": "string", "minLength": 1, "maxLength": 4000,
-                 "description": "先组织成自然口语，每条不超过运行环境上限；多条用换行分隔，不写长文再机械切片。通常1～3条就够，不必用满条数。"},
+                 "description": "普通口语每条不超过运行环境上限，多条用换行分隔，通常1～3条即可。网址用完整http://或https://链接独占一行，不混说明或Markdown链接；代码用完整围栏代码块，保留换行缩进。网址/代码不受20字限制，但text合计最多4000字符。"},
         "reply_to_message_id": {"type": "string", "minLength": 1, "maxLength": 24,
                                 "description": "可选：显式显示QQ引用框。省略则普通发送，仍回应当前焦点；只在多人容易串话或需明确指向时填写，不要每条都引用。私聊不提供。"},
         "at_user_ids": {"type": "array", "maxItems": 3,
@@ -23,8 +23,15 @@ SEND_MESSAGE_TOOL = {"type": "function", "function": {
 }}
 
 
-def short_messages(text: str, max_chars: int = 20) -> list[str]:
-    """优先采用模型给出的短句；超长句按标点/空白断开，最后按字符兜底。"""
+CODE_BLOCK = re.compile(r'(?m)^[ \t]*(?P<fence>`{3,}|~{3,})[^\r\n]*\r?\n[\s\S]*?^[ \t]*(?P=fence)[ \t]*\r?$')
+PROTECTED_CODE = re.compile(CODE_BLOCK.pattern + r'|(?<!`)`[^`\r\n]+`(?!`)', re.M)
+URL = re.compile(r'https?://[^\s<>"`，。！？；：“”‘’「」【】]+', re.I)
+BARE_URL = re.compile(r'https?://[^\s<>"`]+', re.I)
+MARKDOWN_LINK = re.compile(r'\[([^\]\r\n]+)\]\((https?://[^\s<>()]+(?:\([^\s<>()]*\)[^\s<>()]*)*)\)', re.I)
+
+
+def _short_text(text: str, max_chars: int) -> list[str]:
+    """普通文字优先采用模型给出的断点，再按标点与字符兜底。"""
     parts = []
     for line in text.replace("[分条]", "\n").splitlines():
         remaining = line.strip()
@@ -38,6 +45,53 @@ def short_messages(text: str, max_chars: int = 20) -> list[str]:
         if remaining:
             parts.append(remaining)
     return [part for part in parts if part]
+
+
+def _inline_links(text: str, max_chars: int) -> list[str]:
+    # 兼容模型偶尔输出Markdown链接，说明和真实网址分开发送。
+    text = MARKDOWN_LINK.sub(lambda m: f'{m[1]}\n{m[2]}\n', text)
+    parts = []
+    start = 0
+    for match in URL.finditer(text):
+        parts.extend(_short_text(text[start:match.start()], max_chars))
+        value = match[0]
+        tail = ''
+        # 自然语言中的句末标点/外层括号不属于网址；平衡的URL括号保留。
+        isolated = not text[:match.start()].split('\n')[-1].strip() and not text[match.end():].split('\n')[0].strip()
+        if not isolated:
+            while value and (value[-1] in '.,!?;:' or
+                             value[-1] in ')]}' and value.count(value[-1]) > value.count({')': '(', ']': '[', '}': '{'}[value[-1]])):
+                tail = value[-1] + tail
+                value = value[:-1]
+        if value:
+            parts.append(value)
+        parts.extend(_short_text(tail, max_chars))
+        start = match.end()
+    parts.extend(_short_text(text[start:], max_chars))
+    return parts
+
+
+def _text_and_links(text: str, max_chars: int) -> list[str]:
+    parts = []
+    for line in text.splitlines():
+        # 模型按约定单独给出的网址原样保留，包括Unicode路径与参数。
+        if BARE_URL.fullmatch(line.strip()):
+            parts.append(line.strip())
+        else:
+            parts.extend(_inline_links(line, max_chars))
+    return parts
+
+
+def short_messages(text: str, max_chars: int = 20) -> list[str]:
+    """普通文字拆短句；独立网址和代码保留完整内容，各占一个消息气泡。"""
+    parts = []
+    start = 0
+    for match in PROTECTED_CODE.finditer(text):
+        parts.extend(_text_and_links(text[start:match.start()], max_chars))
+        parts.append(match[0])
+        start = match.end()
+    parts.extend(_text_and_links(text[start:], max_chars))
+    return parts
 
 
 class MessageSession:

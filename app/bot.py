@@ -1046,7 +1046,7 @@ class BotService:
                 return await messages.execute(arguments)
             send_definition = copy.deepcopy(SEND_MESSAGE_TOOL)
             if private:
-                send_definition['function']['description'] = '向当前私聊发送每条1～20字的口语短消息；text用换行分隔多条，程序逐条发送。整轮条数遵守运行环境，不@或引用。'
+                send_definition['function']['description'] = '向当前私聊发送普通每条1～20字的口语短消息；完整网址或代码可超长，各独立一条，代码保留排版。text用换行分隔多条，整轮条数遵守运行环境，不@或引用。'
                 send_definition["function"]["parameters"]["properties"].pop("at_user_ids")
                 send_definition["function"]["parameters"]["properties"].pop("reply_to_message_id")
             registry.register(send_definition, send_text)
