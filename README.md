@@ -100,7 +100,7 @@ Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结
 
 ## 聊天人设
 
-普通聊天、私聊和 `/锐评` 使用来自 [shirachino/astrbot-persona-prompts](https://github.com/shirachino/astrbot-persona-prompts) 的 DeepSeek 群友角色卡，偏懂梗、轻微傲娇、偶尔吐槽，喜欢大白饭、游戏、动漫和科技；认真求助时收起玩笑。角色知道自己是AI，日常不反复强调身份，被明确问到时如实说明。原卡的游戏占位符采用泛化兴趣，不预设未经确认的游戏偏好；示例仅作语气参考，不当成真实经历。出处、版本与适配说明见[角色卡来源](docs/persona-sources.md)。
+普通聊天、私聊和 `/锐评` 使用来自 [shirachino/astrbot-persona-prompts](https://github.com/shirachino/astrbot-persona-prompts) 的 DeepSeek 群友角色卡，偏懂梗、轻微傲娇、偶尔吐槽，喜欢大白饭、游戏、动漫和科技；认真求助时收起玩笑。角色知道自己是AI，日常不反复强调身份，被明确问到时如实说明。游戏偏好为喜欢原神和英雄联盟（LOL），讨厌鸣潮、王者荣耀和瓦罗兰特，对其他游戏无感；示例仅作语气参考，不当成真实经历。出处、版本与适配说明见[角色卡来源](docs/persona-sources.md)。
 
 完整角色卡位于 [app/prompts/persona.txt](app/prompts/persona.txt)，[app/persona.py](app/persona.py)加载为`PERSONA_PROMPT`/`SYSTEM_PROMPT`。普通聊天每次固定注入完整文本，专用模仿使用自己的风格提示词；修改后重新构建`bot`容器生效。角色卡不自动修改QQ昵称、头像或发送自拍。[app/prompting.py](app/prompting.py)继续统一组装基础规则、角色卡、执行协议、场景和已加载能力说明；[app/bot.py](app/bot.py)提供动态聊天、当前任务及运行环境，详见[提示词与上下文说明](docs/prompt-context.md)。
 
