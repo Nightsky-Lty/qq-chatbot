@@ -84,6 +84,7 @@ PRIVATE_HELP_TEXT = """私聊可直接发送文字聊天，无需 /问 或 @。
 可直接说“明天上午九点提醒我开会”“查看我的提醒”“取消提醒3”。
 提醒使用北京时间，目前只支持一次性提醒。
 也可以说“发个开心的表情包”，需要本地图库中有对应图片。
+也可以发图后说“存一下这张表情包”，审核通过后进入群聊/私聊共用图库；私聊不随机收藏。
 可发图片或文字附图；开启缓存后支持近期图片指代，每轮最多查看3张原图。
 名单、关键词召集和模仿功能请在群里使用。
 私聊文本和机器人回复会保存在服务器，相关上下文会发送给 DeepSeek。
@@ -608,7 +609,7 @@ class BotService:
     ) -> None:
         """私聊普通文本直接聊天，支持帮助和锐评；从不执行群管理或模仿。"""
         text = view.text.strip()
-        if not text and image_session is None and not (view.images and self.image_cache.enabled):
+        if not text and image_session is None and not (view.images and (self.image_cache.enabled or self.sticker_collector.enabled)):
             await self._send_text(send_private, user_id, "请发文字给我；图片聊天需要部署者开启 CHAT_IMAGE_ENABLED，语音和视频暂不支持。")
             return
         if text == "/帮助":
@@ -621,12 +622,12 @@ class BotService:
         prompt = text or "[用户发送了一条图片消息]"
         if text.startswith(self.settings.chat_prefix):
             prompt = text.removeprefix(self.settings.chat_prefix).strip()
-            if not prompt and image_session is None:
+            if not prompt and image_session is None and not view.images:
                 await self._send_text(send_private, user_id, f"直接发文字即可聊天，也可以用：{self.settings.chat_prefix} 你想说的话")
                 return
         elif text.startswith(self.settings.evaluate_prefix):
             content = text.removeprefix(self.settings.evaluate_prefix).strip()
-            if not content and image_session is None:
+            if not content and image_session is None and not view.images:
                 await self._send_text(send_private, user_id, f"用法：{self.settings.evaluate_prefix} 要评价的内容")
                 return
             prompt = f"请对下面这段内容或本条附图做简短、有梗但不伤人的评价：\n{content}"
@@ -638,6 +639,8 @@ class BotService:
         stored_text = prompt + (f"\n[附带图片{len(view.images)}张，{'附件状态见图片索引' if self.image_cache.enabled else '原图未保存'}]" if view.images else "")
         private_source_id = self.db.log_private_message(user_id, "user", stored_text, parts=view.parts)
         context = ContextPacket(task={"用户请求": prompt, "消息段": view.parts, "事件类型": "戳一戳" if poke else "消息"})
+        collection_jobs = {}
+        collector_sender = self._confirmed_senders.get(send_private, send_private)
         if view.images:
             self.image_cache.record(-user_id, private_source_id, user_id, "", view.images)
         cached_rows = self.image_cache.rows(-user_id, private_source_id, {private_source_id})
@@ -647,10 +650,23 @@ class BotService:
                 image_session = ChatImageSession([self.image_cache.reference(row) for row in selected],
                     image_ids=[f"media_{row['id']}" for row in selected])
             context.images = [self.image_cache.describe(row) for row in selected]
+            for row in selected:
+                if row['status'] in {'pending', 'ready'}:
+                    collection_jobs[f"media_{row['id']}"] = CollectionJob(
+                        -user_id, user_id, 0, '', self.image_cache.reference(row), collector_sender)
+        elif not self.image_cache.enabled and view.images:
+            refs = view.images[:3]
+            context.images = [{'图片编号': f'image_{i + 1}', '本地记录ID': private_source_id,
+                               '发图人QQ': user_id, '位置': i} for i in range(len(refs))]
+            if self.settings.chat_image_enabled:
+                image_session = ChatImageSession(refs)
+            collection_jobs = {f'image_{i + 1}': CollectionJob(-user_id, user_id, 0, '', dict(ref), collector_sender)
+                               for i, ref in enumerate(refs)}
         await self._ai_reply(
             user_id, user_id, prompt, send_private,
             context=context,
             private=True, image_session=image_session, private_source_id=private_source_id,
+            collection_jobs=collection_jobs,
         )
 
     async def _handle_command(
@@ -875,6 +891,7 @@ class BotService:
         observe_only: bool = False,
         source_message: GroupMessage | None = None,
         private_source_id: int = 0,
+        collection_jobs: dict[str, CollectionJob] | None = None,
     ) -> None:
         """检查冷却及并发名额，然后调度后台 AI 请求，不等待模型生成。"""
         if self._closed:
@@ -916,7 +933,8 @@ class BotService:
         task = asyncio.create_task(
             self._run_limited_ai_reply(context_id, user_id, prompt, task_sender, history=history, system=system, context=context,
                                private=private, automatic=automatic, image_session=image_session,
-                               observe_only=observe_only, source_message=source_message, private_source_id=private_source_id),
+                               observe_only=observe_only, source_message=source_message, private_source_id=private_source_id,
+                               collection_jobs=collection_jobs),
             name=f"ai-reply-{key[0]}-{context_id}-{user_id}",
         )
         self._ai_tasks[task] = (task_sender, key)
@@ -961,6 +979,8 @@ class BotService:
         workspace = None
         sticker_session = None
         injected_memories = list(recalled_memories or [])
+        if private and collection_jobs is None:
+            collection_jobs = {}
         if self.settings.memory_enabled and not observe_only and (batch is not None or private):
             namespace = -user_id if private else context_id
             new_source_ids = ({entry.storage_id for entry in batch.entries if not entry.poke}
@@ -1118,7 +1138,7 @@ class BotService:
                         image_session.images.append(ref)
                         image_session.image_ids.append(image_id)
                         image_session.sources[image_id] = self.image_cache.describe(row)
-                    if batch is not None and collection_jobs is not None:
+                    if collection_jobs is not None:
                         collection_jobs[image_id] = CollectionJob(namespace, row["user_id"], bot_id, row["message_id"], ref, send_message)
                 async def working_consolidate():
                     return await self.working_memory.archive(namespace, max(workspace.source_ids, default=0) + 1)
@@ -1137,7 +1157,7 @@ class BotService:
                 registry.register(CHAT_IMAGE_TOOL, get_image)
                 logger.info("Chat images attached: scope=%s context=%s user=%s count=%s", scope, context_id, user_id, len(image_session.images))
 
-            if (batch is not None and not private and not observe_only and collection_jobs is not None
+            if ((batch is not None or private) and not observe_only and collection_jobs is not None
                     and self.sticker_collector.enabled):
                 collection_session = CollectionSession(collection_jobs)
                 async def collect_sticker(arguments: dict[str, Any]) -> dict[str, Any]:

@@ -25,20 +25,22 @@ Sender = Callable[[int, list[dict[str, Any]]], Awaitable[Any]]
 
 COLLECT_STICKER_TOOL = {"type": "function", "function": {
     "name": "collect_sticker",
-    "description": "收藏本轮授权的当前或近期同群图片到共享图库，发图人可不是提问人。按来源消息/概要确定指代，不确定先问。先去重再独立审核，真实成功前不能声称已收藏。每轮最多尝试一张。",
+    "description": "收藏本轮授权的当前/近期会话图片到共享图库，群聊仅同群图片，私聊仅当前用户图片。私聊在用户明确要求保存时调用；图库可在群聊和私聊复用。按来源确定指代，先去重再独立审核，真实成功前不能声称已收藏；每轮最多尝试一张。",
     "parameters": {"type": "object", "properties": {
         "image_id": {"type": "string", "minLength": 1, "maxLength": 32,
-                     "description": "程序列出的本轮可收藏图片编号，如media_101或image_1；不能传未列出的编号、URL、路径或自选群号。"},
+                     "description": "程序列出的本轮可收藏图片编号，如media_101或image_1；不能传未列出的编号、URL、路径或自选群号/用户号。"},
     }, "required": ["image_id"], "additionalProperties": False},
 }}
 
-COLLECT_INSTRUCTIONS = """【收藏本批群表情】
-用户要求或同群图片适合当表情时可调用collect_sticker；只用本轮或检索后真实授权的同群编号，不收其他群、私聊或网页图。每轮一张，失败不换图绕限制。
+COLLECT_INSTRUCTIONS = """【收藏会话表情】
+群聊中用户要求或同群图片适合当表情时可调用collect_sticker；私聊在当前用户明确要求保存时调用，仅用其本人当前/近期或检索后真实授权的图片编号。不能跨群、跨私聊用户或收藏网页图。每轮一张，失败不换图绕限制。
+收藏进入共享图库，可在群聊和私聊复用；私聊不随机收图，不因收到图片就自动收藏。
 收藏独立审核，不必先看图；概要、图片缓存及概率抽签都不是收藏成功。仅ok=true且created=true可说新收藏成功，重复表示已有，其余如实说明。随后文字确认，本轮工具收藏不另发后台播报；收藏不是QQ账号收藏或向群发图。"""
 
 
 @dataclass(slots=True)
 class CollectionJob:
+    """group_id为来源命名空间：群聊用正群号，私聊用负QQ号。"""
     group_id: int
     user_id: int
     bot_id: int
@@ -83,7 +85,7 @@ class StickerCollector:
     def submit(self, group_id: int, user_id: int, bot_id: int, message_id: str,
                images: list[dict[str, str]], sender: Sender) -> None:
         """每张图片独立抽签；队列只存引用，不在OneBot接收循环下载/等待LLM。"""
-        if not self.enabled or self.settings.sticker_collect_probability <= 0:
+        if group_id <= 0 or not self.enabled or self.settings.sticker_collect_probability <= 0:
             return
         now = monotonic()
         self._last_reviewed = {group: at for group, at in self._last_reviewed.items()
@@ -182,7 +184,7 @@ class StickerCollector:
                            *, loaded_images: dict[str, tuple[str, bytes]] | None = None) -> dict[str, Any]:
         image_id = arguments.get("image_id")
         if not isinstance(image_id, str) or image_id not in session.jobs or set(arguments) != {"image_id"}:
-            return self._rejected("invalid_image", "只能收藏程序列出的本批新群图片编号。")
+            return self._rejected("invalid_image", "只能收藏程序列出的本轮当前会话图片编号。")
         async with session.lock:
             if image_id in session.cached:
                 return session.cached[image_id]
@@ -190,7 +192,7 @@ class StickerCollector:
                 return self._rejected("limit", "本轮最多尝试收藏一张，不换图绕过限制。")
             session.attempted = True
             try:
-                # 群Agent已持有AI并发额度，不能再申请同一个额度，否则单并发会死锁。
+                # 聊天Agent已持有AI并发额度，不能再申请同一个额度，否则单并发会死锁。
                 result = await self._collect(session.jobs[image_id], source="agent",
                                              loaded=(loaded_images or {}).get(image_id))
             except (ValueError, httpx.HTTPError, OSError, TimeoutError) as exc:
@@ -204,6 +206,9 @@ class StickerCollector:
         async with self._collect_lock:
             if not self.enabled:
                 return self._rejected("disabled", "收藏已关闭或视觉审核不可用。")
+            if ((job.group_id < 0 and job.user_id != -job.group_id)
+                    or ('cache_id' in job.image and str(job.image.get('namespace')) != str(job.group_id))):
+                return self._rejected('invalid_image', '图片不属于本轮当前会话，未收藏。')
             if ("cache_id" in job.image and self.images.cached_validator is not None
                     and not self.images.cached_validator(job.image)):
                 return self._rejected("expired", "图片缓存已过期、已清理或来源消息已删除。")
@@ -211,7 +216,7 @@ class StickerCollector:
                 return self._rejected("expired", "当前图片已超过收藏处理时限，请重新发送。")
             # 随机入口冷却时不下载；工具仍可先确认是否已经入库，但不能绕过审核冷却。
             if source == "random" and self._cooling(job.group_id):
-                return self._rejected("cooldown", "本群图片审核冷却中，未新收藏。")
+                return self._rejected("cooldown", "本会话图片审核冷却中，未新收藏。")
             return await self._collect_locked(job, source=source, loaded=loaded)
 
     async def _collect_locked(self, job: CollectionJob, *, source: str,
@@ -224,7 +229,7 @@ class StickerCollector:
             logger.info("Sticker collection skipped: reason=duplicate group=%s", job.group_id)
             return {"ok": True, "created": False, "status": "duplicate", "note": "图库已有相同内容，不重新审核或保存，不播报新收藏成功。"}
         if self._cooling(job.group_id):
-            return self._rejected("cooldown", "本群图片审核冷却中，未新收藏。")
+            return self._rejected("cooldown", "本会话图片审核冷却中，未新收藏。")
         if not await asyncio.to_thread(self._has_room, len(data)):
             logger.info("Sticker collection skipped: reason=capacity group=%s", job.group_id)
             return self._rejected("capacity", "收藏图库容量已满，不自动删除旧图。")
