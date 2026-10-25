@@ -29,7 +29,7 @@
 
 ## ReAct Agent架构
 
-群聊路径为：OneBot事件 → 原文和安全消息段入库 → GroupConversations聚批并按群串行处理 → BotService读取连续历史 → ReactAgent决策 → ToolRegistry执行工具，直到 `wait_for_messages` 或 `finish`。活跃期可以自然跟随新话题；普通群聊继续使用现有概率接话，明确@、引用和命令保持直接唤醒。这是ReAct风格的函数调用Agent。更早原文通过[群聊历史查询](docs/chat-history.md)按时间向前读取。
+群聊路径为：OneBot事件 → 原文和安全消息段入库 → GroupConversations聚批并按群串行处理 → BotService读取连续历史 → ReactAgent决策 → ToolRegistry执行工具，直到 `wait_for_messages` 或 `finish`。活跃期可以自然跟随新话题；普通群聊继续使用现有概率接话，明确@、引用和命令保持直接唤醒。这是ReAct风格的函数调用Agent。更早原文通过[聊天历史查询](docs/chat-history.md)按时间向前读取。
 
 | 模块 | 职责 |
 | --- | --- |
@@ -116,7 +116,7 @@ Search和Fetch按成功API请求计费，目前各5元/1000次，模型读取结
 
 群聊与私聊默认使用最近30条连续历史，当前批次单独标明，后到消息不提前进入本轮。真实引用可补充窗口外原文，默认字符上限24000，超过时保留连续尾部并明确标记必要的截断。详见[对话工作记忆](docs/working-memory.md)。
 
-群Agent按需调用`read_chat_history({})`向前读取当前群原文，默认10条、最多20条，后续原样传`next_cursor`为`cursor`。游标绑定本轮群和消息边界，每轮最多3次、每页12000字符、合计24000字符。每页重新检查删除/遗忘，原话不悄悄跳过或截断，不调用额外模型。详见[历史查询](docs/chat-history.md)。
+群聊和私聊Agent均可按需调用`read_chat_history({})`向前读取当前会话原文：群聊仅当前群，私聊仅当前用户与机器人。默认10条、最多20条，后续原样传`next_cursor`为`cursor`。游标绑定本轮会话和消息边界，不能跨群、跨私聊用户或跨任务复用；每轮最多3次、每页12000字符、合计24000字符。每页重新检查删除/遗忘，原话不悄悄跳过或截断，不调用额外模型。详见[历史查询](docs/chat-history.md)。
 
 长期记忆默认不自动注入（`MEMORY_AUTO_RECALL_ENABLED=false`），模型需要时使用`memory_search`，支持事件/抽象/图片、人物/时间过滤与来源展开。后台提取和新增、修改、遗忘、删除、整合接口继续工作。
 
@@ -610,7 +610,7 @@ app/
 ├── focus_context.py # 当前原文的有界检索/人设线索，不读取后到消息
 ├── memory_view.py # 自动召回记忆的紧凑模型视图，工具和数据库保留完整结构
 ├── prompting.py  # 稳定规则/场景/能力说明与结构化动态上下文的唯一组装入口
-├── chat_history.py # 当前群原文游标翻页，不调用额外模型
+├── chat_history.py # 当前群/私聊原文游标翻页，不调用额外模型
 ├── media_text.py # 安全消息段与媒体识别结果的文本视图
 ├── chat_transcript.py # 原文快照转user/message为主体的简单JSON聊天数组
 ├── working_memory.py # 最近30条结构化原文工作记忆与真实来源归档

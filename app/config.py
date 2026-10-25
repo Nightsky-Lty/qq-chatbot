@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     image_llm_base_url: str = ""
     image_llm_api_key: str = ""
     image_llm_thinking_enabled: bool = False
-    # 原始群聊时间线翻页，无分类或额外模型调用。
+    # 当前群/私聊原文时间线翻页，无分类或额外模型调用。
     chat_history_read_max_calls: int = Field(default=3, ge=1, le=8)
     chat_history_read_max_chars: int = Field(default=12000, ge=5000, le=40000)
     chat_history_read_total_chars: int = Field(default=24000, ge=5000, le=100000)

@@ -633,11 +633,7 @@ class BotService:
         elif text.startswith("/"):
             await self._send_text(send_private, user_id, "未知私聊命令，请发送 /帮助；普通文字可以直接聊天。")
             return
-        # 先读历史再写当前文本，不把当前问题重复加入上下文；按用户独立查询。
-        history = None
-        if not self.settings.working_memory_enabled:
-            rows = self.db.recent_private_messages(user_id, self.settings.context_message_limit)
-            history = [{"role": row["role"], "content": row["content"]} for row in rows]
+        # 当前消息保存后，按其本地ID读取边界之前的独立私聊历史。
         prompt = prompt or "[用户发送了一条图片消息]"
         stored_text = prompt + (f"\n[附带图片{len(view.images)}张，{'附件状态见图片索引' if self.image_cache.enabled else '原图未保存'}]" if view.images else "")
         private_source_id = self.db.log_private_message(user_id, "user", stored_text, parts=view.parts)
@@ -653,7 +649,7 @@ class BotService:
             context.images = [self.image_cache.describe(row) for row in selected]
         await self._ai_reply(
             user_id, user_id, prompt, send_private,
-            history=history, context=context,
+            context=context,
             private=True, image_session=image_session, private_source_id=private_source_id,
         )
 
@@ -999,7 +995,7 @@ class BotService:
                                     for part in current.get('消息段', [])).strip()
                     if not current.get('消息段') or prompt in {plain, rows[0]['content']} or prompt.startswith('[用户发送了'):
                         context.task.pop('用户请求', None)
-            if private and self.settings.working_memory_enabled:
+            if private:
                 boundary = private_source_id
                 if not boundary:
                     with self.db._lock:
@@ -1016,16 +1012,20 @@ class BotService:
                 allowed_mentions.update({member["user_id"]: member["display_name"] for member in
                                          self.db.group_members(context_id, set(source_message.mentions))})
             bot_id = batch.focus.self_id if batch else (source_message.self_id if source_message else 0)
-            if batch is not None and not private and not observe_only:
-                boundary = min(entry.storage_id for entry in batch.entries)
+            if not observe_only and (private or batch is not None):
+                namespace = -user_id if private else context_id
+                if not private:
+                    boundary = min(entry.storage_id for entry in batch.entries)
                 visible = [*context.working.get('近期往返', []), *context.working.get('引用补充', [])]
                 chat_history = ChatHistorySession(
-                    self.settings, self.db, context_id, boundary=boundary,
+                    self.settings, self.db, namespace, boundary=boundary,
                     default_before=context.working.get('_history_before', boundary), bot_id=bot_id,
-                    known_source_ids=[r['本地记录ID'] for r in visible] + [entry.storage_id for entry in batch.entries],
+                    known_source_ids=[r['本地记录ID'] for r in visible] +
+                                     ([private_source_id] if private_source_id else []) +
+                                     ([entry.storage_id for entry in batch.entries] if batch else []),
                     media_lookup=self.working_memory.media_lookup)
                 registry.register(READ_CHAT_HISTORY_TOOL, chat_history.execute)
-                context.runtime['更早群聊查询'] = chat_history.runtime()
+                context.runtime['更早聊天查询'] = chat_history.runtime()
             allowed_mentions = {qq: name for qq, name in allowed_mentions.items() if qq > 0 and qq != bot_id}
             preserve_layout = False
             conversation = ("private", user_id) if private else ("group", context_id)

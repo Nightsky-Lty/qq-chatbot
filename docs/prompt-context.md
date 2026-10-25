@@ -43,7 +43,7 @@
 
 基础发送/收尾与`search_tools`常驻；其他工具由本地embedding检索top-k及必要依赖。工具schema负责参数，能力补充说明仅在工具加载后注入；注册表及执行器校验权限，检索不扩大授权。
 
-更早群聊使用[read_chat_history](chat-history.md)，游标绑定当前群、本轮任务与消息边界，不调用额外分类模型。工具结果保留在真实assistant/tool链，不伪造新群友发言。
+群聊与私聊的更早原文均使用[read_chat_history](chat-history.md)，游标绑定当前会话、本轮任务与消息边界，不调用额外分类模型。工具结果保留在真实assistant/tool链，不伪造新群友发言。
 
 ## 长期记忆
 
