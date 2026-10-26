@@ -46,7 +46,7 @@ class WorkingMemoryManager:
         return {r["id"]: r for r in self.db.memory_source_rows(namespace, ids)
                 if r["id"] not in blocked and r["role"] in {"user", "assistant", "notice"}}
 
-    def _window(self, namespace: int, before_id: int | None = None) -> dict[int, dict]:
+    def _window(self, namespace: int, before_id: int | None = None, exclude_ids=()) -> dict[int, dict]:
         table, key, target = ("messages", "group_id", namespace) if namespace > 0 else ("private_messages", "user_id", -namespace)
         limit = self.settings.context_message_limit
         boundary = before_id if before_id is not None else 9223372036854775807
@@ -61,7 +61,7 @@ class WorkingMemoryManager:
                 break
             valid = self._valid(namespace, set(ids))
             for source in ids:
-                if source in valid and len(found) < limit:
+                if source in valid and source not in exclude_ids and len(found) < limit:
                     found[source] = valid[source]
             boundary = ids[-1]
         return found
@@ -111,13 +111,13 @@ class WorkingMemoryManager:
         return item
 
     def snapshot(self, namespace: int, *, before_id: int, query: str = "", roots=(), bot_id: int = 0,
-                 image_lookup=None) -> dict[str, Any]:
+                 image_lookup=None, exclude_ids=()) -> dict[str, Any]:
         """连续近期原文；预算只截取连续尾部，窗口外真实引用单独补充。"""
         from app.chat_transcript import ChatTranscript
         result = {"近期往返": [], "说明": "连续聊天原文，仅作背景；新消息见当前任务"}
         if self.closed:
             return result
-        pool = self._window(namespace, before_id)
+        pool = self._window(namespace, before_id, exclude_ids)
         if self.settings.working_memory_enabled:
             state = self._ensure(namespace)
             state.rows = self._valid(namespace, set(state.rows))

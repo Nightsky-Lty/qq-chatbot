@@ -15,6 +15,7 @@ from app.server_status import ServerStatusService
 from app.image_cache import ImageCache
 from app.agent import AgentOutcome, ReactAgent
 from app.conversation import GroupBatch, GroupConversations, GroupMessage
+from app.private_conversation import PrivateConversations, PrivateRequest
 from app.chat_images import CHAT_IMAGE_TOOL, ChatImageService, ChatImageSession
 from app.database import Database
 from app.llm import DeepSeekClient, SYSTEM_PROMPT
@@ -154,6 +155,7 @@ class BotService:
         self._status_tasks: dict[asyncio.Task[None], tuple[SendMessage, AIKey]] = {}
         self._pending_status_users: set[AIKey] = set()
         self.conversations = GroupConversations(settings, self._run_group_batch)
+        self.private_conversations = PrivateConversations(settings, self._ai_slots, self._run_private_batch)
         self._closed = False
 
     async def cancel_pending(self, send_message: SendMessage | None = None, *, key: AIKey | None = None) -> None:
@@ -167,6 +169,9 @@ class BotService:
             await self.conversations.cancel(sender=send_message)
         elif key[0] in {"group", "auto", "image"}:
             await self.conversations.cancel(group_id=key[1])
+        if key is None or key[0] == "private":
+            await self.private_conversations.cancel(sender=confirmed or send_message,
+                                                    user_id=key[1] if key else None)
         tasks = [
             task for task, (sender, task_key) in self._ai_tasks.items()
             if (send_message is None or sender in {send_message, confirmed})
@@ -203,6 +208,7 @@ class BotService:
         """阻止接受新请求并取消所有后台任务，在关闭模型客户端前调用。"""
         self._closed = True
         await self.conversations.close()
+        await self.private_conversations.close()
         await self.cancel_pending()
         await self.sticker_collector.close()
         await self.image_cache.close()
@@ -223,7 +229,7 @@ class BotService:
     def _finish_ai_task(self, task: asyncio.Task[None]) -> None:
         """任务结束后回收名额；尚未开始就被取消的任务也必须回收。"""
         entry = self._ai_tasks.pop(task, None)
-        if entry is not None:
+        if entry is not None and not any(key == entry[1] for _, key in self._ai_tasks.values()):
             self._pending_ai_users.discard(entry[1])
         if not task.cancelled():
             error = task.exception()
@@ -615,7 +621,7 @@ class BotService:
         self, user_id: int, view: MessageView, send_private: SendPrivate, *, image_session: ChatImageSession | None = None,
         poke: bool = False,
     ) -> None:
-        """私聊普通文本直接聊天，支持帮助和锐评；从不执行群管理或模仿。"""
+        """私聊原文入库并排队，支持帮助和锐评；从不执行群管理或模仿。"""
         text = view.text.strip()
         if not text and image_session is None and not (view.images and (self.image_cache.enabled or self.sticker_collector.enabled)):
             await self._send_text(send_private, user_id, "请发文字给我；图片聊天需要部署者开启 CHAT_IMAGE_ENABLED，语音和视频暂不支持。")
@@ -670,12 +676,68 @@ class BotService:
                 image_session = ChatImageSession(refs)
             collection_jobs = {f'image_{i + 1}': CollectionJob(-user_id, user_id, 0, '', dict(ref), collector_sender)
                                for i, ref in enumerate(refs)}
-        await self._ai_reply(
-            user_id, user_id, prompt, send_private,
-            context=context,
-            private=True, image_session=image_session, private_source_id=private_source_id,
-            collection_jobs=collection_jobs,
-        )
+        state = await self.private_conversations.submit(
+            user_id, PrivateRequest(private_source_id, prompt, context, image_session, collection_jobs),
+            collector_sender)
+        if state is None:
+            await self._send_text(send_private, user_id, "私聊排队消息有点多，请稍后再发。")
+        elif state.worker not in self._ai_tasks:
+            key = ("private", user_id, user_id)
+            self._pending_ai_users.add(key)
+            self._ai_tasks[state.worker] = (collector_sender, key)
+            state.worker.add_done_callback(self._finish_ai_task)
+
+    async def _run_private_batch(self, user_id: int, requests: list[PrivateRequest], sender: SendPrivate) -> None:
+        namespace = -user_id
+        rows = self.working_memory._valid(namespace, {r.source_id for r in requests})
+        requests = [r for r in requests if r.source_id in rows]
+        if not requests:
+            return
+        current, images, refs, ids, jobs, sources = [], [], [], [], {}, {}
+        limit = self.settings.image_cache_context_limit if self.image_cache.enabled else 3
+        for request in requests:
+            item = self.working_memory._public(namespace, rows[request.source_id])
+            item_images = []
+            available = request.image_session.available if request.image_session else {}
+            for image in request.context.images:
+                if len(images) >= limit:
+                    break
+                old_id = image['图片编号']
+                if self.image_cache.enabled and old_id.startswith('media_'):
+                    row = self.image_cache._row(namespace, int(old_id[6:]))
+                    if row is None or row['source_id'] != request.source_id:
+                        continue
+                    image = self.image_cache.describe(row)
+                image_id = old_id if self.image_cache.enabled else f'image_{len(images) + 1}'
+                image = {**image, '图片编号': image_id}
+                images.append(image)
+                item_images.append(image)
+                sources[image_id] = image
+                if old_id in available:
+                    refs.append(available[old_id])
+                    ids.append(image_id)
+                if old_id in request.collection_jobs:
+                    jobs[image_id] = request.collection_jobs[old_id]
+            if item_images:
+                item['图片资料（非原话）'] = item_images
+            current.append(item)
+        source_ids = set(rows)
+        prompt = '\n'.join(r.prompt for r in requests)[-4000:]
+        task = {'本批新消息': current, '建议焦点ID': requests[-1].source_id}
+        evaluations = [r.prompt for r in requests if r.prompt.startswith('请对下面这段内容或本条附图')]
+        if evaluations:
+            task['用户请求'] = '\n'.join(evaluations)
+        context = ContextPacket(task=task, images=images)
+        # 当前消息排队期间，上一轮的真实回复可能晚于它入库；仍保留在同一历史窗口。
+        with self.db._lock:
+            end = self.db.connection.execute('SELECT coalesce(max(id),0)+1 FROM private_messages WHERE user_id=?', (user_id,)).fetchone()[0]
+        context.working = self.working_memory.snapshot(namespace, before_id=end, exclude_ids=source_ids)
+        key = ('private', user_id, user_id)
+        self._last_ai_call[key] = time.monotonic()
+        await self._run_ai_reply(
+            user_id, user_id, prompt, sender, private=True, context=context,
+            image_session=ChatImageSession(refs, image_ids=ids, sources=sources) if self.settings.chat_image_enabled and refs else None,
+            private_source_id=min(source_ids), private_source_ids=source_ids, collection_jobs=jobs)
 
     async def _handle_command(
         self,
@@ -983,6 +1045,7 @@ class BotService:
         collection_jobs: dict[str, CollectionJob] | None = None,
         private_source_id: int = 0,
         recalled_memories: list[dict] | None = None,
+        private_source_ids: set[int] | None = None,
     ) -> AgentOutcome | None:
         """后台生成并发送回复；私聊回复入库，运行日志不记录文本、样本或凭证。"""
         started = time.monotonic()
@@ -998,7 +1061,7 @@ class BotService:
         if self.settings.memory_enabled and not observe_only and (batch is not None or private):
             namespace = -user_id if private else context_id
             new_source_ids = ({entry.storage_id for entry in batch.entries if not entry.poke}
-                              if batch else ({private_source_id} if private_source_id else set()))
+                              if batch else (private_source_ids or ({private_source_id} if private_source_id else set())))
             context_ids = set()
             if batch:
                 for entry in batch.entries:
@@ -1034,7 +1097,8 @@ class BotService:
                 if not boundary:
                     with self.db._lock:
                         boundary = self.db.connection.execute("SELECT coalesce(max(id),0)+1 FROM private_messages WHERE user_id=?", (user_id,)).fetchone()[0]
-                context.working = self.working_memory.snapshot(-user_id, before_id=boundary, query=prompt)
+                if not context.working:
+                    context.working = self.working_memory.snapshot(-user_id, before_id=boundary, query=prompt)
             if private and self.settings.memory_enabled and self.settings.memory_auto_recall_enabled:
                 recall_query = memory_context_query(prompt, context, history=history) if self.settings.memory_context_query_enabled else ''
                 private_memories = await self.memory.retrieve(-user_id, prompt, user_ids={user_id}, boundary=private_source_id or None,
@@ -1056,6 +1120,7 @@ class BotService:
                     default_before=context.working.get('_history_before', boundary), bot_id=bot_id,
                     known_source_ids=[r['本地记录ID'] for r in visible] +
                                      ([private_source_id] if private_source_id else []) +
+                                     list(private_source_ids or ()) +
                                      ([entry.storage_id for entry in batch.entries] if batch else []),
                     media_lookup=self.working_memory.media_lookup)
                 registry.register(READ_CHAT_HISTORY_TOOL, chat_history.execute)
@@ -1105,7 +1170,12 @@ class BotService:
 
             if self.settings.web_search_enabled and not observe_only and (batch is not None or private):
                 # 仅本批可回复消息/当前私聊文本中的URL；不授权历史、记忆或下一批链接。
-                current_texts = [entry.text for entry in batch.candidates] if batch else [prompt]
+                if batch is not None:
+                    current_texts = [entry.text for entry in batch.candidates]
+                elif private_source_ids:
+                    current_texts = [row['内容'] for row in context.task['本批新消息']]
+                else:
+                    current_texts = [prompt]
                 web_session = WebSession(allowed_urls=user_urls(current_texts))
                 for definition in WEB_TOOLS:
                     name = definition["function"]["name"]
