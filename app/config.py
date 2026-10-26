@@ -58,9 +58,9 @@ class Settings(BaseSettings):
     evaluate_prefix: str = "/锐评"
     mimic_prefix: str = "/模仿"
     # 冷却单位为秒；上下文和模仿样本限制按消息条数计算。
-    ai_cooldown_seconds: int = Field(default=8, ge=0, le=600)
+    ai_cooldown_seconds: int = Field(default=1, ge=0, le=600)
     private_ai_cooldown_seconds: int = Field(default=1, ge=0, le=600)
-    # 限制模型运行总数；群话题有界排队，私聊/模仿满额时提示重试。
+    # 限制模型运行总数；群聊/私聊有界排队，模仿满额时提示重试。
     ai_max_concurrency: int = Field(default=3, ge=1, le=16)
     agent_max_steps: int = Field(default=8, ge=2, le=16)
     agent_max_tool_calls: int = Field(default=16, ge=4, le=32)

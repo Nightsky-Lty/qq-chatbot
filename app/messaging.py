@@ -97,7 +97,7 @@ def short_messages(text: str, max_chars: int = 20) -> list[str]:
 
 
 class PacedMessageSender:
-    """同轮文字/表情共用节奏，首条立即发，后续间隔随机1～3秒。"""
+    """同轮文字/表情共用节奏，首条立即发，后续间隔随机2～4秒。"""
 
     def __init__(self, sender: Callable[[int, list[dict[str, Any]]], Awaitable[Any]]):
         self.sender = sender
@@ -107,7 +107,7 @@ class PacedMessageSender:
     async def __call__(self, target: int, segments: list[dict[str, Any]]) -> Any:
         async with self.lock:
             if self.last_sent_at is not None:
-                delay = random.uniform(1, 3) - (time.monotonic() - self.last_sent_at)
+                delay = random.uniform(2, 4) - (time.monotonic() - self.last_sent_at)
                 if delay > 0:
                     await asyncio.sleep(delay)
             result = await self.sender(target, segments)
